@@ -1,5 +1,2 @@
-# Copyright © 2025 kogeler
-# SPDX-License-Identifier: Apache-2.0
-
 prometheus-client
 requests

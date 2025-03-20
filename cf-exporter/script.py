@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+# Copyright © 2025 Novasama Technologies GmbH
+# SPDX-License-Identifier: Apache-2.0
+
 import logging
 import os
 import time
@@ -13,7 +16,7 @@ from prometheus_client import start_http_server, Gauge
 
 # Prometheus metrics
 metrics = {
-    'visits_counter': Gauge('cloudflare_visits',
+    'visits_counter': Gauge('cf_visits',
                             'Total visits since midnight UTC',
                             ['zone_name', 'host_name', 'client_country_name', 'client_request_referer', 'user_agent_browser', 'user_agent_os']
                            )
