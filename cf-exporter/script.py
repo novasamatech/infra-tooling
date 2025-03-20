@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-#
+
 # Copyright © 2025 Novasama Technologies GmbH
 # SPDX-License-Identifier: Apache-2.0
-#
-# Very concise Cloudflare metrics exporter for Prometheus.
-# Fetches zone data from Cloudflare and exports visit metrics.
 
 import logging
 import os
