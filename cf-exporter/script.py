@@ -165,19 +165,18 @@ def get_visits_for_zone(api: CloudflareAPI, zone_id: str, zone_name: str) -> Non
         for zone_data in zones_data:
             zone_groups = zone_data.get('httpRequestsAdaptiveGroups', [])
             for group in zone_groups:
-                dimensions = group.get('dimensions', {})
                 sum_data = group.get('sum', {})
-                
+                visits = sum_data.get('visits', 0)
+                if visits == 0:
+                    continue
+                dimensions = group.get('dimensions', {})
                 host = dimensions.get('clientRequestHTTPHost', 'unknown')
                 client_country = dimensions.get('clientCountryName', 'unknown')
                 referer = dimensions.get('clientRequestReferer', 'unknown')
                 ua_browser = dimensions.get('userAgentBrowser', 'unknown')
                 ua_os = dimensions.get('userAgentOS', 'unknown')
-                visits = sum_data.get('visits', 0)
-                
                 if referer == '':
                     referer = 'direct'
-                
                 metrics['visits_counter'].labels(
                     zone_name=zone_name,
                     host_name=host,
@@ -186,7 +185,6 @@ def get_visits_for_zone(api: CloudflareAPI, zone_id: str, zone_name: str) -> Non
                     user_agent_browser=ua_browser,
                     user_agent_os=ua_os
                 ).set(visits)
-                
                 total_updates += 1
         
         logging.info(
