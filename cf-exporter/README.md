@@ -5,7 +5,7 @@ This service exports metrics from Cloudflare to Prometheus. It queries Cloudflar
 - On startup, the exporter will:
   1. Fetch a list of all zones configured in your Cloudflare account (paginated).
   2. For each zone, it will query the Cloudflare GraphQL Analytics API to retrieve HTTP request information, specifically for the path “/” since midnight UTC on the current date.
-  3. Labels such as zone name, host, client country, etc., will be populated, and the “cloudflare_visits” gauge metric will be updated accordingly.  
+  3. Labels such as zone name, host, client country, etc., will be populated, and the “cf_visits” counter metric will be updated accordingly.  
 
 - The exporter repeats this process on a configurable interval. Metrics are served via a built-in HTTP server on the specified port.
 
@@ -36,7 +36,7 @@ The following environment variables can be set to configure the exporter:
 
 ## Usage with Docker
 
-Below are some examples of how you can run the exporter using Docker. Replace "YOUR_DOCKER_IMAGE_PATH" with the actual path to your Docker image.
+Below are some examples of how you can run the exporter using Docker.
 
 ### Example 1 (minimal)
 
