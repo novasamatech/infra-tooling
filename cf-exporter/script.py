@@ -24,6 +24,7 @@ metrics = {
         [
             'zone_name',
             'host_name',
+            'path',
             'client_country_name',
             'client_request_referer',
             'user_agent_browser',
@@ -151,7 +152,6 @@ def get_visits_for_zone(api: CloudflareAPI, zone_id: str, zone_name: str) -> Non
             filter: {{
               datetime_geq: "{datetime_filter['geq']}",
               datetime_lt: "{datetime_filter['lt']}",
-              clientRequestPath: "/"
             }}
           ) {{
             sum {{
@@ -159,6 +159,7 @@ def get_visits_for_zone(api: CloudflareAPI, zone_id: str, zone_name: str) -> Non
             }}
             dimensions {{
               clientRequestHTTPHost,
+              clientRequestPath,
               clientCountryName,
               clientRequestReferer,
               userAgentBrowser,
@@ -202,6 +203,7 @@ def get_visits_for_zone(api: CloudflareAPI, zone_id: str, zone_name: str) -> Non
             labels = {}
             labels.update({"zone_name": zone_name})
             labels.update({"host_name": dimensions.get('clientRequestHTTPHost', 'unknown')})
+            labels.update({"path": dimensions.get('clientRequestPath', 'unknown')})
             labels.update({"client_country_name": dimensions.get('clientCountryName', 'unknown')})
             labels.update({"client_request_referer": dimensions.get('clientRequestReferer', 'unknown')})
             labels.update({"user_agent_browser": dimensions.get('userAgentBrowser', 'unknown')})
