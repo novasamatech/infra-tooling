@@ -45,7 +45,7 @@ import argparse
 import os
 import sys
 import time
-from typing import List, Tuple
+from typing import List, Tuple, Iterator
 
 import jwt
 import re
@@ -164,31 +164,77 @@ def list_requests_for_app(app_id: str, token: str) -> list[dict]:
     return j.get("data", [])
 
 
-def list_available_reports_for_app(app_id: str, token: str) -> list[dict]:
-    """List available analytics reports for the given app."""
-    # First get report requests
+def list_available_reports_for_app(app_id: str, token: str) -> Iterator[dict]:
+    """Yield available analytics reports for the given app with detailed request and file information."""
+    # First get report requests with full details
     report_requests = list_requests_for_app(app_id, token)
-    available_reports = []
 
     for request in report_requests:
         request_id = request["id"]
+        request_attrs = request.get("attributes") or {}
+        # Store request attributes for later use
+        request_info = {
+            "created_date": request_attrs.get("createdDate", ""),
+            "stopped": request_attrs.get("stoppedDueToInactivity", False),
+            "access_type": request_attrs.get("accessType", "")
+        }
         try:
             # Get reports for this request
             reports_response = asc_get(f"/v1/analyticsReportRequests/{request_id}/reports",
-                                     token, params={"limit": 100})
+                                     token, params={"limit": 200})
             for report in reports_response.get("data", []):
+                report_attrs = report.get("attributes") or {}
+
+                # Get report files/instances for this report
+                report_files = []
+                try:
+                    # According to Apple documentation, files are accessed through analyticsReportInstances
+                    # First get the instances for this report
+                    instances_response = asc_get(f"/v1/analyticsReports/{report['id']}/instances",
+                                               token, params={"limit": 100})
+
+                    # For each instance, get the files
+                    for instance_data in instances_response.get("data", []):
+                        instance_id = instance_data["id"]
+                        try:
+                            files_response = asc_get(f"/v1/analyticsReportInstances/{instance_id}/files",
+                                                   token, params={"limit": 100})
+
+                            # Process files for this instance
+                            for file_data in files_response.get("data", []):
+                                file_attrs = file_data.get("attributes") or {}
+                                report_files.append({
+                                    "file_id": file_data["id"],
+                                    "name": file_attrs.get("fileName", ""),
+                                    "url": file_attrs.get("downloadUrl", ""),
+                                    "size": file_attrs.get("fileSize", 0),
+                                    "created_date": file_attrs.get("createdDate", ""),
+                                    "start_date": file_attrs.get("startDate", ""),
+                                    "end_date": file_attrs.get("endDate", ""),
+                                    "instance_id": instance_id
+                                })
+                        except Exception as e:
+                            # Log instance-level errors but continue
+                            print(f"[INFO] Could not access files for instance {instance_id}: {e}")
+
+                except Exception as e:
+                    # Log any errors but continue processing other reports
+                    print(f"[INFO] Could not access instances for report {report['id']}: {e}")
+
                 report_info = {
                     "request_id": request_id,
                     "report_id": report["id"],
-                    "name": (report.get("attributes") or {}).get("name", ""),
-                    "category": (report.get("attributes") or {}).get("category", ""),
-                    "report_type": (report.get("attributes") or {}).get("reportType", "")
+                    "name": report_attrs.get("name", ""),
+                    "category": report_attrs.get("category", ""),
+                    "report_type": report_attrs.get("reportType", report_attrs.get("granularity", report_attrs.get("frequency", ""))),
+                    "request_created_date": request_info.get("created_date", ""),
+                    "request_stopped": request_info.get("stopped", False),
+                    "request_access_type": request_info.get("access_type", ""),
+                    "files": report_files
                 }
-                available_reports.append(report_info)
+                yield report_info
         except Exception as e:
             print(f"[WARNING] Failed to get reports for request {request_id}: {e}")
-
-    return available_reports
 
 
 def create_request_for_app(app_id: str, token: str) -> str:
@@ -221,7 +267,7 @@ def validate_bundle_id(bundle_id: str) -> bool:
 
 
 # -------------------- Configuration --------------------
-MAX_BUNDLES = 50  # Maximum number of bundle IDs to process at once
+MAX_BUNDLES = 10  # Maximum number of bundle IDs to process at once
 
 
 # -------------------- Pretty print --------------------
@@ -241,43 +287,71 @@ def print_requests_table(title: str, rows: List[Tuple[str, str, str, str]]) -> N
         print(" | ".join(r[i].ljust(colw[i]) for i in range(4)))
 
 
-def print_reports_table(title: str, reports: List[dict]) -> None:
-    """Print available reports in a table format, grouped by app."""
+def print_reports_table(title: str, reports_iter: Iterator[dict]) -> None:
+    """Print available reports one at a time with complete information including files."""
     print(f"\n{title}")
-    if not reports:
-        print("(no reports available)")
-        return
+    print("=" * 80)
 
-    # Group reports by bundle_id and app_name
-    reports_by_app = {}
-    for report in reports:
-        key = (report.get("bundle_id", ""), report.get("app_name", ""))
-        if key not in reports_by_app:
-            reports_by_app[key] = []
-        reports_by_app[key].append(report)
+    current_app = None
+    current_request = None
+    report_count = 0
 
-    # Print reports for each app
-    for (bundle_id, app_name), app_reports in reports_by_app.items():
-        print(f"\n📱 App: {app_name} ({bundle_id})")
-        if not app_reports:
-            print("  (no reports available for this app)")
-            continue
+    for report in reports_iter:
+        # Print app header when it changes
+        if current_app != (report.get("bundle_id"), report.get("app_name")):
+            current_app = (report.get("bundle_id"), report.get("app_name"))
+            print(f"\n📱 App: {current_app[1]} ({current_app[0]})")
+            print("-" * 60)
 
-        headers = ("Report Name", "Category", "Type")
-        rows = []
-        for report in app_reports:
-            rows.append((
-                report.get("name", ""),
-                report.get("category", ""),
-                report.get("report_type", "")
-            ))
+        # Print request header when it changes
+        if current_request != report.get("request_id"):
+            current_request = report.get("request_id")
+            print(f"\n  🔗 Request: {current_request}")
+            print(f"    Created: {report.get('request_created_date', 'Not available')}")
+            print(f"    Access Type: {report.get('request_access_type', '')}")
+            print(f"    Stopped: {'Yes' if report.get('request_stopped') else 'No'}")
 
-        if rows:
-            colw = [max(len(str(x[i])) for x in rows + [headers]) for i in range(3)]
-            print("  " + " | ".join(headers[i].ljust(colw[i]) for i in range(3)))
-            print("  " + "-+-".join("-" * colw[i] for i in range(3)))
-            for r in rows:
-                print("  " + " | ".join(r[i].ljust(colw[i]) for i in range(3)))
+        # Print report details
+        print(f"\n    📊 Report: {report.get('name', 'Unknown')}")
+        print(f"      Category: {report.get('category', '')}")
+        report_type = report.get('report_type', '')
+        if report_type:
+            print(f"      Type: {report_type}")
+        print(f"      Report ID: {report.get('report_id', '')}")
+
+        # Print files information
+        files = report.get("files", [])
+        if files:
+            # Group files by date for better organization
+            files_by_date = {}
+            for file_info in files:
+                date_key = file_info.get("start_date", "") or file_info.get("created_date", "unknown_date")
+                if date_key not in files_by_date:
+                    files_by_date[date_key] = []
+                files_by_date[date_key].append(file_info)
+
+            print(f"      📁 Files:")
+            for date_key, files in sorted(files_by_date.items()):
+                if date_key != "unknown_date":
+                    print(f"        📅 {date_key}:")
+                else:
+                    print(f"        📅 Unknown date:")
+
+                for file_info in files:
+                    file_size_mb = file_info.get("size", 0) / (1024 * 1024)
+                    print(f"          • {file_info.get('name', 'unknown')}")
+                    print(f"            ID: {file_info.get('file_id', '')}")
+                    print(f"            Size: {file_size_mb:.2f} MB")
+                    if file_info.get("start_date") and file_info.get("end_date"):
+                        print(f"            Period: {file_info.get('start_date')} - {file_info.get('end_date')}")
+        else:
+            print(f"      📭 No files available (report may be processing)")
+
+        report_count += 1
+        print(f"\n    {'─' * 40}")
+
+    print(f"\n📈 Total reports processed: {report_count}")
+    print("=" * 80)
 
 
 def collect_requests_snapshot(bundles: List[str], token: str) -> List[Tuple[str, str, str, str]]:
@@ -307,21 +381,29 @@ def collect_requests_snapshot(bundles: List[str], token: str) -> List[Tuple[str,
     return snapshot
 
 
-def collect_reports_snapshot(bundles: List[str], token: str) -> List[dict]:
-    """Collect available reports for all bundles."""
-    all_reports = []
+def collect_reports_snapshot(bundles: List[str], token: str) -> Iterator[dict]:
+    """Yield available reports for all bundles progressively."""
     for b in bundles:
         try:
             app_id, app_name = get_app(b, token)
-            reports = list_available_reports_for_app(app_id, token)
-            for report in reports:
+            for report in list_available_reports_for_app(app_id, token):
                 report["bundle_id"] = b
                 report["app_name"] = app_name
-                all_reports.append(report)
+                yield report
         except Exception as e:
             # Skip errors for individual apps, continue with others
             print(f"[WARNING] Failed to get reports for {b}: {e}")
-    return all_reports
+            # Yield an error report to maintain structure
+            yield {
+                "bundle_id": b,
+                "app_name": "ERROR",
+                "request_id": "ERROR",
+                "report_id": "ERROR",
+                "name": f"Error: {str(e)[:100]}",
+                "category": "ERROR",
+                "report_type": "",
+                "files": []
+            }
 
 
 # -------------------- Main --------------------
