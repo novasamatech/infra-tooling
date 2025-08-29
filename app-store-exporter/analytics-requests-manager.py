@@ -457,10 +457,6 @@ def main():
         print(f"[ERROR] Cannot create JWT: {e}", file=sys.stderr)
         sys.exit(2)
 
-    # Snapshot BEFORE
-    before = collect_requests_snapshot(bundles, token)
-    print_requests_table("Current ONGOING requests (BEFORE):", before)
-
     if args.reports:
         # List available reports and exit
         reports = collect_reports_snapshot(bundles, token)
@@ -468,10 +464,21 @@ def main():
         return
 
     if action_list:
+        # Show current requests first, then available reports
+        print("\n📋 Current ONGOING requests:")
+        requests_snapshot = collect_requests_snapshot(bundles, token)
+        print_requests_table("", requests_snapshot)
+
         # List available reports and exit
         reports = collect_reports_snapshot(bundles, token)
         print_reports_table("Available Analytics Reports:", reports)
         return
+
+    # Snapshot BEFORE only for create/delete operations
+    if action_create or action_delete:
+        print("\n⚠️  Showing current ONGOING requests BEFORE operation:")
+        before = collect_requests_snapshot(bundles, token)
+        print_requests_table("Current ONGOING requests (BEFORE):", before)
 
     # Perform actions with rate limiting
     for i, b in enumerate(bundles):
@@ -531,9 +538,11 @@ def main():
                 error_msg = "Authentication error occurred"
             print(f"[ERROR] {b}: {error_msg}")
 
-    # Snapshot AFTER
-    after = collect_requests_snapshot(bundles, token)
-    print_requests_table("Current ONGOING requests (AFTER):", after)
+    # Snapshot AFTER only for create/delete operations
+    if action_create or action_delete:
+        print("\n⚠️  Showing current ONGOING requests AFTER operation:")
+        after = collect_requests_snapshot(bundles, token)
+        print_requests_table("Current ONGOING requests (AFTER):", after)
 
 
 if __name__ == "__main__":
