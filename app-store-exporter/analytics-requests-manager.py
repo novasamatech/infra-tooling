@@ -11,13 +11,17 @@ Description:
     (for --list it prints requests and available reports).
 
 CLI options:
-  --issuer      <ISSUER_ID>      Required. Issuer ID from App Store Connect → Users and Access → Integrations.
-  --key-id      <KEY_ID>         Required. Key ID for your .p8 key (shown next to the generated key).
-  --p8          <PATH>           Required. Path to the private key file, e.g. AuthKey_XXXXXX.p8.
-  --bundles     <LIST>           Required. Comma-separated bundle IDs, e.g. com.app.one,com.app.two.
-  --create                      Optional. Create ONGOING requests for each bundle (DEFAULT action if no flag specified).
-  --delete                      Optional. Delete existing ONGOING requests for each bundle.
-  --list                        Optional. List existing ONGOING requests and available reports for each bundle and exit.
+  --issuer           <ISSUER_ID>      Required. Issuer ID from App Store Connect → Users and Access → Integrations.
+  --key-id           <KEY_ID>         Required. Key ID for your .p8 key (shown next to the generated key).
+  --p8               <PATH>           Required. Path to the private key file, e.g. AuthKey_XXXXXX.p8.
+  --bundles          <LIST>           Required. Comma-separated bundle IDs, e.g. com.app.one,com.app.two.
+  --create                          Optional. Create ONGOING requests for each bundle (DEFAULT action if no flag specified).
+  --delete                          Optional. Delete existing ONGOING requests for each bundle.
+  --list                            Optional. List existing ONGOING requests and available reports for each bundle and exit.
+  --reports                         Optional. List available reports for each app.
+  --debug                           Optional. Enable debug logging and set default limits (10) for reports/instances unless overridden.
+  --limit-reports    <N>             Optional. Limit number of reports processed per request (default: unlimited; in --debug default: 10).
+  --limit-instances  <N>             Optional. Limit number of instances processed per report (default: unlimited; in --debug default: 10).
 
 Permissions:
 - Requires an API key with Admin (or Account Holder) privileges to create/delete requests!
@@ -50,6 +54,8 @@ from typing import List, Tuple, Iterator
 import jwt
 import re
 import requests
+import logging
+from datetime import datetime, timedelta, timezone
 
 BASE = "https://api.appstoreconnect.apple.com"
 
@@ -88,6 +94,7 @@ def asc_get(path: str, token: str, params: dict | None = None, max_retries: int 
                 print(f"[ERROR] 403 Forbidden for GET {path}. Check API key role (Admin needed for create/delete), app access, and team.", file=sys.stderr)
                 sys.exit(3)
             r.raise_for_status()
+            logging.debug("GET %s params=%s -> %s\n%s", path, params or {}, r.status_code, r.text)
             return r.json()
         except (requests.ConnectionError, requests.Timeout) as e:
             if attempt < max_retries - 1:
@@ -113,6 +120,7 @@ def asc_post(path: str, token: str, payload: dict, max_retries: int = 3) -> dict
                 print(f"[ERROR] 403 Forbidden for POST {path}. Admin (or Account Holder) role required to create requests.", file=sys.stderr)
                 sys.exit(3)
             r.raise_for_status()
+            logging.debug("POST %s payload=%s -> %s\n%s", path, payload, r.status_code, r.text)
             return r.json()
         except (requests.ConnectionError, requests.Timeout) as e:
             if attempt < max_retries - 1:
@@ -134,6 +142,7 @@ def asc_delete(path: str, token: str, max_retries: int = 3) -> None:
                 sys.exit(3)
             if r.status_code not in (200, 202, 204):
                 r.raise_for_status()
+            logging.debug("DELETE %s -> %s\n%s", path, r.status_code, r.text)
             return
         except (requests.ConnectionError, requests.Timeout) as e:
             if attempt < max_retries - 1:
@@ -145,6 +154,56 @@ def asc_delete(path: str, token: str, max_retries: int = 3) -> None:
 
 
 # -------------------- Core helpers --------------------
+# -------------------- Extra helpers (pagination, links, debug) --------------------
+# Debug and limits are controlled via CLI flags (--debug, --limit-*)
+DEBUG_MAX_REPORTS = None
+DEBUG_MAX_INSTANCES = None
+
+def dbg(msg: str) -> None:
+    logging.debug(msg)
+
+def asc_get_any(url_or_path: str, token: str, params: dict | None = None, max_retries: int = 3) -> dict:
+    """GET that accepts either relative API path ('/v1/...') or absolute URL (links.next)."""
+    if url_or_path.startswith("http"):
+        for attempt in range(max_retries):
+            try:
+                r = requests.get(url_or_path, headers={"Authorization": f"Bearer {token}"}, params=params or {}, timeout=60)
+                if r.status_code == 403:
+                    print(f"[ERROR] 403 Forbidden for GET {url_or_path}. Check API key role (Admin needed for create/delete), app access, and team.", file=sys.stderr)
+                    sys.exit(3)
+                r.raise_for_status()
+                logging.debug("GET %s params=%s -> %s\n%s", url_or_path, params or {}, r.status_code, r.text)
+                return r.json()
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff
+                    print(f"[WARNING] GET {url_or_path} failed (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    raise
+        raise RuntimeError(f"Failed to GET {url_or_path} after {max_retries} attempts")
+    else:
+        return asc_get(url_or_path, token, params=params, max_retries=max_retries)
+
+def fetch_all(url_or_path: str, token: str, params: dict | None = None) -> list[dict]:
+    """Fetch all pages following links.next, accumulating 'data' list."""
+    items: list[dict] = []
+    next_url = url_or_path
+    next_params = params or {}
+    while True:
+        dbg(f"GET {next_url} params={next_params}")
+        resp = asc_get_any(next_url, token, params=next_params)
+        data = resp.get("data") or []
+        items.extend(data)
+        links = resp.get("links") or {}
+        next_link = links.get("next")
+        if not next_link:
+            break
+        dbg(f"Following next: {next_link}")
+        next_url = next_link
+        next_params = None  # 'next' is a fully qualified URL with params
+    return items
+
 def get_app(bundle_id: str, token: str) -> Tuple[str, str]:
     """Return (app_id, app_name) by bundleId."""
     j = asc_get("/v1/apps", token, params={"filter[bundleId]": bundle_id, "limit": 1})
@@ -164,7 +223,7 @@ def list_requests_for_app(app_id: str, token: str) -> list[dict]:
     return j.get("data", [])
 
 
-def list_available_reports_for_app(app_id: str, token: str) -> Iterator[dict]:
+def list_available_reports_for_app(app_id: str, token: str, date_from: str | None = None, date_to: str | None = None) -> Iterator[dict]:
     """Yield available analytics reports for the given app with detailed request and file information."""
     # First get report requests with full details
     report_requests = list_requests_for_app(app_id, token)
@@ -179,29 +238,66 @@ def list_available_reports_for_app(app_id: str, token: str) -> Iterator[dict]:
             "access_type": request_attrs.get("accessType", "")
         }
         try:
-            # Get reports for this request
-            reports_response = asc_get(f"/v1/analyticsReportRequests/{request_id}/reports",
-                                     token, params={"limit": 200})
-            for report in reports_response.get("data", []):
+            # Get reports for this request via relationship link (fallback to fixed path)
+            rel = (request.get("relationships") or {}).get("reports") or {}
+            dbg(f"Request relationships keys: {list((request.get('relationships') or {}).keys())}")
+            dbg(f"Reports rel keys: {list((rel or {}).keys())}")
+            dbg(f"Reports rel.links keys: {list(((rel or {}).get('links') or {}).keys())}")
+            related_url = (rel.get("links") or {}).get("related") or f"/v1/analyticsReportRequests/{request_id}/reports"
+            dbg(f"Reports related URL for request {request_id}: {related_url}")
+            reports = fetch_all(related_url, token, params={"limit": 200})
+            report_iter_count = 0
+            for report in reports:
                 report_attrs = report.get("attributes") or {}
 
                 # Get report files/instances for this report
                 report_files = []
                 try:
-                    # According to Apple documentation, files are accessed through analyticsReportInstances
-                    # First get the instances for this report
-                    instances_response = asc_get(f"/v1/analyticsReports/{report['id']}/instances",
-                                               token, params={"limit": 100})
+                    # Get the instances for this report via relationship link (fallback to fixed path)
+                    rep_rels = (report.get("relationships") or {})
+                    dbg(f"Report {report.get('id','?')} relationships keys: {list(rep_rels.keys())}")
+                    rrel = rep_rels.get("instances") or {}
+                    dbg(f"Report instances rel keys: {list((rrel or {}).keys())}")
+                    dbg(f"Report instances rel.links keys: {list(((rrel or {}).get('links') or {}).keys())}")
+                    instances_url = (rrel.get("links") or {}).get("related") or f"/v1/analyticsReports/{report['id']}/instances"
+                    dbg(f"Instances URL for report {report.get('id', '?')}: {instances_url}")
+                    # Apply date filters only if provided via CLI; otherwise, request without date filters
+                    params = {
+                        "limit": 100
+                    }
+                    if date_from or date_to:
+                        if date_from:
+                            params["filter[startDate]"] = date_from
+                        if date_to:
+                            params["filter[endDate]"] = date_to
+                    try:
+                        instances = fetch_all(instances_url, token, params=params)
+                    except requests.HTTPError as he:
+                        status = he.response.status_code if he.response is not None else None
+                        if status == 400 and (date_from or date_to):
+                            dbg("400 from instances with date filters; retrying without filters")
+                            instances = fetch_all(instances_url, token, params={"limit": 100})
+                        else:
+                            raise
 
                     # For each instance, get the files
-                    for instance_data in instances_response.get("data", []):
+                    instance_iter_count = 0
+                    for instance_data in instances:
                         instance_id = instance_data["id"]
                         try:
-                            files_response = asc_get(f"/v1/analyticsReportInstances/{instance_id}/files",
-                                                   token, params={"limit": 100})
+                            inst_rels = (instance_data.get("relationships") or {})
+                            dbg(f"Instance {instance_id} relationships keys: {list(inst_rels.keys())}")
+                            irel = inst_rels.get("files") or {}
+                            dbg(f"Instance files rel keys: {list((irel or {}).keys())}")
+                            dbg(f"Instance files rel.links keys: {list(((irel or {}).get('links') or {}).keys())}")
+                            files_url = (irel.get("links") or {}).get("related") or f"/v1/analyticsReportInstances/{instance_id}/files"
+                            dbg(f"Files URL for instance {instance_id}: {files_url}")
+                            files = fetch_all(files_url, token, params={
+                                "limit": 100
+                            })
 
                             # Process files for this instance
-                            for file_data in files_response.get("data", []):
+                            for file_data in files:
                                 file_attrs = file_data.get("attributes") or {}
                                 report_files.append({
                                     "file_id": file_data["id"],
@@ -213,13 +309,17 @@ def list_available_reports_for_app(app_id: str, token: str) -> Iterator[dict]:
                                     "end_date": file_attrs.get("endDate", ""),
                                     "instance_id": instance_id
                                 })
+                            instance_iter_count += 1
+                            if DEBUG_MAX_INSTANCES and instance_iter_count >= DEBUG_MAX_INSTANCES:
+                                dbg("Reached DEBUG_MAX_INSTANCES; stopping instances iteration")
+                                break
                         except Exception as e:
                             # Log instance-level errors but continue
                             print(f"[INFO] Could not access files for instance {instance_id}: {e}")
 
                 except Exception as e:
                     # Log any errors but continue processing other reports
-                    print(f"[INFO] Could not access instances for report {report['id']}: {e}")
+                    print(f"[INFO] Could not access instances for report {report.get('id', '?')}: {e}")
 
                 report_info = {
                     "request_id": request_id,
@@ -233,6 +333,10 @@ def list_available_reports_for_app(app_id: str, token: str) -> Iterator[dict]:
                     "files": report_files
                 }
                 yield report_info
+                report_iter_count += 1
+                if DEBUG_MAX_REPORTS and report_iter_count >= DEBUG_MAX_REPORTS:
+                    dbg("Reached DEBUG_MAX_REPORTS; stopping reports iteration")
+                    break
         except Exception as e:
             print(f"[WARNING] Failed to get reports for request {request_id}: {e}")
 
@@ -267,7 +371,7 @@ def validate_bundle_id(bundle_id: str) -> bool:
 
 
 # -------------------- Configuration --------------------
-MAX_BUNDLES = 10  # Maximum number of bundle IDs to process at once
+MAX_BUNDLES = 50  # Maximum number of bundle IDs to process at once
 
 
 # -------------------- Pretty print --------------------
@@ -381,12 +485,12 @@ def collect_requests_snapshot(bundles: List[str], token: str) -> List[Tuple[str,
     return snapshot
 
 
-def collect_reports_snapshot(bundles: List[str], token: str) -> Iterator[dict]:
+def collect_reports_snapshot(bundles: List[str], token: str, date_from: str | None = None, date_to: str | None = None) -> Iterator[dict]:
     """Yield available reports for all bundles progressively."""
     for b in bundles:
         try:
             app_id, app_name = get_app(b, token)
-            for report in list_available_reports_for_app(app_id, token):
+            for report in list_available_reports_for_app(app_id, token, date_from, date_to):
                 report["bundle_id"] = b
                 report["app_name"] = app_name
                 yield report
@@ -423,6 +527,11 @@ def main():
     ap.add_argument("--delete", action="store_true", help="Delete existing ONGOING requests")
     ap.add_argument("--list", action="store_true", help="List existing ONGOING requests and exit")
     ap.add_argument("--reports", action="store_true", help="List available reports for each app")
+    ap.add_argument("--from", dest="date_from", help="Start date (YYYY-MM-DD) filter for report instances")
+    ap.add_argument("--to", dest="date_to", help="End date (YYYY-MM-DD) filter for report instances")
+    ap.add_argument("--debug", action="store_true", help="Enable debug logging and set default limits (10) for reports/instances unless overridden.")
+    ap.add_argument("--limit-reports", dest="limit_reports", type=int, help="Limit number of reports processed per request (default: unlimited; in --debug default: 10).")
+    ap.add_argument("--limit-instances", dest="limit_instances", type=int, help="Limit number of instances processed per report (default: unlimited; in --debug default: 10).")
     args = ap.parse_args()
 
     # Decide action (default to --create if nothing specified)
@@ -431,6 +540,28 @@ def main():
     action_list   = args.list
     if not any([action_create, action_delete, action_list]):
         action_create = True
+
+    # Configure logging
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s"
+    )
+
+    # Configure processing limits
+    global DEBUG_MAX_REPORTS, DEBUG_MAX_INSTANCES
+    if args.limit_reports is not None:
+        DEBUG_MAX_REPORTS = args.limit_reports
+    elif args.debug:
+        DEBUG_MAX_REPORTS = 10
+    else:
+        DEBUG_MAX_REPORTS = None
+
+    if args.limit_instances is not None:
+        DEBUG_MAX_INSTANCES = args.limit_instances
+    elif args.debug:
+        DEBUG_MAX_INSTANCES = 10
+    else:
+        DEBUG_MAX_INSTANCES = None
 
     # Parse and validate bundles
     bundles = [b.strip() for b in args.bundles.split(",") if b.strip()]
@@ -459,7 +590,7 @@ def main():
 
     if args.reports:
         # List available reports and exit
-        reports = collect_reports_snapshot(bundles, token)
+        reports = collect_reports_snapshot(bundles, token, args.date_from, args.date_to)
         print_reports_table("Available Analytics Reports:", reports)
         return
 
@@ -470,7 +601,7 @@ def main():
         print_requests_table("", requests_snapshot)
 
         # List available reports and exit
-        reports = collect_reports_snapshot(bundles, token)
+        reports = collect_reports_snapshot(bundles, token, args.date_from, args.date_to)
         print_reports_table("Available Analytics Reports:", reports)
         return
 
