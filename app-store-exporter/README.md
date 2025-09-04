@@ -23,9 +23,9 @@ Prometheus exporter for Apple App Store Connect analytics metrics. This exporter
 
 ## Features
 
-- **Multi-metric Support**: Exports 5 distinct metrics simultaneously
+- **Multi-metric Support**: Exports 4 distinct metrics simultaneously
 - **Country-level Granularity**: Metrics are exported per country with proper labels
-- **Latest Data Processing**: Processes the most recent daily reports
+- **Latest Data Processing**: Processes the most recent reports by metric granularity (DAILY or WEEKLY)
 - **Zero-value Handling**: Exports metrics even when values are zero
 - **Performance Optimized**: Debug calculations only performed when debug logging is enabled
 - **Report Management**: Includes utility for managing analytics report requests
@@ -34,11 +34,10 @@ Prometheus exporter for Apple App Store Connect analytics metrics. This exporter
 
 | Metric Name | Description | Labels |
 |-------------|-------------|---------|
-| `appstore_daily_installs` | Daily installs by country | `app`, `country` |
-| `appstore_daily_deletions` | Daily deletions by country | `app`, `country` |
+| `appstore_daily_user_installs` | Daily user installs (App Units) by country | `app`, `country` |
+| `appstore_daily_device_installs` | Daily device installs by country | `app`, `country` |
 | `appstore_active_devices` | Active devices by country | `app`, `country` |
-| `appstore_daily_sessions` | Daily sessions by country | `app`, `country` |
-| `appstore_daily_page_views` | Daily page views by country | `app`, `country` |
+| `appstore_uninstalls` | Uninstalls by country | `app`, `country` |
 
 ## Prerequisites
 
@@ -102,13 +101,12 @@ python analytics-requests-manager.py \
 
 The exporter looks for these specific report types and extracts data from corresponding columns:
 
-| Metric | Report Name | Data Column | Notes |
-|--------|-------------|-------------|-------|
-| Daily Installs | App Store Installation and Deletion | `Installations` | Standard or Detailed report |
-| Daily Deletions | App Store Installation and Deletion | `Deletions` | Standard or Detailed report |
-| Active Devices | App Sessions | `Unique Devices` | From App Sessions report |
-| Daily Sessions | App Sessions | `Sessions` | Standard or Detailed report |
-| Page Views | App Store Discovery and Engagement | `Product Page Views` | Standard or Detailed report |
+| Metric | Report Name | Data Column | Granularity | Notes |
+|--------|-------------|-------------|-------------|-------|
+| Daily User Installs | App Downloads (Standard or Detailed) | `App Units` | DAILY | Unique users (Apple IDs) |
+| Daily Device Installs | Platform App Installs | `Installs` | DAILY | Closest to device installs |
+| Active Devices | App Sessions (Standard or Detailed) | `Active Devices` | DAILY | Proxy for active installed devices |
+| Uninstalls | App Store Installation and Deletion (Standard or Detailed) | `Uninstalls` | WEEKLY | Often only weekly instances available |
 
 **Important**: These are Apple's official report names and column names. The exporter automatically maps them to the appropriate Prometheus metrics.
 
@@ -126,8 +124,7 @@ Different API key permissions enable different capabilities:
 
 When creating reports, they are automatically configured with:
 - **Access Type**: ONGOING (continuous data collection)
-- **Time Granularity**: DAY (daily detail)
-- **Frequency**: DAILY (daily updates)
+- **Granularity**: metric-specific (DAILY or WEEKLY), configured per metric in the exporter
 
 ### Data Processing Time
 
@@ -312,7 +309,7 @@ For issues and feature requests, please create an issue in the project repositor
 
 ### v1.0.0
 - Initial release
-- Support for 5 core metrics
+- Support for 4 core metrics
 - Automatic app discovery
 - Country-level granularity
 - Prometheus metrics endpoint
