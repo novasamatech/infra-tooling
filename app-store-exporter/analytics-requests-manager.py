@@ -18,10 +18,9 @@ CLI options:
   --create                          Optional. Create ONGOING requests for each bundle (DEFAULT action if no flag specified).
   --delete                          Optional. Delete existing ONGOING requests for each bundle.
   --list                            Optional. List existing ONGOING requests and available reports for each bundle and exit.
-  --reports                         Optional. List available reports for each app.
-  --debug                           Optional. Enable debug logging and set default limits (10) for reports/instances unless overridden.
-  --limit-reports    <N>             Optional. Limit number of reports processed per request (default: unlimited; in --debug default: 10).
-  --limit-instances  <N>             Optional. Limit number of instances processed per report (default: unlimited; in --debug default: 10).
+  --start/--from     <YYYY-MM-DD>     Optional. Start date (inclusive) for filtering report instances. If start == end, filters by processingDate; otherwise uses startDate/endDate.
+  --end/--to         <YYYY-MM-DD>     Optional. End date (inclusive) for filtering report instances.
+  --debug                           Optional. Enable debug logging and iterate reports until the first report with non-empty instances/segments, then stop.
 
 Permissions:
 - Requires an API key with Admin (or Account Holder) privileges to create/delete requests!
@@ -153,11 +152,8 @@ def asc_delete(path: str, token: str, max_retries: int = 3) -> None:
                 raise
 
 
-# -------------------- Core helpers --------------------
 # -------------------- Extra helpers (pagination, links, debug) --------------------
-# Debug and limits are controlled via CLI flags (--debug, --limit-*)
-DEBUG_MAX_REPORTS = None
-DEBUG_MAX_INSTANCES = None
+IS_DEBUG = False
 
 def dbg(msg: str) -> None:
     logging.debug(msg)
@@ -224,7 +220,7 @@ def list_requests_for_app(app_id: str, token: str) -> list[dict]:
 
 
 def list_available_reports_for_app(app_id: str, token: str, date_from: str | None = None, date_to: str | None = None) -> Iterator[dict]:
-    """Yield available analytics reports for the given app with detailed request and file information."""
+    """Yield available analytics reports for the given app with detailed request and segment information."""
     # First get report requests with full details
     report_requests = list_requests_for_app(app_id, token)
 
@@ -250,8 +246,8 @@ def list_available_reports_for_app(app_id: str, token: str, date_from: str | Non
             for report in reports:
                 report_attrs = report.get("attributes") or {}
 
-                # Get report files/instances for this report
-                report_files = []
+                # Get report instances for this report
+                report_segments: list[dict] = []
                 try:
                     # Get the instances for this report via relationship link (fallback to fixed path)
                     rep_rels = (report.get("relationships") or {})
@@ -261,61 +257,74 @@ def list_available_reports_for_app(app_id: str, token: str, date_from: str | Non
                     dbg(f"Report instances rel.links keys: {list(((rrel or {}).get('links') or {}).keys())}")
                     instances_url = (rrel.get("links") or {}).get("related") or f"/v1/analyticsReports/{report['id']}/instances"
                     dbg(f"Instances URL for report {report.get('id', '?')}: {instances_url}")
-                    # Apply date filters only if provided via CLI; otherwise, request without date filters
-                    params = {
-                        "limit": 100
-                    }
+                    # Apply API-side date filters only if provided via CLI; otherwise, request without date filters.
+                    # If start == end, prefer filtering by processingDate for exact-day match.
+                    params = {"limit": 200}
                     if date_from or date_to:
-                        if date_from:
-                            params["filter[startDate]"] = date_from
-                        if date_to:
-                            params["filter[endDate]"] = date_to
+                        if date_from and date_to and date_from == date_to:
+                            params["filter[processingDate]"] = date_from
+                        else:
+                            if date_from:
+                                params["filter[startDate]"] = date_from
+                            if date_to:
+                                params["filter[endDate]"] = date_to
                     try:
                         instances = fetch_all(instances_url, token, params=params)
                     except requests.HTTPError as he:
                         status = he.response.status_code if he.response is not None else None
-                        if status == 400 and (date_from or date_to):
-                            dbg("400 from instances with date filters; retrying without filters")
+                        # On 400 for processingDate, fall back to startDate/endDate; on 400 for start/end, retry without filters.
+                        if status == 400 and params.get("filter[processingDate]"):
+                            dbg("400 from instances with processingDate filter; retrying with startDate/endDate")
+                            params.pop("filter[processingDate]", None)
+                            params["filter[startDate]"] = date_from
+                            params["filter[endDate]"] = date_to or date_from
+                            instances = fetch_all(instances_url, token, params=params)
+                        elif status == 400 and (date_from or date_to):
+                            dbg("400 from instances with start/end filters; retrying without filters")
                             instances = fetch_all(instances_url, token, params={"limit": 100})
                         else:
                             raise
 
-                    # For each instance, get the files
+
+
+                    # In debug mode, skip empty-instance reports after filtering; stop after first non-empty
+                    if IS_DEBUG and not instances:
+                        dbg("Debug: report has empty instances after date filter, continue searching...")
+                        continue
+
+                    # For each instance, get the segments
                     instance_iter_count = 0
                     for instance_data in instances:
                         instance_id = instance_data["id"]
+                        instance_attrs = (instance_data.get("attributes") or {})
                         try:
                             inst_rels = (instance_data.get("relationships") or {})
                             dbg(f"Instance {instance_id} relationships keys: {list(inst_rels.keys())}")
-                            irel = inst_rels.get("files") or {}
-                            dbg(f"Instance files rel keys: {list((irel or {}).keys())}")
-                            dbg(f"Instance files rel.links keys: {list(((irel or {}).get('links') or {}).keys())}")
-                            files_url = (irel.get("links") or {}).get("related") or f"/v1/analyticsReportInstances/{instance_id}/files"
-                            dbg(f"Files URL for instance {instance_id}: {files_url}")
-                            files = fetch_all(files_url, token, params={
+                            srel = inst_rels.get("segments") or {}
+                            dbg(f"Instance segments rel keys: {list((srel or {}).keys())}")
+                            dbg(f"Instance segments rel.links keys: {list(((srel or {}).get('links') or {}).keys())}")
+                            segments_url = (srel.get("links") or {}).get("related") or f"/v1/analyticsReportInstances/{instance_id}/segments"
+                            dbg(f"Segments URL for instance {instance_id}: {segments_url}")
+                            segments = fetch_all(segments_url, token, params={
                                 "limit": 100
                             })
 
-                            # Process files for this instance
-                            for file_data in files:
-                                file_attrs = file_data.get("attributes") or {}
-                                report_files.append({
-                                    "file_id": file_data["id"],
-                                    "name": file_attrs.get("fileName", ""),
-                                    "url": file_attrs.get("downloadUrl", ""),
-                                    "size": file_attrs.get("fileSize", 0),
-                                    "created_date": file_attrs.get("createdDate", ""),
-                                    "start_date": file_attrs.get("startDate", ""),
-                                    "end_date": file_attrs.get("endDate", ""),
-                                    "instance_id": instance_id
+                            # Process segments for this instance
+                            for segment_data in segments:
+                                seg_attrs = segment_data.get("attributes") or {}
+                                report_segments.append({
+                                    "segment_id": segment_data["id"],
+                                    "start_date": seg_attrs.get("startDate", ""),
+                                    "end_date": seg_attrs.get("endDate", ""),
+                                    "instance_id": instance_id,
+                                    "instance_processing_date": instance_attrs.get("processingDate", ""),
+                                    "instance_granularity": instance_attrs.get("granularity", ""),
+                                    "attributes": seg_attrs
                                 })
                             instance_iter_count += 1
-                            if DEBUG_MAX_INSTANCES and instance_iter_count >= DEBUG_MAX_INSTANCES:
-                                dbg("Reached DEBUG_MAX_INSTANCES; stopping instances iteration")
-                                break
                         except Exception as e:
                             # Log instance-level errors but continue
-                            print(f"[INFO] Could not access files for instance {instance_id}: {e}")
+                            print(f"[INFO] Could not access segments for instance {instance_id}: {e}")
 
                 except Exception as e:
                     # Log any errors but continue processing other reports
@@ -330,13 +339,21 @@ def list_available_reports_for_app(app_id: str, token: str, date_from: str | Non
                     "request_created_date": request_info.get("created_date", ""),
                     "request_stopped": request_info.get("stopped", False),
                     "request_access_type": request_info.get("access_type", ""),
-                    "files": report_files
+                    "segments": report_segments
                 }
+
+                # In debug mode: stop processing as soon as we encounter a report with non-empty instances (segments collected)
+                if IS_DEBUG:
+                    if report_segments or instances:
+                        yield report_info
+                        return
+                    # If both instances and segments ended up empty, skip yielding in debug
+                    continue
+
+                # Normal mode: yield every report (even if no segments found yet)
                 yield report_info
-                report_iter_count += 1
-                if DEBUG_MAX_REPORTS and report_iter_count >= DEBUG_MAX_REPORTS:
-                    dbg("Reached DEBUG_MAX_REPORTS; stopping reports iteration")
-                    break
+
+
         except Exception as e:
             print(f"[WARNING] Failed to get reports for request {request_id}: {e}")
 
@@ -392,7 +409,7 @@ def print_requests_table(title: str, rows: List[Tuple[str, str, str, str]]) -> N
 
 
 def print_reports_table(title: str, reports_iter: Iterator[dict]) -> None:
-    """Print available reports one at a time with complete information including files."""
+    """Print available reports one at a time with complete information including segments."""
     print(f"\n{title}")
     print("=" * 80)
 
@@ -423,33 +440,37 @@ def print_reports_table(title: str, reports_iter: Iterator[dict]) -> None:
             print(f"      Type: {report_type}")
         print(f"      Report ID: {report.get('report_id', '')}")
 
-        # Print files information
-        files = report.get("files", [])
-        if files:
-            # Group files by date for better organization
-            files_by_date = {}
-            for file_info in files:
-                date_key = file_info.get("start_date", "") or file_info.get("created_date", "unknown_date")
-                if date_key not in files_by_date:
-                    files_by_date[date_key] = []
-                files_by_date[date_key].append(file_info)
+        # Print segments information grouped by instance
+        segments = report.get("segments", [])
+        if segments:
+            # Group segments by instance
+            instances_map = {}
+            for seg in segments:
+                iid = seg.get("instance_id", "")
+                inst_entry = instances_map.setdefault(iid, {
+                    "processing_date": seg.get("instance_processing_date", ""),
+                    "granularity": seg.get("instance_granularity", ""),
+                    "segments": []
+                })
+                inst_entry["segments"].append(seg)
 
-            print(f"      📁 Files:")
-            for date_key, files in sorted(files_by_date.items()):
-                if date_key != "unknown_date":
-                    print(f"        📅 {date_key}:")
+            print(f"      🧩 Instances:")
+            for iid, inst in instances_map.items():
+                print(f"        ▸ Instance {iid}")
+                if inst.get("processing_date"):
+                    print(f"          Processing Date: {inst.get('processing_date')}")
+                if inst.get("granularity"):
+                    print(f"          Granularity: {inst.get('granularity')}")
+                segs = inst.get("segments") or []
+                if segs:
+                    print(f"          📑 Segments:")
+                    for s in segs:
+                        print(f"            • Segment")
+                        print(f"              ID: {s.get('segment_id', '')}")
                 else:
-                    print(f"        📅 Unknown date:")
-
-                for file_info in files:
-                    file_size_mb = file_info.get("size", 0) / (1024 * 1024)
-                    print(f"          • {file_info.get('name', 'unknown')}")
-                    print(f"            ID: {file_info.get('file_id', '')}")
-                    print(f"            Size: {file_size_mb:.2f} MB")
-                    if file_info.get("start_date") and file_info.get("end_date"):
-                        print(f"            Period: {file_info.get('start_date')} - {file_info.get('end_date')}")
+                    print(f"          📭 No segments for this instance")
         else:
-            print(f"      📭 No files available (report may be processing)")
+            print(f"      📭 No segments available (report may be processing)")
 
         report_count += 1
         print(f"\n    {'─' * 40}")
@@ -506,7 +527,7 @@ def collect_reports_snapshot(bundles: List[str], token: str, date_from: str | No
                 "name": f"Error: {str(e)[:100]}",
                 "category": "ERROR",
                 "report_type": "",
-                "files": []
+                "segments": []
             }
 
 
@@ -526,12 +547,10 @@ def main():
     ap.add_argument("--create", action="store_true", help="Create ONGOING requests (default action)")
     ap.add_argument("--delete", action="store_true", help="Delete existing ONGOING requests")
     ap.add_argument("--list", action="store_true", help="List existing ONGOING requests and exit")
-    ap.add_argument("--reports", action="store_true", help="List available reports for each app")
-    ap.add_argument("--from", dest="date_from", help="Start date (YYYY-MM-DD) filter for report instances")
-    ap.add_argument("--to", dest="date_to", help="End date (YYYY-MM-DD) filter for report instances")
-    ap.add_argument("--debug", action="store_true", help="Enable debug logging and set default limits (10) for reports/instances unless overridden.")
-    ap.add_argument("--limit-reports", dest="limit_reports", type=int, help="Limit number of reports processed per request (default: unlimited; in --debug default: 10).")
-    ap.add_argument("--limit-instances", dest="limit_instances", type=int, help="Limit number of instances processed per report (default: unlimited; in --debug default: 10).")
+
+    ap.add_argument("--start", "--from", dest="date_from", help="Start date (YYYY-MM-DD) filter for report instances (uses filter[processingDate] when equal to --end)")
+    ap.add_argument("--end", "--to", dest="date_to", help="End date (YYYY-MM-DD) filter for report instances (uses filter[processingDate] when equal to --start)")
+    ap.add_argument("--debug", action="store_true", help="Enable debug logging and iterate reports until the first report with non-empty instances/segments, then stop.")
     args = ap.parse_args()
 
     # Decide action (default to --create if nothing specified)
@@ -547,21 +566,9 @@ def main():
         format="%(asctime)s %(levelname)s %(message)s"
     )
 
-    # Configure processing limits
-    global DEBUG_MAX_REPORTS, DEBUG_MAX_INSTANCES
-    if args.limit_reports is not None:
-        DEBUG_MAX_REPORTS = args.limit_reports
-    elif args.debug:
-        DEBUG_MAX_REPORTS = 10
-    else:
-        DEBUG_MAX_REPORTS = None
-
-    if args.limit_instances is not None:
-        DEBUG_MAX_INSTANCES = args.limit_instances
-    elif args.debug:
-        DEBUG_MAX_INSTANCES = 10
-    else:
-        DEBUG_MAX_INSTANCES = None
+    # Configure debug mode (in debug mode we iterate until first report with non-empty instances/segments and then stop)
+    global IS_DEBUG
+    IS_DEBUG = args.debug
 
     # Parse and validate bundles
     bundles = [b.strip() for b in args.bundles.split(",") if b.strip()]
@@ -588,11 +595,7 @@ def main():
         print(f"[ERROR] Cannot create JWT: {e}", file=sys.stderr)
         sys.exit(2)
 
-    if args.reports:
-        # List available reports and exit
-        reports = collect_reports_snapshot(bundles, token, args.date_from, args.date_to)
-        print_reports_table("Available Analytics Reports:", reports)
-        return
+
 
     if action_list:
         # Show current requests first, then available reports
@@ -677,4 +680,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrupted by user (Ctrl+C)", file=sys.stderr)
+        sys.exit(130)
