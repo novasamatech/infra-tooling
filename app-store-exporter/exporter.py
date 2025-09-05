@@ -97,44 +97,31 @@ METRICS = [
         "key": "daily_user_installs",
         "prom_name": "appstore_daily_user_installs",
         "help": "Daily user installs (App Units) by country",
-        "labels": ["app", "country"],
+        "labels": {"country": "Territory", "platform_version": "Platform Version", "source_type": "Source Type"},
         "report_type": "App Downloads Standard",
         "value_patterns": ["Counts"],
         "granularity": "DAILY",
-        "country_column": "Territory",
-        "counter": None,
-    },
-    {
-        "key": "daily_device_installs",
-        "prom_name": "appstore_daily_device_installs",
-        "help": "Daily device installs by country",
-        "labels": ["app", "country"],
-        "report_type": "Platform App Installs",
-        "value_patterns": ["Installs"],
-        "granularity": "DAILY",
-        "country_column": "Territory",
+        "row_filter": {"column": "Download Type", "equals": "First-time download"},
         "counter": None,
     },
     {
         "key": "active_devices",
         "prom_name": "appstore_active_devices",
         "help": "Active devices by country (proxy for active device installs)",
-        "labels": ["app", "country"],
+        "labels": {"country": "Territory", "device": "Device", "platform_version": "Platform Version", "source_type": "Source Type"},
         "report_type": "App Sessions Standard",
         "value_patterns": ["Unique Devices"],
         "granularity": "DAILY",
-        "country_column": "Territory",
         "counter": None,
     },
     {
         "key": "uninstalls",
         "prom_name": "appstore_uninstalls",
         "help": "Uninstalls by country (Installation and Deletion). May be WEEKLY depending on availability",
-        "labels": ["app", "country"],
+        "labels": {"country": "Territory", "device": "Device", "platform_version": "Platform Version", "source_type": "Source Type"},
         "report_type": "App Store Installation and Deletion Standard",
         "value_patterns": ["Counts"],
         "granularity": "WEEKLY",
-        "country_column": "Territory",
         "row_filter": {"column": "Event", "equals": "Delete"},
         "counter": None,
     },
@@ -145,7 +132,11 @@ def _init_metrics():
     global counters
     counters = {}
     for m in METRICS:
-        c = Counter(m["prom_name"], m["help"], m["labels"], registry=REGISTRY)
+        # Convert label mapping to list of label names for Prometheus
+        label_names = ["app"]  # Always include app label
+        if "labels" in m:
+            label_names.extend(m["labels"].keys())
+        c = Counter(m["prom_name"], m["help"], label_names, registry=REGISTRY)
         m["counter"] = c
         counters[m["key"]] = c
 
@@ -524,21 +515,30 @@ def _extract_number(value):
     except ValueError:
         return 0.0
 
-# Removed dead helper _resolve_value_column
-
-def _export_metrics(app_name, country, metrics, report_date):
+def _export_metrics(app_info, row, metric_name, value, row_date):
     """Export metrics to Prometheus."""
-    timestamp_ms = int(dt.datetime.combine(report_date, dt.time.min).timestamp() * 1000)
-    labels = {"app": app_name, "country": country}
+    try:
+        report_date = _parse_iso_date(row_date)
+        timestamp_ms = int(dt.datetime.combine(report_date, dt.time.min).timestamp() * 1000)
+    except Exception:
+        # Fallback to current date if parsing fails
+        report_date = date.today()
+        timestamp_ms = int(dt.datetime.combine(report_date, dt.time.min).timestamp() * 1000)
 
-    for metric_name, value in metrics.items():
-        if metric_name in counters:
-            counter = counters[metric_name]
-            if hasattr(counter.labels(**labels), '_value'):
-                counter.labels(**labels)._value.set(value, timestamp=timestamp_ms)
+    if metric_name in counters:
+        counter = counters[metric_name]
+        # Build labels from the mapping configuration for this specific metric
+        labels = {"app": app_info["name"]}  # Fixed app label from app config
+        metric_config = next((m for m in METRICS if m["key"] == metric_name), None)
+        if metric_config and "labels" in metric_config:
+            for label_name, field_name in metric_config["labels"].items():
+                labels[label_name] = row.get(field_name, "")
 
-            if LOG.isEnabledFor(logging.DEBUG) and value > 0:
-                LOG.debug("Exported %s=%s for %s/%s", metric_name, value, app_name, country)
+        if hasattr(counter.labels(**labels), '_value'):
+            counter.labels(**labels)._value.set(value, timestamp=timestamp_ms)
+
+        if LOG.isEnabledFor(logging.DEBUG) and value > 0:
+            LOG.debug("Exported %s=%s with labels %s", metric_name, value, labels)
 
 def _process_analytics_data(app_info, report_type, metric_name, value_patterns, granularity, country_column, row_filter=None):
     """Process analytics data for a specific report type, using the freshest instance by configured granularity (DAILY or WEEKLY)."""
@@ -609,8 +609,17 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
                     LOG.debug("CSV headers: %s", list(row.keys()))
                     LOG.debug("Skipping sample row output (debug sanitization)")
                 # Do not filter by date to avoid dropping valid rows
-                country = (row.get(country_col) or "").upper()
-                if not country:
+                # Check that all label fields are present in the row
+                missing_labels = []
+                metric_config = next((m for m in METRICS if m["key"] == metric_name), None)
+                if metric_config and "labels" in metric_config:
+                    for field_name in metric_config["labels"].values():
+                        if not row.get(field_name):
+                            missing_labels.append(field_name)
+
+                if missing_labels:
+                    if LOG.isEnabledFor(logging.DEBUG):
+                        LOG.debug("Skipping row missing required label fields: %s", missing_labels)
                     continue
                 if row_filter:
                     rf_col = row_filter.get("column")
@@ -618,63 +627,80 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
                     if rf_col and rf_val is not None and row.get(rf_col) != rf_val:
                         continue
                 seg_id = row.get("__segment_id") or "NO_SEGMENT"
-                filtered_rows.append((seg_id, country, row))
+                filtered_rows.append((seg_id, row))
 
 
-            # Choose best segment by max usable rows (rows with country and any matching value column)
-            LOG.debug("Built filtered_rows=%d for candidate '%s', instance %s", len(filtered_rows), candidate, instance_id)
-            # Strict segment scoring: require both exact country column and exact value column to be present
-            # using precomputed value_col
-            seg_scores = {}
-            for seg_id, country, row in filtered_rows:
-                if value_col and (row.get(value_col) not in (None, "")) and (row.get(country_col) not in (None, "")):
-                    seg_scores[seg_id] = seg_scores.get(seg_id, 0) + 1
-            if seg_scores:
-                best_segment_id = max(seg_scores.items(), key=lambda kv: kv[1])[0]
-            else:
-                best_segment_id = filtered_rows[0][0] if filtered_rows else None
+                # Group rows by schema (set of non-metadata columns) to handle different data slices separately
+                LOG.debug("Built filtered_rows=%d for candidate '%s', instance %s", len(filtered_rows), candidate, instance_id)
 
-            # Sum per country for the chosen segment only
-            LOG.debug("Summing metric '%s' per country using segment %s; filtered_rows=%d", metric_name, best_segment_id, len(filtered_rows))
-            LOG.debug("Chosen segment: %s", best_segment_id)
-            per_country = {}
-            for seg_id, country, row in filtered_rows:
-                if seg_id != best_segment_id:
-                    continue
-                # Strict value extraction: use the exact configured value column only
-                # using precomputed value_col
-                if not value_col or (row.get(value_col) in (None, "")):
-                    continue
-                value = _extract_number(row.get(value_col))
-                if LOG.isEnabledFor(logging.DEBUG):
-                    LOG.debug("Using value column '%s' for %s/%s", value_col, app_name, country)
-                if value < 0:
-                    continue
-                per_country[country] = per_country.get(country, 0.0) + value
+                # Group rows by their schema signature (excluding internal metadata columns)
+                rows_by_schema = {}
+                for seg_id, row in filtered_rows:
+                    # Get schema signature (all non-metadata columns)
+                    schema_cols = tuple(sorted(k for k in row.keys() if not k.startswith('__')))
+                    if schema_cols not in rows_by_schema:
+                        rows_by_schema[schema_cols] = []
+                    rows_by_schema[schema_cols].append((seg_id, row))
 
-            # Determine export date: prefer chosen segment startDate; fallback to instance processingDate
-            LOG.debug("Countries aggregated for '%s': %d (keys sample=%s)", candidate, len(per_country), list(per_country.keys())[:5])
-            # Determine export date: use max row date from chosen segment; fallback to instance processing date
-            row_days = []
-            for seg_id, _, row in filtered_rows:
-                if seg_id != best_segment_id:
-                    continue
-                rd = (row.get("Date") or row.get("Processing Date") or row.get("__segment_start") or processing_date or "").strip()[:10]
-                if rd:
-                    row_days.append(rd)
-            export_day = max(row_days) if row_days else (processing_date or "")
-            try:
-                report_date = _parse_iso_date(export_day or date.today().isoformat())
-            except Exception:
-                report_date = date.today()
+                exported_count = 0
+                total_duplicates = 0
 
-            exported_count = 0
-            LOG.debug("Prepared %d country entries for metric %s (report=%s, export_day=%s, segment=%s)", len(per_country), metric_name, candidate, export_day or processing_date, best_segment_id)
-            for country, value in per_country.items():
-                _export_metrics(app_name, country, {metric_name: value}, report_date)
-                exported_count += 1
-                if LOG.isEnabledFor(logging.DEBUG):
-                    LOG.debug("Exported %s=%s for %s/%s on %s", metric_name, value, app_name, country, report_date)
+                # Process each schema group separately
+                for schema_cols, schema_rows in rows_by_schema.items():
+                    LOG.debug("Processing schema group with %d rows, columns: %s", len(schema_rows), schema_cols)
+
+                    schema_seen_keys = set()
+                    schema_duplicates = 0
+
+                    for seg_id, row in schema_rows:
+                        # Strict value extraction: use the exact configured value column only
+                        if not value_col or (row.get(value_col) in (None, "")):
+                            continue
+
+                        # Create comprehensive unique key including all dimensions
+                        date_val = (row.get("Date") or row.get("Processing Date") or row.get("__segment_start") or processing_date or "").strip()[:10]
+
+                        # Build key from all dimension columns except value column (no metadata)
+                        dimension_keys = []
+                        for col in schema_cols:
+                            if col != value_col and not col.startswith('__'):
+                                dim_value = str(row.get(col, '')).strip()
+                                dimension_keys.append(f"{col}={dim_value}")
+
+                        unique_key = f"{date_val}_" + "_".join(sorted(dimension_keys))
+
+                        # Check for duplicates within this schema group
+                        if unique_key in schema_seen_keys:
+                            if LOG.isEnabledFor(logging.DEBUG):
+                                LOG.debug("Duplicate detected for key %s - skipping to avoid double-counting", unique_key)
+                            schema_duplicates += 1
+                            continue
+
+                        schema_seen_keys.add(unique_key)
+
+                        # Extract value and export immediately with proper labels
+                        value = _extract_number(row.get(value_col))
+                        if value < 0:
+                            continue
+
+                        _export_metrics(app_info, row, metric_name, value, date_val)
+                        exported_count += 1
+
+                        if LOG.isEnabledFor(logging.DEBUG):
+                            LOG.debug("Exported %s=%s from segment %s (key: %s)",
+                                     value_col, value, seg_id, unique_key)
+
+                    total_duplicates += schema_duplicates
+                    if schema_duplicates > 0:
+                        LOG.info("Found %d duplicates in schema group with columns %s", schema_duplicates, schema_cols)
+
+            # Use instance processing date as fallback for reporting
+            report_date = processing_date or ""
+
+            segments_used = len({seg_id for seg_id, _ in filtered_rows})
+            schema_groups = len(rows_by_schema)
+            LOG.debug("Exported %d data points for metric %s (report=%s, processing_date=%s, segments_used=%d, schema_groups=%d, duplicates_found=%d)",
+                     exported_count, metric_name, candidate, processing_date or "unknown", segments_used, schema_groups, total_duplicates)
 
             if exported_count > 0:
                 LOG.info("Exported %d %s data points for candidate '%s' on %s", exported_count, metric_name, candidate, report_date)

@@ -23,21 +23,23 @@ Prometheus exporter for Apple App Store Connect analytics metrics. This exporter
 
 ## Features
 
-- **Multi-metric Support**: Exports 4 distinct metrics simultaneously
-- **Country-level Granularity**: Metrics are exported per country with proper labels
-- **Latest Data Processing**: Processes the most recent reports by metric granularity (DAILY or WEEKLY)
-- **Zero-value Handling**: Exports metrics even when values are zero
-- **Performance Optimized**: Debug calculations only performed when debug logging is enabled
+- **Multi-metric Support**: Exports 3 distinct metrics simultaneously with proper filtering
+- **Flexible Label System**: Metrics include multiple dimensions (country, device, platform version, source type)
+- **Granularity-aware Processing**: Handles both DAILY and WEEKLY report instances based on metric requirements
+- **Advanced Filtering**: Applies row-level filtering (e.g., First-time downloads only, Delete events only)
+- **Segment-aware Processing**: Handles multiple report segments with different schemas
+- **Duplicate Protection**: Prevents double-counting across segments and dimensions
 - **Report Management**: Includes utility for managing analytics report requests
 
 ## Exported Metrics
 
+**Note**: Each metric includes additional dimensions beyond country for more detailed segmentation. The exporter automatically handles Apple's complex multi-segment data structure with proper deduplication across different dimensional cuts.
+
 | Metric Name | Description | Labels |
 |-------------|-------------|---------|
-| `appstore_daily_user_installs` | Daily user installs (App Units) by country | `app`, `country` |
-| `appstore_daily_device_installs` | Daily device installs by country | `app`, `country` |
-| `appstore_active_devices` | Active devices by country | `app`, `country` |
-| `appstore_uninstalls` | Uninstalls by country | `app`, `country` |
+| `appstore_daily_user_installs` | Daily user installs (App Units) by country | `app`, `country`, `platform_version`, `source_type` |
+| `appstore_active_devices` | Active devices by country (proxy for active device installs) | `app`, `country`, `device`, `platform_version`, `source_type` |
+| `appstore_uninstalls` | Uninstalls by country (Installation and Deletion) | `app`, `country`, `device`, `platform_version`, `source_type` |
 
 ## Prerequisites
 
@@ -103,12 +105,13 @@ The exporter looks for these specific report types and extracts data from corres
 
 | Metric | Report Name | Data Column | Granularity | Notes |
 |--------|-------------|-------------|-------------|-------|
-| Daily User Installs | App Downloads (Standard or Detailed) | `App Units` | DAILY | Unique users (Apple IDs) |
-| Daily Device Installs | Platform App Installs | `Installs` | DAILY | Closest to device installs |
-| Active Devices | App Sessions (Standard or Detailed) | `Active Devices` | DAILY | Proxy for active installed devices |
-| Uninstalls | App Store Installation and Deletion (Standard or Detailed) | `Uninstalls` | WEEKLY | Often only weekly instances available |
+| Daily User Installs | App Downloads Standard | `Counts` | DAILY | Filtered to "First-time download" only |
+| Active Devices | App Sessions Standard | `Unique Devices` | DAILY | Proxy for active device installs |
+| Uninstalls | App Store Installation and Deletion Standard | `Counts` | WEEKLY | Filtered to "Delete" events only |
 
-**Important**: These are Apple's official report names and column names. The exporter automatically maps them to the appropriate Prometheus metrics.
+**Note**: The exporter automatically handles Apple's complex data structure with multiple segments and ensures proper deduplication across different dimensional cuts. The filtering logic ensures only relevant data is extracted (e.g., only first-time downloads for user installs).
+
+**Important**: These are Apple's official report names and column names. The exporter automatically maps them to the appropriate Prometheus metrics and applies necessary filtering logic.
 
 ### API Key Permission Requirements
 
@@ -308,9 +311,14 @@ For issues and feature requests, please create an issue in the project repositor
 ## Changelog
 
 ### v1.0.0
-- Initial release
-- Support for 4 core metrics
-- Automatic app discovery
-- Country-level granularity
-- Prometheus metrics endpoint
-- Report management utility
+- Initial release with comprehensive Apple App Store Connect metrics export
+- **Multi-metric Support**: 3 core metrics with proper filtering logic
+- **Enhanced Label System**: Multi-dimensional labels (country, device, platform version, source type)
+- **Advanced Filtering**: Row-level filtering for accurate metric extraction (First-time downloads, Delete events)
+- **Duplicate Protection**: Prevents double-counting across report segments and dimensions
+- **Segment-aware Processing**: Handles multiple segments with different schemas
+- **Granularity Support**: DAILY and WEEKLY processing based on metric requirements
+- **Flexible App Configuration**: Support for single and multiple apps with bundle ID mapping
+- **Automatic App Discovery**: Finds and processes available analytics reports
+- **Prometheus Integration**: Standard /metrics endpoint with proper label support
+- **Report Management**: Includes utility for managing analytics report requests
