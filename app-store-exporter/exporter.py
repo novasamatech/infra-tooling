@@ -545,6 +545,11 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
     app_id = app_info["id"]
     app_name = app_info["name"]
 
+    rows_by_schema = {}
+    report_date = ""
+    exported_count = 0
+    total_duplicates = 0
+
     try:
         # Find existing report request
         report_request_id = _find_existing_report_request(app_id)
@@ -584,19 +589,18 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
                 except Exception as _e_rf:
                     LOG.debug("Failed to collect row filter values: %s", _e_rf)
             # One-time warnings if configured columns are not present in the CSV headers
-            if not hasattr(_process_analytics_data, "_warned_missing_cols"):
-                _process_analytics_data._warned_missing_cols = set()
+            _warned_missing_cols = set()
             if headers:
                 if country_col and country_col not in headers:
                     key = f"{candidate}|country|{country_col}"
-                    if key not in _process_analytics_data._warned_missing_cols:
+                    if key not in _warned_missing_cols:
                         LOG.warning("Configured country column '%s' not found in report '%s'; available headers: %s", country_col, candidate, headers)
-                        _process_analytics_data._warned_missing_cols.add(key)
+                        _warned_missing_cols.add(key)
                 if value_col and value_col not in headers:
                     key = f"{candidate}|value|{value_col}"
-                    if key not in _process_analytics_data._warned_missing_cols:
+                    if key not in _warned_missing_cols:
                         LOG.warning("Configured value column '%s' not found in report '%s'; available headers: %s", value_col, candidate, headers)
-                        _process_analytics_data._warned_missing_cols.add(key)
+                        _warned_missing_cols.add(key)
 
             # Select the single best segment (aggregate if exists, else the segment with fewest populated dimension columns),
             # then sum metric values per country for the chosen segment on the instance processing date.
@@ -629,21 +633,16 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
                 seg_id = row.get("__segment_id") or "NO_SEGMENT"
                 filtered_rows.append((seg_id, row))
 
-
                 # Group rows by schema (set of non-metadata columns) to handle different data slices separately
                 LOG.debug("Built filtered_rows=%d for candidate '%s', instance %s", len(filtered_rows), candidate, instance_id)
 
                 # Group rows by their schema signature (excluding internal metadata columns)
-                rows_by_schema = {}
                 for seg_id, row in filtered_rows:
                     # Get schema signature (all non-metadata columns)
                     schema_cols = tuple(sorted(k for k in row.keys() if not k.startswith('__')))
                     if schema_cols not in rows_by_schema:
                         rows_by_schema[schema_cols] = []
                     rows_by_schema[schema_cols].append((seg_id, row))
-
-                exported_count = 0
-                total_duplicates = 0
 
                 # Process each schema group separately
                 for schema_cols, schema_rows in rows_by_schema.items():
