@@ -98,7 +98,7 @@ METRICS = [
         "prom_name": "appstore_daily_user_installs",
         "help": "Daily user installs (App Units) by country",
         "labels": ["app", "country"],
-        "report_types": ["App Downloads Standard"],
+        "report_type": "App Downloads Standard",
         "value_patterns": ["Counts"],
         "granularity": "DAILY",
         "country_column": "Territory",
@@ -109,7 +109,7 @@ METRICS = [
         "prom_name": "appstore_daily_device_installs",
         "help": "Daily device installs by country",
         "labels": ["app", "country"],
-        "report_types": ["Platform App Installs"],
+        "report_type": "Platform App Installs",
         "value_patterns": ["Installs"],
         "granularity": "DAILY",
         "country_column": "Territory",
@@ -120,7 +120,7 @@ METRICS = [
         "prom_name": "appstore_active_devices",
         "help": "Active devices by country (proxy for active device installs)",
         "labels": ["app", "country"],
-        "report_types": ["App Sessions Standard"],
+        "report_type": "App Sessions Standard",
         "value_patterns": ["Unique Devices"],
         "granularity": "DAILY",
         "country_column": "Territory",
@@ -131,7 +131,7 @@ METRICS = [
         "prom_name": "appstore_uninstalls",
         "help": "Uninstalls by country (Installation and Deletion). May be WEEKLY depending on availability",
         "labels": ["app", "country"],
-        "report_types": ["App Store Installation and Deletion Standard"],
+        "report_type": "App Store Installation and Deletion Standard",
         "value_patterns": ["Counts"],
         "granularity": "WEEKLY",
         "country_column": "Territory",
@@ -257,23 +257,15 @@ def _find_report_id(report_request_id, name_pattern):
             available_reports = [f"{it['name']} ({it['category']})" for it in items]
             LOG.debug("Report catalog for request %s: %s", report_request_id, available_reports)
 
-        # Support multiple candidate patterns separated by '||'
-        candidates = [p.strip() for p in (name_pattern.split("||") if isinstance(name_pattern, str) else [name_pattern]) if p and p.strip()]
-        LOG.debug("Trying report name candidates: %s", candidates)
+        candidates = [name_pattern.strip()] if isinstance(name_pattern, str) and name_pattern.strip() else []
+        LOG.debug("Trying report name candidates (exact match only): %s", candidates)
         for candidate in candidates:
-            lp = (candidate or "").lower()
+            lp = candidate.lower()
 
-            # 1) Exact name match (case-insensitive)
+            # Exact name match (case-insensitive)
             for it in items:
                 if it["name"].lower() == lp:
                     LOG.info("Matched report by exact name '%s' (%s)", it["name"], it["category"])
-                    return it["id"]
-
-            # 2) Fallback to substring match
-            for it in items:
-                ln = it["name"].lower()
-                if lp in ln or ln in lp:
-                    LOG.info("Matched report by substring '%s': %s (%s)", candidate, it["name"], it["category"])
                     return it["id"]
 
         available_reports = [f"{it['name']} ({it['category']})" for it in items]
@@ -393,7 +385,7 @@ def _download_report_segments(instance_id):
                 LOG.debug("Segment %s has no downloadable url in attributes", segment.get("id"))
                 continue
 
-            # Download segment payload (could be ZIP, GZIP, or plain CSV)
+            # Download segment payload (gzip or plain CSV)
             # Precompute host info outside try to avoid unbound in except
             host = urlparse(segment_url).netloc.lower()
             host_is_apple = "appstoreconnect.apple.com" in host
@@ -532,67 +524,7 @@ def _extract_number(value):
     except ValueError:
         return 0.0
 
-def _resolve_value_column(value_patterns, row: dict):
-    """
-    Resolve the best value column from a CSV row using flexible, case-insensitive matching.
-
-    Strategy:
-    1) Exact case-insensitive match for any pattern in row headers.
-    2) Normalized match (remove spaces and punctuation).
-    3) Startswith/endswith matching for minor variants (e.g., 'Uninstalls Count').
-    4) Known synonyms mapping.
-    Returns original column name if found, else None.
-    """
-    if not row:
-        return None
-
-    # Build header maps
-    headers = list(row.keys())
-    lower_map = {h.lower(): h for h in headers}
-    norm = lambda s: "".join(ch for ch in s.lower() if ch.isalnum())
-    norm_map = {norm(h): h for h in headers}
-
-    # Known synonyms per common patterns
-    synonyms = {
-        "uninstalls": ["uninstall", "deletions", "delete count", "deletes", "uninstallation", "uninstallations"],
-        "app units": ["units", "downloads", "app downloads"],
-        "installs": ["installations", "device installs"],
-        "active devices": ["unique devices", "active device count", "devices"],
-    }
-
-    # 1) Exact case-insensitive
-    for p in value_patterns:
-        lp = p.lower()
-        if lp in lower_map and (row.get(lower_map[lp]) not in (None, "")):
-            return lower_map[lp]
-
-    # 2) Normalized exact
-    for p in value_patterns:
-        np = norm(p)
-        if np in norm_map and (row.get(norm_map[np]) not in (None, "")):
-            return norm_map[np]
-
-    # 3) Startswith/endswith
-    for p in value_patterns:
-        lp = p.lower()
-        for lh, orig in lower_map.items():
-            if (lh.startswith(lp) or lh.endswith(lp)) and (row.get(orig) not in (None, "")):
-                return orig
-
-    # 4) Synonyms
-    for p in value_patterns:
-        lp = p.lower()
-        for key, alts in synonyms.items():
-            if lp == key or lp in alts:
-                candidates = [key] + alts
-                for cand in candidates:
-                    if cand in lower_map and (row.get(lower_map[cand]) not in (None, "")):
-                        return lower_map[cand]
-                    nc = norm(cand)
-                    if nc in norm_map and (row.get(norm_map[nc]) not in (None, "")):
-                        return norm_map[nc]
-
-    return None
+# Removed dead helper _resolve_value_column
 
 def _export_metrics(app_name, country, metrics, report_date):
     """Export metrics to Prometheus."""
@@ -620,9 +552,8 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
             LOG.warning("No report request found for %s", app_name)
             return
 
-        # Support fallback: multiple candidate report names separated by '||'
-        candidates = [p.strip() for p in (report_type.split("||") if isinstance(report_type, str) else [report_type]) if p and p.strip()]
-        LOG.debug("Report '%s' candidates to try (order): %s", report_type, candidates)
+        candidates = [report_type] if report_type else []
+        LOG.debug("Report candidate(s) to try (exact match): %s", candidates)
 
         for candidate in candidates:
             # Find specific report for this candidate
@@ -677,10 +608,6 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
                 if i == 0 and LOG.isEnabledFor(logging.DEBUG):
                     LOG.debug("CSV headers: %s", list(row.keys()))
                     LOG.debug("Skipping sample row output (debug sanitization)")
-                seg_start = (row.get("__segment_start") or "").strip()[:10]
-                seg_end = (row.get("__segment_end") or "").strip()[:10]
-                inst_day = (processing_date or "").strip()[:10]
-                row_day = (row.get("Date") or row.get("Day") or row.get("Event Date") or row.get("Processing Date") or seg_start or inst_day).strip()[:10]
                 # Do not filter by date to avoid dropping valid rows
                 country = (row.get(country_col) or "").upper()
                 if not country:
@@ -697,7 +624,7 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
             # Choose best segment by max usable rows (rows with country and any matching value column)
             LOG.debug("Built filtered_rows=%d for candidate '%s', instance %s", len(filtered_rows), candidate, instance_id)
             # Strict segment scoring: require both exact country column and exact value column to be present
-            value_col = value_patterns[0] if value_patterns else None
+            # using precomputed value_col
             seg_scores = {}
             for seg_id, country, row in filtered_rows:
                 if value_col and (row.get(value_col) not in (None, "")) and (row.get(country_col) not in (None, "")):
@@ -715,7 +642,7 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
                 if seg_id != best_segment_id:
                     continue
                 # Strict value extraction: use the exact configured value column only
-                value_col = value_patterns[0] if value_patterns else None
+                # using precomputed value_col
                 if not value_col or (row.get(value_col) in (None, "")):
                     continue
                 value = _extract_number(row.get(value_col))
@@ -770,7 +697,7 @@ def _process_app_metrics(app_info):
     for m in METRICS:
         _process_analytics_data(
             app_info,
-            m["report_types"][0],
+            m["report_type"],
             m["key"],
             m["value_patterns"],
             m.get("granularity", "DAILY"),
