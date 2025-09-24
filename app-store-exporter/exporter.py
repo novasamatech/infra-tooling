@@ -18,7 +18,7 @@ from datetime import date, timedelta
 from urllib.parse import urlparse
 
 from prometheus_client import Counter, CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST
-from wsgiref.simple_server import make_server
+from wsgiref.simple_server import make_server, WSGIRequestHandler
 
 LOG = logging.getLogger("appstore_exporter")
 
@@ -1023,7 +1023,16 @@ def main():
             LOG.info("Test interrupted")
         return
 
-    httpd = make_server("0.0.0.0", PORT, app)
+    # Create custom request handler that suppresses logs except in DEBUG mode
+    class QuietRequestHandler(WSGIRequestHandler):
+        def log_message(self, format, *args):
+            """Override to suppress access logs except in DEBUG mode."""
+            if LOG.isEnabledFor(logging.DEBUG):
+                # Use the default logging in DEBUG mode
+                super().log_message(format, *args)
+            # Otherwise suppress the log
+
+    httpd = make_server("0.0.0.0", PORT, app, handler_class=QuietRequestHandler)
     try:
         LOG.info("HTTP server started on port %s", PORT)
         httpd.serve_forever()
