@@ -16,7 +16,7 @@ CSV files, and exports metrics for monitoring and alerting.
 - **Automatic Package Discovery**: Scans GCS bucket to find all available packages
 - **Latest Data Processing**: Always processes the most recent CSV file for each package
 - **Country-level Granularity**: Metrics are exported per country with proper labels
-- **Zero-value Handling**: Exports metrics even when values are zero (except when all metrics are zero)
+- **Zero-value Handling**: Only exports metrics with non-zero values to avoid empty series
 - **Performance Optimized**: Debug calculations only performed when debug logging is enabled
 - **Health Check**: Simple health status endpoint for monitoring
 - **Quiet Operation**: HTTP request logging only in DEBUG mode
@@ -103,6 +103,8 @@ subsequent collections fail (as cached metrics are still being served).
 - **Debug Optimization**: Expensive debug calculations only performed when LOG_LEVEL=DEBUG
 - **Set-based Operations**: Uses efficient set operations for date parsing and deduplication
 - **Single Pass Processing**: Extracts all five metrics in a single pass through CSV data
+- **C Extension Support**: Dockerfile includes build dependencies for google-crc32c C extension
+- **Empty Series Prevention**: Zero-value metrics are not exported to avoid creating empty series
 
 ## Error Handling
 
@@ -144,6 +146,8 @@ subsequent collections fail (as cached metrics are still being served).
 The exporter includes a Dockerfile with:
 - Alpine-based Python 3.13 image
 - Non-root user execution (uid/gid 1000)
+- Build dependencies for C extensions (google-crc32c)
+- Optimized layer caching
 
 Build and run:
 ```bash
@@ -209,17 +213,75 @@ Parses multiple date formats:
 - DD-MMM-YYYY (15-Jan-2025)
 - MM/DD/YYYY (01/15/2025)
 
+## Troubleshooting
+
+### No metrics exported
+- Check debug logs: `GPLAY_EXPORTER_LOG_LEVEL=DEBUG`
+- Verify GCS bucket permissions
+- Ensure CSV files exist in expected location
+- Check health endpoint: `curl http://localhost:8000/healthz`
+
+### Authentication errors
+- Verify credentials file exists and is readable
+- Check service account has Storage Object Viewer permission
+- Ensure GPLAY_EXPORTER_GOOGLE_APPLICATION_CREDENTIALS points to valid JSON file
+
+### High memory usage
+- Normal for large CSV files
+- Consider reducing collection interval if processing many packages
+
+### Metrics not updating
+- Check latest CSV file dates in GCS
+- Verify collection interval setting
+- Look for errors in logs
+
 ## Changelog
+
+### Version 1.1.2 (2025-01-24)
+
+#### Improvements
+- Zero value metrics were exported from export
+
+### Version 1.1.1 (2025-01-24)
+
+#### Improvements
+- Dockerfile was updated
+- Tests were updated
 
 ### Version 1.1.0 (2025-01-24)
 
 #### Breaking Changes
-- **Environment Variables**: Removed support for old unprefixed environment variable names. All environment variables now require the `GPLAY_EXPORTER_` prefix.
+- **Environment Variables**: Removed support for old unprefixed environment variable names. All variables must now use the `GPLAY_EXPORTER_` prefix:
+  - `GOOGLE_APPLICATION_CREDENTIALS` → `GPLAY_EXPORTER_GOOGLE_APPLICATION_CREDENTIALS`
+  - `GPLAY_BUCKET_ID` → `GPLAY_EXPORTER_BUCKET_ID`
+  - `PORT` → `GPLAY_EXPORTER_PORT`
+  - `COLLECTION_INTERVAL_SECONDS` → `GPLAY_EXPORTER_COLLECTION_INTERVAL_SECONDS`
+  - `GCS_PROJECT` → `GPLAY_EXPORTER_GCS_PROJECT`
+  - `TEST_MODE` → `GPLAY_EXPORTER_TEST_MODE`
+  - `LOG_LEVEL` → `GPLAY_EXPORTER_LOG_LEVEL`
 
 #### Improvements
-- **Code Documentation**: Added comprehensive docstrings and inline comments throughout the codebase
-- **Health Check Simplified**: `/healthz` endpoint now returns simple "ok"/"not ok" text instead of JSON
-- **Logging Optimization**: HTTP request logs now only appear in DEBUG mode
-- **C Extension Support**: Added build dependencies in Dockerfile to compile google-crc32c C extension for better performance
-- **Thread Safety**: Improved thread safety with proper locking mechanisms
-- **Test Coverage**: Test script added to ensure code quality and reliability
+- **Health Check**: Simplified `/healthz` endpoint to return only status code (200/503) and simple text response ("ok"/"not ok"). Detailed information moved to debug logs
+- **Logging**: HTTP request logs now only appear in DEBUG mode via custom `QuietWSGIRequestHandler`
+- **Documentation**: Added extensive code comments and docstrings in English throughout the codebase
+- **Docker**: Fixed google-crc32c warning by adding build dependencies (gcc, musl-dev, python3-dev, libffi-dev) to Dockerfile for C extension compilation
+- **Performance**: Optimized Dockerfile layer ordering for better caching
+- **Metrics Export**: Zero-value metrics are no longer exported to prevent creating empty Prometheus series
+
+#### Technical Details
+- Metrics remain as Prometheus Counters (not Gauges) by design, as they represent cumulative daily values
+- Registry is recreated on each collection cycle to handle date changes properly
+- Health status becomes "healthy" after first successful collection and remains healthy even if subsequent collections fail
+- Empty metric series prevention reduces memory usage in Prometheus
+
+### Version 1.0.0 (Initial Release)
+- Initial implementation with Google Play Console metrics export
+- Support for 5 metric types from CSV files
+- Automatic package discovery from GCS bucket
+- Background collection with configurable intervals
+- Prometheus metrics endpoint
+- Basic health check endpoint
+
+## License
+
+This project is licensed under the [Apache License 2.0](../LICENSE).
