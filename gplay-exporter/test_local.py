@@ -227,7 +227,7 @@ def test_wsgi_endpoints():
     return True
 
 def test_metric_export():
-    """Test metric export functionality."""
+    """Test metric export functionality with counters."""
     print("\n=== Testing Metric Export ===")
 
     import exporter
@@ -238,7 +238,7 @@ def test_metric_export():
     exporter.REGISTRY = exporter.CollectorRegistry()
     exporter.counters = exporter._create_prometheus_counters()
 
-    # Export test metrics
+    # Export test metrics with non-zero values
     test_metrics = {
         "daily_device_installs": 100.0,
         "daily_device_uninstalls": 20.0,
@@ -252,7 +252,7 @@ def test_metric_export():
     # Generate and check output
     output = generate_latest(exporter.REGISTRY).decode('utf-8')
 
-    # Verify all metrics are present
+    # Verify all metrics are present with _total suffix
     for metric_name in test_metrics:
         full_metric_name = f"gplay_{metric_name}_total"
         if full_metric_name in output:
@@ -268,12 +268,67 @@ def test_metric_export():
         print("✗ Labels not found in metrics output")
         return False
 
-    # Verify that metrics are counters (should have _total suffix in output)
-    if "gplay_daily_device_installs_total" in output:
-        print("✓ Metrics correctly named with _total suffix for counters")
+    # Test zero-value filtering
+    print("\n  Testing zero-value filtering...")
+
+    # Reset registry for clean test
+    exporter.REGISTRY = exporter.CollectorRegistry()
+    exporter.counters = exporter._create_prometheus_counters()
+
+    # Export metrics with some zero values
+    mixed_metrics = {
+        "daily_device_installs": 50.0,  # non-zero
+        "daily_device_uninstalls": 0.0,  # zero - should not be exported
+        "active_device_installs": 100.0,  # non-zero
+        "daily_user_installs": 0.0,  # zero - should not be exported
+        "daily_user_uninstalls": 5.0,  # non-zero
+    }
+
+    exporter._export_metrics("com.test.app2", "GB", mixed_metrics, date(2025, 1, 15))
+
+    # Generate output
+    output = generate_latest(exporter.REGISTRY).decode('utf-8')
+
+    # Check that non-zero metrics are present (look for both metric name and label values)
+    if 'gplay_daily_device_installs_total' in output and 'com.test.app2' in output and 'GB' in output and '50.0' in output:
+        print("  ✓ Non-zero daily_device_installs exported")
     else:
-        print("✗ Counter metrics not properly named")
+        print("  ✗ Non-zero daily_device_installs not found")
         return False
+
+    if 'gplay_active_device_installs_total' in output and '100.0' in output:
+        print("  ✓ Non-zero active_device_installs exported")
+    else:
+        print("  ✗ Non-zero active_device_installs not found")
+        return False
+
+    if 'gplay_daily_user_uninstalls_total' in output and '5.0' in output:
+        print("  ✓ Non-zero daily_user_uninstalls exported")
+    else:
+        print("  ✗ Non-zero daily_user_uninstalls not found")
+        return False
+
+    # Check that zero metrics are NOT present by looking for lines with the metric AND the specific labels
+    output_lines = output.split('\n')
+    gb_lines = [line for line in output_lines if 'country="GB"' in line and 'package="com.test.app2"' in line]
+
+    # Check for absence of zero-value metrics in GB lines
+    zero_uninstalls_found = any('daily_device_uninstalls_total' in line for line in gb_lines)
+    zero_user_installs_found = any('daily_user_installs_total' in line for line in gb_lines)
+
+    if not zero_uninstalls_found:
+        print("  ✓ Zero-value daily_device_uninstalls correctly filtered out")
+    else:
+        print("  ✗ Zero-value daily_device_uninstalls was incorrectly exported")
+        return False
+
+    if not zero_user_installs_found:
+        print("  ✓ Zero-value daily_user_installs correctly filtered out")
+    else:
+        print("  ✗ Zero-value daily_user_installs was incorrectly exported")
+        return False
+
+    print("✓ Zero-value filtering works correctly")
 
     return True
 

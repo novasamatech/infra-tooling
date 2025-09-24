@@ -145,6 +145,8 @@ def _export_metrics(package: str, country: str, metrics: Dict[str, float], date:
     """
     Export multiple metrics for a country.
 
+    Only exports metrics with non-zero values to avoid creating empty series.
+
     Args:
         package: Android package name
         country: Country code (e.g., "US")
@@ -155,14 +157,19 @@ def _export_metrics(package: str, country: str, metrics: Dict[str, float], date:
 
     for metric_name, value in metrics.items():
         if metric_name in counters:
+            # Skip zero values to avoid creating empty series
+            if value <= 0:
+                if LOG.isEnabledFor(logging.DEBUG):
+                    LOG.debug("Skipping zero metric: %s for %s/%s", metric_name, package, country)
+                continue
+
             # Set the counter to the absolute value from the CSV
             # This is safe because we recreate counters on each collection
             counters[metric_name].labels(**labels)._value.set(value)
 
             if LOG.isEnabledFor(logging.DEBUG):
-                if value > 0:
-                    LOG.debug("Exported metric: %s=%s for %s/%s on %s",
-                             metric_name, value, package, country, date)
+                LOG.debug("Exported metric: %s=%s for %s/%s on %s",
+                         metric_name, value, package, country, date)
         else:
             LOG.warning("Unknown metric %s for %s/%s", metric_name, package, country)
 
