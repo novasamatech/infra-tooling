@@ -23,7 +23,7 @@ from wsgiref.simple_server import make_server
 LOG = logging.getLogger("appstore_exporter")
 
 # Dedicated app logger: do not alter root logger or third‑party loggers.
-_app_log_level = (os.environ.get("LOG_LEVEL", "INFO") or "INFO").upper()
+_app_log_level = (os.environ.get("APPSTORE_EXPORTER_LOG_LEVEL", "INFO") or "INFO").upper()
 LOG.setLevel(_app_log_level)
 LOG.propagate = False
 if not LOG.handlers:
@@ -34,12 +34,12 @@ if not LOG.handlers:
 
 # ------------ Configuration ------------
 # Required credentials
-ISSUER_ID = os.environ.get("APPSTORE_ISSUER_ID")
-KEY_ID = os.environ.get("APPSTORE_KEY_ID")
-PRIVATE_KEY_PATH = os.environ.get("APPSTORE_PRIVATE_KEY") or ""
+ISSUER_ID = os.environ.get("APPSTORE_EXPORTER_ISSUER_ID")
+KEY_ID = os.environ.get("APPSTORE_EXPORTER_KEY_ID")
+PRIVATE_KEY_PATH = os.environ.get("APPSTORE_EXPORTER_PRIVATE_KEY") or ""
 
 if not all([ISSUER_ID, KEY_ID, PRIVATE_KEY_PATH]):
-    LOG.error("Missing required environment variables: APPSTORE_ISSUER_ID, APPSTORE_KEY_ID, APPSTORE_PRIVATE_KEY")
+    LOG.error("Missing required environment variables: APPSTORE_EXPORTER_ISSUER_ID, APPSTORE_EXPORTER_KEY_ID, APPSTORE_EXPORTER_PRIVATE_KEY")
     sys.exit(2)
 
 # App configuration - support both single and multiple apps
@@ -48,19 +48,19 @@ def _parse_app_config():
     apps = []
 
     # Single app configuration
-    single_app_id = os.environ.get("APPSTORE_APP_ID")
+    single_app_id = os.environ.get("APPSTORE_EXPORTER_APP_ID")
     if single_app_id:
         apps.append({
             "id": single_app_id,
-            "name": os.environ.get("APPSTORE_BUNDLE_ID", f"App_{single_app_id}"),
-            "bundle_id": os.environ.get("APPSTORE_BUNDLE_ID", "unknown")
+            "name": os.environ.get("APPSTORE_EXPORTER_BUNDLE_ID", f"App_{single_app_id}"),
+            "bundle_id": os.environ.get("APPSTORE_EXPORTER_BUNDLE_ID", "unknown")
         })
         return apps
 
     # Multiple apps configuration
-    app_ids = os.environ.get("APPSTORE_APP_IDS", "").split(",")
+    app_ids = os.environ.get("APPSTORE_EXPORTER_APP_IDS", "").split(",")
 
-    bundle_ids = os.environ.get("APPSTORE_BUNDLE_IDS", "").split(",")
+    bundle_ids = os.environ.get("APPSTORE_EXPORTER_BUNDLE_IDS", "").split(",")
 
     if app_ids and app_ids[0]:
         for i, app_id in enumerate(app_ids):
@@ -78,20 +78,33 @@ def _parse_app_config():
 
 APPS = _parse_app_config()
 if not APPS:
-    LOG.error("No apps configured. Set APPSTORE_APP_ID or APPSTORE_APP_IDS")
+    LOG.error("No apps configured. Set APPSTORE_EXPORTER_APP_ID or APPSTORE_EXPORTER_APP_IDS")
     sys.exit(2)
 
 # Optional settings
-PORT = int(os.environ.get("PORT", "8000"))
-COLLECTION_INTERVAL = int(os.environ.get("COLLECTION_INTERVAL_SECONDS", "43200"))
-DAYS_TO_FETCH = int(os.environ.get("DAYS_TO_FETCH", "14"))
-TEST_MODE = os.environ.get("TEST_MODE")
+PORT = int(os.environ.get("APPSTORE_EXPORTER_PORT", "8000"))
+COLLECTION_INTERVAL = int(os.environ.get("APPSTORE_EXPORTER_COLLECTION_INTERVAL_SECONDS", "43200"))
+DAYS_TO_FETCH = int(os.environ.get("APPSTORE_EXPORTER_DAYS_TO_FETCH", "14"))
+TEST_MODE = os.environ.get("APPSTORE_EXPORTER_TEST_MODE")
 
 API_BASE = "https://api.appstoreconnect.apple.com"
 REGISTRY = CollectorRegistry()
 _REPORTS_CACHE = {}
 
+# Health check state management with thread safety
+_health_state = {
+    "healthy": False,
+    "last_successful_collection": None,
+    "last_error": None,
+    "collections_count": 0
+}
+_health_state_lock = threading.Lock()
+_registry_lock = threading.Lock()  # Lock for Registry access to prevent race conditions
+
 # ------------ Prometheus Metrics Config ------------
+# Add error tracking metrics
+from prometheus_client import Gauge
+
 METRICS = [
     {
         "key": "daily_user_installs",
@@ -129,7 +142,7 @@ METRICS = [
 
 def _init_metrics():
     """Create Prometheus counters for all configured metrics and bind them to the current registry."""
-    global counters
+    global counters, parsing_errors_counter, last_collection_timestamp
     counters = {}
     for m in METRICS:
         # Convert label mapping to list of label names for Prometheus
@@ -140,12 +153,35 @@ def _init_metrics():
         m["counter"] = c
         counters[m["key"]] = c
 
+    # Create internal metrics for monitoring
+    parsing_errors_counter = Counter(
+        'appstore_exporter_parsing_errors_total',
+        'Total number of parsing errors per app and report',
+        ['app', 'report_type'],
+        registry=REGISTRY
+    )
+    last_collection_timestamp = Gauge(
+        'appstore_exporter_last_collection_timestamp',
+        'Timestamp of last successful collection',
+        registry=REGISTRY
+    )
+
 # Initialize counters at import time
 _init_metrics()
 
 # ------------ Core Functions ------------
 def _make_token():
-    """Generate JWT token for App Store Connect API."""
+    """Generate JWT token for App Store Connect API.
+
+    Creates a JWT token with ES256 algorithm valid for 20 minutes.
+    The token is required for all App Store Connect API calls.
+
+    Returns:
+        str: Signed JWT token
+
+    Raises:
+        Exception: If private key cannot be read or JWT encoding fails
+    """
     try:
         with open(PRIVATE_KEY_PATH, "r") as f:
             private_key = f.read()
@@ -162,7 +198,25 @@ def _make_token():
         raise
 
 def _asc_api_call(method, path, params=None, payload=None, retries=3):
-    """Make API call with retry logic."""
+    """Make API call to App Store Connect with retry logic.
+
+    Handles rate limiting (429) with exponential backoff and retries
+    transient failures. Generates a fresh JWT token for each attempt.
+
+    Args:
+        method: HTTP method (GET or POST)
+        path: API endpoint path (e.g., '/v1/apps')
+        params: Query parameters for GET requests
+        payload: JSON payload for POST requests
+        retries: Number of retry attempts (default: 3)
+
+    Returns:
+        dict: Parsed JSON response from the API
+
+    Raises:
+        HTTPError: For non-retryable HTTP errors
+        RuntimeError: After all retry attempts are exhausted
+    """
     token = _make_token()
     headers = {"Authorization": f"Bearer {token}"}
     url = f"{API_BASE}{path}"
@@ -198,7 +252,17 @@ def _asc_api_call(method, path, params=None, payload=None, retries=3):
     raise RuntimeError(f"Failed after {retries} attempts")
 
 def _find_existing_report_request(app_id):
-    """Find existing analytics report request for an app."""
+    """Find existing analytics report request for an app.
+
+    Searches for ONGOING report requests first, then falls back to
+    any available report request. This is required to access analytics data.
+
+    Args:
+        app_id: App Store Connect app ID
+
+    Returns:
+        str: Report request ID if found, None otherwise
+    """
     try:
         # First try to find ongoing requests
         response = _asc_api_call("GET", f"/v1/apps/{app_id}/analyticsReportRequests",
@@ -228,7 +292,18 @@ def _find_existing_report_request(app_id):
         return None
 
 def _find_report_id(report_request_id, name_pattern):
-    """Find report ID by name (or substring), using a per-request cache and logging the catalog only once."""
+    """Find report ID by exact name match, using cache to minimize API calls.
+
+    Caches the report catalog per request ID to avoid repeated API calls.
+    Performs case-insensitive exact matching on report names.
+
+    Args:
+        report_request_id: ID of the analytics report request
+        name_pattern: Exact report name to search for
+
+    Returns:
+        str: Report ID if found, None otherwise
+    """
     try:
         # Use cached catalog if available; fetch and cache otherwise
         items = _REPORTS_CACHE.get(report_request_id)
@@ -269,8 +344,18 @@ def _find_report_id(report_request_id, name_pattern):
         return None
 
 def _find_freshest_instance(report_id, granularity="DAILY", lookback_days=14):
-    """Find the freshest available instance by granularity (DAILY or WEEKLY), newest first.
-    Returns a tuple: (instance_dict_or_None, rows_list)
+    """Find the most recent report instance with data.
+
+    Searches for instances within the lookback window, starting with the
+    newest. Downloads segments for each instance until finding one with data.
+
+    Args:
+        report_id: Analytics report ID
+        granularity: 'DAILY' or 'WEEKLY' granularity filter
+        lookback_days: Number of days to look back (default: 14)
+
+    Returns:
+        tuple: (instance_dict, rows_list) if found, (None, []) otherwise
     """
     try:
         resp = _asc_api_call(
@@ -339,10 +424,22 @@ def _parse_iso_date(date_str):
         raise ValueError(f"Unable to parse date: {date_str}")
 
 def _download_report_segments(instance_id):
-    """Download and parse CSV segments from report instance."""
+    """Download and parse CSV segments from report instance.
+
+    Handles pagination through segment links, downloads each segment
+    (with GZIP decompression if needed), and parses CSV/TSV data.
+    Adds segment metadata to each row for tracking.
+
+    Args:
+        instance_id: Analytics report instance ID
+
+    Returns:
+        list: List of dictionaries, each representing a data row with
+              segment metadata (__segment_id, __segment_start, __segment_end)
+    """
     try:
         response = _asc_api_call("GET", f"/v1/analyticsReportInstances/{instance_id}/segments")
-        # Collect all pages by following links.next with Authorization header
+        # Process segments incrementally to reduce memory usage
         segments_data = []
         resp = response
         while True:
@@ -362,6 +459,8 @@ def _download_report_segments(instance_id):
         if not segments_data:
             LOG.debug("No segments returned for instance %s", instance_id)
         LOG.debug("Segments for instance %s: %s", instance_id, [s.get("id") for s in segments_data])
+
+        # Process segments in chunks to reduce memory usage
         all_rows = []
 
         for segment in segments_data:
@@ -424,8 +523,8 @@ def _download_report_segments(instance_id):
             LOG.debug("Segment %s download: ctype=%s, compression_attr=%s, url_ext=%s", segment.get("id"), ctype, compression, ext)
             LOG.debug("Segment %s url host=%s size=%dB", segment.get("id"), urlparse(segment_url).netloc, len(content))
 
-            def _parse_csv_bytes(data: bytes) -> int:
-                """Parse CSV/TSV text bytes into all_rows; return number of parsed rows."""
+            def _parse_csv_bytes(data: bytes) -> list:
+                """Parse CSV/TSV text bytes; return list of parsed rows."""
                 # Decode text with common encodings
                 text = None
                 for enc in ("utf-8-sig", "utf-8", "utf-16", "utf-16le", "latin-1"):
@@ -445,7 +544,7 @@ def _download_report_segments(instance_id):
                 except Exception:
                     delimiter = '\t' if '\t' in sample else (';' if ';' in sample else ',')
                     reader = csv.DictReader(buf, delimiter=delimiter)
-                rows_parsed_local = 0
+                rows_parsed_local = []
                 for row in reader:
                     # Skip completely empty rows
                     if not row or all((v is None or (isinstance(v, str) and not v.strip())) for v in row.values()):
@@ -454,8 +553,8 @@ def _download_report_segments(instance_id):
                     row_dict["__segment_id"] = segment["id"]
                     row_dict["__segment_start"] = seg_attrs.get("startDate", "")
                     row_dict["__segment_end"] = seg_attrs.get("endDate", "")
-                    all_rows.append(row_dict)
-                    rows_parsed_local += 1
+                    rows_parsed_local.append(row_dict)
+                LOG.debug("Parsed %d rows from segment %s", len(rows_parsed_local), segment.get("id"))
                 return rows_parsed_local
 
             try:
@@ -477,33 +576,26 @@ def _download_report_segments(instance_id):
                         # Already decompressed or not a valid gzip; continue with data_bytes as-is
                         pass
 
-                rows_parsed = _parse_csv_bytes(data_bytes)
-                LOG.debug("Parsed %d rows from segment %s (csv/plain)", rows_parsed, segment.get("id"))
-                if rows_parsed == 0:
-                    try:
-                        # Log fieldnames even if there are no data rows to help identify available columns
-                        buf = io.StringIO(data_bytes.decode("utf-8-sig", errors="ignore"))
-                        sample = buf.read(8192)
-                        buf.seek(0)
-                        try:
-                            dialect = csv.Sniffer().sniff(sample, delimiters='\t,;')
-                            rdr = csv.DictReader(buf, dialect=dialect)
-                        except Exception:
-                            delimiter = '\t' if '\t' in sample else (';' if ';' in sample else ',')
-                            rdr = csv.DictReader(buf, delimiter=delimiter)
-                        LOG.debug("Segment %s CSV headers (no data rows): %s", segment.get("id"), rdr.fieldnames)
-                    except Exception as _e_headers:
-                        LOG.debug("Segment %s headers could not be determined: %s", segment.get("id"), _e_headers)
-                    LOG.debug("Segment %s had zero data rows (ctype=%s, compression=%s, ext=%s)", segment.get("id"), ctype, compression, ext)
+                # Parse and add rows
+                parsed_rows = _parse_csv_bytes(data_bytes)
+                all_rows.extend(parsed_rows)
+                LOG.debug("Parsed %d rows from segment %s (csv/plain)", len(parsed_rows), segment.get("id"))
 
+            except UnicodeDecodeError as e:
+                LOG.warning("Failed to decode segment %s content as text: %s (ctype=%s, len=%s)", segment.get("id"), e, ctype, len(content))
+            except csv.Error as e:
+                LOG.warning("Failed to parse segment %s as CSV: %s (ctype=%s, len=%s)", segment.get("id"), e, ctype, len(content))
             except Exception as e:
-                LOG.warning("Failed to parse segment %s content: %s (ctype=%s, len=%s)", segment.get("id"), e, ctype, len(content))
+                LOG.warning("Unexpected error parsing segment %s: %s (ctype=%s, len=%s)", segment.get("id"), e, ctype, len(content))
 
         LOG.debug("Total rows parsed for instance %s: %d", instance_id, len(all_rows))
         return all_rows
 
+    except requests.RequestException as e:
+        LOG.error("Network error downloading segments: %s", e)
+        return []
     except Exception as e:
-        LOG.error("Failed to download segments: %s", e)
+        LOG.error("Unexpected error downloading segments: %s", e)
         return []
 
 def _extract_number(value):
@@ -541,7 +633,25 @@ def _export_metrics(app_info, row, metric_name, value, row_date):
             LOG.debug("Exported %s=%s with labels %s", metric_name, value, labels)
 
 def _process_analytics_data(app_info, report_type, metric_name, value_patterns, granularity, country_column, row_filter=None):
-    """Process analytics data for a specific report type, using the freshest instance by configured granularity (DAILY or WEEKLY)."""
+    """Process analytics data for a specific report type and export to Prometheus.
+
+    Main processing pipeline:
+    1. Finds the report request and specific report by name
+    2. Gets the freshest instance with the specified granularity
+    3. Applies row filters (e.g., only First-time downloads)
+    4. Groups data by schema to handle different dimensional cuts
+    5. Deduplicates data across segments to prevent double-counting
+    6. Exports metrics with proper labels to Prometheus
+
+    Args:
+        app_info: App configuration dict with 'id', 'name', 'bundle_id'
+        report_type: Exact name of the Apple analytics report
+        metric_name: Internal metric key (e.g., 'daily_user_installs')
+        value_patterns: List with column name containing the metric value
+        granularity: 'DAILY' or 'WEEKLY' instance granularity
+        country_column: Column name for country/territory data
+        row_filter: Optional dict with 'column' and 'equals' for filtering rows
+    """
     app_id = app_info["id"]
     app_name = app_info["name"]
 
@@ -551,6 +661,9 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
     total_duplicates = 0
 
     try:
+        # Track errors for this app
+        parse_error_count = 0
+
         # Find existing report request
         report_request_id = _find_existing_report_request(app_id)
         if not report_request_id:
@@ -713,9 +826,19 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
 
     except Exception as e:
         LOG.error("Failed to process %s for %s: %s", report_type, app_name, e)
+        # Increment error counter for this app and report type
+        if 'parsing_errors_counter' in globals():
+            parsing_errors_counter.labels(app=app_name, report_type=report_type).inc()
 
 def _process_app_metrics(app_info):
-    """Process all metrics for an app."""
+    """Process all configured metrics for a single app.
+
+    Iterates through all metrics defined in METRICS configuration
+    and processes each one with its specific report type and filters.
+
+    Args:
+        app_info: App configuration dict with 'id', 'name', 'bundle_id'
+    """
     app_name = app_info["name"]
     LOG.info("Processing metrics for: %s", app_name)
 
@@ -731,27 +854,54 @@ def _process_app_metrics(app_info):
         )
 
 def _run_metrics_collection():
-    """Run metrics collection for all configured apps."""
-    global REGISTRY, counters
-    REGISTRY = CollectorRegistry()
-    _init_metrics()
+    """Run metrics collection for all configured apps with health state tracking."""
+    global REGISTRY, counters, _health_state
+    with _registry_lock:
+        REGISTRY = CollectorRegistry()
+        _init_metrics()
 
     LOG.info("Starting metrics collection for %d apps", len(APPS))
 
+    collection_errors = []
     for app_info in APPS:
         try:
             _process_app_metrics(app_info)
         except Exception as e:
             LOG.error("Failed to process app %s: %s", app_info["name"], e)
+            collection_errors.append(str(e))
 
-    LOG.info("Metrics collection completed")
+    # Update health state based on collection results (thread-safe)
+    with _health_state_lock:
+        _health_state["collections_count"] += 1
+
+        if not collection_errors:
+            _health_state["healthy"] = True
+            _health_state["last_successful_collection"] = dt.datetime.now()
+            _health_state["last_error"] = None
+            LOG.info("Metrics collection completed successfully")
+        else:
+            # Partial success - some apps collected successfully
+            if len(collection_errors) < len(APPS):
+                _health_state["healthy"] = True
+                _health_state["last_successful_collection"] = dt.datetime.now()
+            _health_state["last_error"] = f"Failed to collect metrics for {len(collection_errors)}/{len(APPS)} apps"
+            LOG.info("Metrics collection completed with %d errors", len(collection_errors))
+
+        # Update last collection timestamp
+        if _health_state["healthy"] and 'last_collection_timestamp' in globals():
+            last_collection_timestamp.set(time.time())
 
 # ------------ Background Collection ------------
 _collection_thread = None
 _stop_event = threading.Event()
 
 def _background_collection():
-    """Background collection thread."""
+    """Background collection thread main loop.
+
+    Runs metrics collection at regular intervals, handling both
+    normal operation and test mode. Updates health state based
+    on collection success/failure.
+    """
     LOG.info("Starting background collection (interval: %ss)", COLLECTION_INTERVAL)
 
     if TEST_MODE:
@@ -784,6 +934,10 @@ def _background_collection():
             _run_metrics_collection()
         except Exception as e:
             LOG.exception("Collection failed: %s", e)
+            # Update health state on total collection failure (thread-safe)
+            with _health_state_lock:
+                _health_state["healthy"] = False
+                _health_state["last_error"] = str(e)
 
         _stop_event.wait(COLLECTION_INTERVAL)
 
@@ -807,18 +961,48 @@ def stop_background_collection():
 
 # ------------ HTTP Server ------------
 def app(environ, start_response):
-    """WSGI application handler."""
+    """WSGI application handler with health-aware status reporting."""
     path = environ.get("PATH_INFO", "/")
 
+    # Log requests only in DEBUG mode
+    if LOG.isEnabledFor(logging.DEBUG):
+        LOG.debug("HTTP request: %s %s", environ.get("REQUEST_METHOD", "GET"), path)
+
     if path == "/healthz":
-        start_response("200 OK", [("Content-Type", "text/plain; charset=utf-8")])
-        return [b"ok\n"]
+        # Check actual health state (thread-safe read)
+        with _health_state_lock:
+            is_healthy = _health_state["healthy"] and _health_state["collections_count"] > 0
+            collections_count = _health_state["collections_count"]
+            last_collection = _health_state.get('last_successful_collection', 'never')
+            last_error = _health_state.get('last_error', 'unknown error')
+
+        if is_healthy:
+            start_response("200 OK", [("Content-Type", "text/plain; charset=utf-8")])
+            response = "ok\n"
+            if LOG.isEnabledFor(logging.DEBUG):
+                response = f"ok - last successful collection: {last_collection}\n"
+            return [response.encode('utf-8')]
+        else:
+            # Not healthy yet - either no collections or last collection failed
+            status = "503 Service Unavailable"
+            start_response(status, [("Content-Type", "text/plain; charset=utf-8")])
+            if collections_count == 0:
+                response = "not ready - no collections completed yet\n"
+            else:
+                response = f"unhealthy - {last_error}\n"
+            return [response.encode('utf-8')]
 
     if path != "/metrics":
         start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
         return [b"not found\n"]
 
-    output = generate_latest(REGISTRY)
+    # Log metrics access only in DEBUG mode
+    if LOG.isEnabledFor(logging.DEBUG):
+        LOG.debug("Serving metrics endpoint")
+
+    # Use lock to prevent reading REGISTRY during recreation
+    with _registry_lock:
+        output = generate_latest(REGISTRY)
     start_response("200 OK", [("Content-Type", CONTENT_TYPE_LATEST)])
     return [output]
 
