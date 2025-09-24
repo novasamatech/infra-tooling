@@ -103,7 +103,6 @@ subsequent collections fail (as cached metrics are still being served).
 - **Debug Optimization**: Expensive debug calculations only performed when LOG_LEVEL=DEBUG
 - **Set-based Operations**: Uses efficient set operations for date parsing and deduplication
 - **Single Pass Processing**: Extracts all five metrics in a single pass through CSV data
-- **C Extension Support**: Dockerfile includes build dependencies for google-crc32c C extension
 
 ## Error Handling
 
@@ -145,8 +144,6 @@ subsequent collections fail (as cached metrics are still being served).
 The exporter includes a Dockerfile with:
 - Alpine-based Python 3.13 image
 - Non-root user execution (uid/gid 1000)
-- Build dependencies for C extensions (google-crc32c)
-- Optimized layer caching
 
 Build and run:
 ```bash
