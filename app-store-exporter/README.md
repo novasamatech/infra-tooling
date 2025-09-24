@@ -282,6 +282,9 @@ For issues and feature requests, please create an issue in the project repositor
 
 ## Changelog
 
+### v1.1.1
+- **WSGI Log Suppression**: Fixed HTTP access logs to only appear in DEBUG mode (including WSGI server logs)
+
 ### v1.1.0
 - **Breaking Change**: All environment variables now use `APPSTORE_EXPORTER_` prefix for consistency
 - **Improved Health Check**: Service is healthy only after first successful collection
