@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
+# Copyright © 2025 Novasama Technologies GmbH
+# SPDX-License-Identifier: Apache-2.0
+
 """
 ASC Analytics Requests Manager (ONGOING only)
 
@@ -12,9 +16,13 @@ Description:
 
 CLI options:
   --issuer           <ISSUER_ID>      Required. Issuer ID from App Store Connect → Users and Access → Integrations.
+                                       Can also be set via APPSTORE_EXPORTER_ISSUER_ID environment variable.
   --key-id           <KEY_ID>         Required. Key ID for your .p8 key (shown next to the generated key).
+                                       Can also be set via APPSTORE_EXPORTER_KEY_ID environment variable.
   --p8               <PATH>           Required. Path to the private key file, e.g. AuthKey_XXXXXX.p8.
+                                       Can also be set via APPSTORE_EXPORTER_PRIVATE_KEY environment variable.
   --bundles          <LIST>           Required. Comma-separated bundle IDs, e.g. com.app.one,com.app.two.
+                                       Can also be set via APPSTORE_EXPORTER_BUNDLE_IDS environment variable.
   --create                          Optional. Create ONGOING requests for each bundle (DEFAULT action if no flag specified).
   --delete                          Optional. Delete existing ONGOING requests for each bundle.
   --list                            Optional. List existing ONGOING requests and available reports for each bundle and exit.
@@ -536,13 +544,29 @@ def main():
     ap = argparse.ArgumentParser(
         description="Create/Delete/List App Store Connect Analytics ONGOING report requests for multiple apps."
     )
-    ap.add_argument("--issuer", required=True, help="Issuer ID (Users and Access → Integrations)")
-    ap.add_argument("--key-id", required=True, help="Key ID for the .p8")
-    ap.add_argument("--p8", required=True, help="Path to AuthKey_XXXXXX.p8")
+    ap.add_argument(
+        "--issuer",
+        default=os.environ.get("APPSTORE_EXPORTER_ISSUER_ID"),
+        required=not os.environ.get("APPSTORE_EXPORTER_ISSUER_ID"),
+        help="Issuer ID (Users and Access → Integrations). Default: APPSTORE_EXPORTER_ISSUER_ID env var"
+    )
+    ap.add_argument(
+        "--key-id",
+        default=os.environ.get("APPSTORE_EXPORTER_KEY_ID"),
+        required=not os.environ.get("APPSTORE_EXPORTER_KEY_ID"),
+        help="Key ID for the .p8. Default: APPSTORE_EXPORTER_KEY_ID env var"
+    )
+    ap.add_argument(
+        "--p8",
+        default=os.environ.get("APPSTORE_EXPORTER_PRIVATE_KEY"),
+        required=not os.environ.get("APPSTORE_EXPORTER_PRIVATE_KEY"),
+        help="Path to AuthKey_XXXXXX.p8. Default: APPSTORE_EXPORTER_PRIVATE_KEY env var"
+    )
     ap.add_argument(
         "--bundles",
-        required=True,
-        help="Comma-separated bundle IDs, e.g. com.app.one,com.app.two",
+        default=os.environ.get("APPSTORE_EXPORTER_BUNDLE_IDS"),
+        required=not os.environ.get("APPSTORE_EXPORTER_BUNDLE_IDS"),
+        help="Comma-separated bundle IDs, e.g. com.app.one,com.app.two. Default: APPSTORE_EXPORTER_BUNDLE_IDS env var",
     )
     ap.add_argument("--create", action="store_true", help="Create ONGOING requests (default action)")
     ap.add_argument("--delete", action="store_true", help="Delete existing ONGOING requests")

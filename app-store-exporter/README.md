@@ -1,6 +1,6 @@
 # Apple App Store Connect Metrics Exporter
 
-Prometheus exporter for Apple App Store Connect analytics metrics. This exporter fetches daily metrics from the App Store Connect API and exposes them as Prometheus counters.
+Prometheus exporter for Apple App Store Connect analytics metrics. This exporter fetches daily metrics from the App Store Connect API and exposes them as Prometheus counters with built-in observability metrics.
 
 
 ## Dependencies
@@ -40,6 +40,9 @@ Prometheus exporter for Apple App Store Connect analytics metrics. This exporter
 | `appstore_daily_user_installs` | Daily user installs (App Units) by country | `app`, `country`, `platform_version`, `source_type` |
 | `appstore_active_devices` | Active devices by country (proxy for active device installs) | `app`, `country`, `device`, `platform_version`, `source_type` |
 | `appstore_uninstalls` | Uninstalls by country (Installation and Deletion) | `app`, `country`, `device`, `platform_version`, `source_type` |
+| **Exporter Metrics** | | |
+| `appstore_exporter_parsing_errors_total` | Total parsing errors encountered | `app`, `report_type` |
+| `appstore_exporter_last_collection_timestamp` | Unix timestamp of last successful collection | - |
 
 ## Prerequisites
 
@@ -139,16 +142,16 @@ Apple typically processes reports within 24-48 hours after creation. The exporte
 
 ```bash
 # App Store Connect API credentials
-export APPSTORE_ISSUER_ID="your_issuer_id_here"
-export APPSTORE_KEY_ID="your_key_id_here"
-export APPSTORE_PRIVATE_KEY="/path/to/AuthKey_XXXXXX.p8"
+export APPSTORE_EXPORTER_ISSUER_ID="your_issuer_id_here"
+export APPSTORE_EXPORTER_KEY_ID="your_key_id_here"
+export APPSTORE_EXPORTER_PRIVATE_KEY="/path/to/AuthKey_XXXXXX.p8"
 
 # Optional: Customize behavior
-export PORT="8000"  # HTTP server port (default: 8000)
-export COLLECTION_INTERVAL_SECONDS="43200"  # Collection interval in seconds (default: 12 hours)
-export DAYS_TO_FETCH="14"  # Number of days to fetch data for (default: 14)
-export LOG_LEVEL="INFO"  # Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL
-export TEST_MODE=""  # Set to "1" for test mode (run once and exit)
+export APPSTORE_EXPORTER_PORT="8000"  # HTTP server port (default: 8000)
+export APPSTORE_EXPORTER_COLLECTION_INTERVAL_SECONDS="43200"  # Collection interval in seconds (default: 12 hours)
+export APPSTORE_EXPORTER_DAYS_TO_FETCH="14"  # Number of days to fetch data for (default: 14)
+export APPSTORE_EXPORTER_LOG_LEVEL="INFO"  # Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+export APPSTORE_EXPORTER_TEST_MODE=""  # Set to "1" for test mode (run once and exit)
 
 ### App Configuration
 
@@ -156,22 +159,22 @@ Configure one or multiple apps using these environment variables:
 
 **Single app configuration:**
 ```bash
-export APPSTORE_APP_ID="your_app_id_here"  # Required: App Store Connect App ID (numeric)
-export APPSTORE_BUNDLE_ID="your.bundle.id"  # Optional: Bundle ID for better logging and metrics labels
+export APPSTORE_EXPORTER_APP_ID="your_app_id_here"  # Required: App Store Connect App ID (numeric)
+export APPSTORE_EXPORTER_BUNDLE_ID="your.bundle.id"  # Optional: Bundle ID for better logging and metrics labels
 ```
 
 **Multiple apps configuration (comma-separated lists):**
 ```bash
-export APPSTORE_APP_IDS="app_id_1,app_id_2,app_id_3"  # Comma-separated list of App IDs
-export APPSTORE_BUNDLE_IDS="bundle.id.1,bundle.id.2,bundle.id.3"  # Optional: Comma-separated list of corresponding bundle IDs
+export APPSTORE_EXPORTER_APP_IDS="app_id_1,app_id_2,app_id_3"  # Comma-separated list of App IDs
+export APPSTORE_EXPORTER_BUNDLE_IDS="bundle.id.1,bundle.id.2,bundle.id.3"  # Optional: Comma-separated list of corresponding bundle IDs
 ```
 
 **Important notes:**
-- `APPSTORE_APP_ID` or `APPSTORE_APP_IDS` is required for API calls
-- `APPSTORE_BUNDLE_ID`/`APPSTORE_BUNDLE_IDS` are optional but recommended for better readability
+- `APPSTORE_EXPORTER_APP_ID` or `APPSTORE_EXPORTER_APP_IDS` is required for API calls
+- `APPSTORE_EXPORTER_BUNDLE_ID`/`APPSTORE_EXPORTER_BUNDLE_IDS` are optional but recommended for better readability
 - If bundle ID is not provided, the exporter will use "App_{app_id}" format
-- For multiple apps, the order in `APPSTORE_APP_IDS` and `APPSTORE_BUNDLE_IDS` must match
-- If `APPSTORE_BUNDLE_IDS` has fewer items than `APPSTORE_APP_IDS`, missing bundle IDs will use fallback names
+- For multiple apps, the order in `APPSTORE_EXPORTER_APP_IDS` and `APPSTORE_EXPORTER_BUNDLE_IDS` must match
+- If `APPSTORE_EXPORTER_BUNDLE_IDS` has fewer items than `APPSTORE_EXPORTER_APP_IDS`, missing bundle IDs will use fallback names
 ```
 
 ### Generating App Store Connect API Credentials
@@ -192,73 +195,60 @@ export APPSTORE_BUNDLE_IDS="bundle.id.1,bundle.id.2,bundle.id.3"  # Optional: Co
 ### Production Deployment
 
 ```bash
-APPSTORE_ISSUER_ID="your_issuer_id" \
-APPSTORE_KEY_ID="your_key_id" \
-APPSTORE_PRIVATE_KEY="/path/to/AuthKey.p8" \
-APPSTORE_APP_ID="your_app_id" \
-APPSTORE_BUNDLE_ID="your.bundle.id" \
+APPSTORE_EXPORTER_ISSUER_ID="your_issuer_id" \
+APPSTORE_EXPORTER_KEY_ID="your_key_id" \
+APPSTORE_EXPORTER_PRIVATE_KEY="/path/to/AuthKey.p8" \
+APPSTORE_EXPORTER_APP_ID="your_app_id" \
+APPSTORE_EXPORTER_BUNDLE_ID="your.bundle.id" \
 python exporter.py
 
 # Multiple apps with custom settings:
-PORT="9090" \
-COLLECTION_INTERVAL_SECONDS="21600" \
-DAYS_TO_FETCH="7" \
-APPSTORE_ISSUER_ID="your_issuer_id" \
-APPSTORE_KEY_ID="your_key_id" \
-APPSTORE_PRIVATE_KEY="/path/to/AuthKey.p8" \
-APPSTORE_APP_IDS="1234567890,9876543210" \
-APPSTORE_BUNDLE_IDS="com.company.app1,com.company.app2" \
-python exporter.py
-
-# Multiple apps example:
-APPSTORE_ISSUER_ID="your_issuer_id" \
-APPSTORE_KEY_ID="your_key_id" \
-APPSTORE_PRIVATE_KEY="/path/to/AuthKey.p8" \
-APPSTORE_APP_IDS="1234567890,9876543210" \
-APPSTORE_BUNDLE_IDS="com.company.app1,com.company.app2" \
+APPSTORE_EXPORTER_PORT="9090" \
+APPSTORE_EXPORTER_COLLECTION_INTERVAL_SECONDS="21600" \
+APPSTORE_EXPORTER_DAYS_TO_FETCH="7" \
+APPSTORE_EXPORTER_ISSUER_ID="your_issuer_id" \
+APPSTORE_EXPORTER_KEY_ID="your_key_id" \
+APPSTORE_EXPORTER_PRIVATE_KEY="/path/to/AuthKey.p8" \
+APPSTORE_EXPORTER_APP_IDS="1234567890,9876543210" \
+APPSTORE_EXPORTER_BUNDLE_IDS="com.company.app1,com.company.app2" \
 python exporter.py
 ```
 
 ### Debug Mode
 
 ```bash
-LOG_LEVEL="DEBUG" \
-APPSTORE_ISSUER_ID="your_issuer_id" \
-APPSTORE_KEY_ID="your_key_id" \
-APPSTORE_PRIVATE_KEY="/path/to/AuthKey.p8" \
-APPSTORE_APP_ID="your_app_id" \
-APPSTORE_BUNDLE_ID="your.bundle.id" \
-TEST_MODE="1" \
-python exporter.py
-
-# Multiple apps test example:
-APPSTORE_ISSUER_ID="your_issuer_id" \
-APPSTORE_KEY_ID="your_key_id" \
-APPSTORE_PRIVATE_KEY="/path/to/AuthKey.p8" \
-APPSTORE_APP_IDS="1234567890,9876543210" \
-APPSTORE_BUNDLE_IDS="com.company.app1,com.company.app2" \
-TEST_MODE="1" \
+APPSTORE_EXPORTER_LOG_LEVEL="DEBUG" \
+APPSTORE_EXPORTER_ISSUER_ID="your_issuer_id" \
+APPSTORE_EXPORTER_KEY_ID="your_key_id" \
+APPSTORE_EXPORTER_PRIVATE_KEY="/path/to/AuthKey.p8" \
+APPSTORE_EXPORTER_APP_ID="your_app_id" \
+APPSTORE_EXPORTER_BUNDLE_ID="your.bundle.id" \
+APPSTORE_EXPORTER_TEST_MODE="1" \
 python exporter.py
 ```
 
-### Custom Configuration
+### Testing
+
+Run unit tests and integration tests:
 
 ```bash
-PORT="9090" \
-COLLECTION_INTERVAL_SECONDS="21600" \
-DAYS_TO_FETCH="7" \
-APPSTORE_ISSUER_ID="your_issuer_id" \
-APPSTORE_KEY_ID="your_key_id" \
-APPSTORE_PRIVATE_KEY="/path/to/AuthKey.p8" \
-APPSTORE_APP_ID="your_app_id" \
-APPSTORE_BUNDLE_ID="your.bundle.id" \
-python exporter.py
+# Run unit tests
+python test_exporter.py
+
+# Run with debug output
+python test_exporter.py --debug
+
+# Run integration tests with mocked API
+python test_exporter.py --integration
+
+# Test against real API (requires valid credentials)
+python test_exporter.py --real-api
 ```
 
 ## API Endpoints
 
 - **`/metrics`**: Prometheus metrics endpoint
-- **`/healthz`**: Health check endpoint
+- **`/healthz`**: Health check endpoint (returns 200 OK only after successful collection)
 
 ## Docker Deployment
 
@@ -266,30 +256,12 @@ python exporter.py
 docker build -t appstore-exporter .
 docker run -d \
   -p 8000:8000 \
-  -e APPSTORE_ISSUER_ID="your_issuer_id" \
-  -e APPSTORE_KEY_ID="your_key_id" \
-  -e APPSTORE_PRIVATE_KEY="/path/to/AuthKey.p8" \
-  -e APPSTORE_APP_ID="your_app_id" \
-  -e APPSTORE_BUNDLE_ID="your.bundle.id" \
+  -e APPSTORE_EXPORTER_ISSUER_ID="your_issuer_id" \
+  -e APPSTORE_EXPORTER_KEY_ID="your_key_id" \
+  -e APPSTORE_EXPORTER_PRIVATE_KEY="/path/to/AuthKey.p8" \
+  -e APPSTORE_EXPORTER_APP_ID="your_app_id" \
+  -e APPSTORE_EXPORTER_BUNDLE_ID="your.bundle.id" \
   appstore-exporter
-
-# Multiple apps Docker example:
-docker run -d \
-  -p 8000:8000 \
-  -e APPSTORE_ISSUER_ID="your_issuer_id" \
-  -e APPSTORE_KEY_ID="your_key_id" \
-  -e APPSTORE_PRIVATE_KEY="/path/to/AuthKey.p8" \
-  -e APPSTORE_APP_IDS="1234567890,9876543210" \
-  -e APPSTORE_BUNDLE_IDS="com.company.app1,com.company.app2" \
-  appstore-exporter
-```
-
-### Debug Logging
-
-Enable debug logging for detailed information:
-
-```bash
-LOG_LEVEL="DEBUG" python exporter.py
 ```
 
 ## License
@@ -310,15 +282,29 @@ For issues and feature requests, please create an issue in the project repositor
 
 ## Changelog
 
+### v1.1.0
+- **Breaking Change**: All environment variables now use `APPSTORE_EXPORTER_` prefix for consistency
+- **Improved Health Check**: Service is healthy only after first successful collection
+- **Enhanced Logging**: HTTP endpoint access logged only in DEBUG mode to reduce noise
+- **Better Error Handling**: Improved health state tracking with partial failure support
+- **Code Documentation**: Added comprehensive docstrings to all major functions
+- **Testing Framework**: Added comprehensive test suite with unit and integration tests
+- **Performance**: Optimized report caching to reduce API calls
+- **Stability**: Added retry logic with exponential backoff for transient failures
+- **Thread Safety**: Added registry lock to prevent race conditions during metric collection
+- **Self-Monitoring Metrics**: Added exporter's own metrics for observability:
+  - `appstore_exporter_parsing_errors_total`: Track parsing errors per app and report type
+  - `appstore_exporter_last_collection_timestamp`: Monitor freshness of collected data
+- **Improved Error Handling**: More granular exception handling for CSV parsing (UnicodeDecodeError, csv.Error)
+
 ### v1.0.0
-- Initial release with comprehensive Apple App Store Connect metrics export
+- **Init**: Initial release with comprehensive Apple App Store Connect metrics export
 - **Multi-metric Support**: 3 core metrics with proper filtering logic
 - **Enhanced Label System**: Multi-dimensional labels (country, device, platform version, source type)
-- **Advanced Filtering**: Row-level filtering for accurate metric extraction (First-time downloads, Delete events)
-- **Duplicate Protection**: Prevents double-counting across report segments and dimensions
+- **Advanced Filtering**: Row-level filtering for accurate metric extraction
+- **Duplicate Protection**: Prevents double-counting across segments
 - **Segment-aware Processing**: Handles multiple segments with different schemas
 - **Granularity Support**: DAILY and WEEKLY processing based on metric requirements
-- **Flexible App Configuration**: Support for single and multiple apps with bundle ID mapping
-- **Automatic App Discovery**: Finds and processes available analytics reports
+- **Flexible App Configuration**: Support for single and multiple apps
 - **Prometheus Integration**: Standard /metrics endpoint with proper label support
 - **Report Management**: Includes utility for managing analytics report requests
