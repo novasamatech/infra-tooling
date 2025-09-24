@@ -9,6 +9,13 @@ FROM python:3.13-alpine
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+# Install build dependencies for C extensions
+RUN apk add --no-cache \
+    gcc \
+    musl-dev \
+    python3-dev \
+    libffi-dev
+
 # Create a non-privileged user and group (pyuser)
 # -D: do not create a home directory, -G: set the group
 RUN addgroup -g 1000 pyuser && adduser -D -G pyuser -u 1000 pyuser
@@ -16,14 +23,14 @@ RUN addgroup -g 1000 pyuser && adduser -D -G pyuser -u 1000 pyuser
 # Define the working directory inside the container
 WORKDIR /app
 
-# Copy the Python script into the container
-COPY exporter.py .
-
 # Copy the requirements.txt file into the container
 COPY requirements.txt .
 
-# Install dependencies without caching
+# Install dependencies without caching (includes C extension compilation)
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the Python script into the container
+COPY exporter.py .
 
 # Switch to the non-privileged user
 USER pyuser
