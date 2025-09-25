@@ -146,7 +146,7 @@ def _init_metrics():
     counters = {}
     for m in METRICS:
         # Convert label mapping to list of label names for Prometheus
-        label_names = ["app"]  # Always include app label
+        label_names = ["package"]  # Always include package label
         if "labels" in m:
             label_names.extend(m["labels"].keys())
         c = Counter(m["prom_name"], m["help"], label_names, registry=REGISTRY)
@@ -157,7 +157,7 @@ def _init_metrics():
     parsing_errors_counter = Counter(
         'appstore_exporter_parsing_errors_total',
         'Total number of parsing errors per app and report',
-        ['app', 'report_type'],
+        ['package', 'report_type'],
         registry=REGISTRY
     )
     last_collection_timestamp = Gauge(
@@ -618,16 +618,16 @@ def _export_metrics(app_info, row, metric_name, value, row_date):
         timestamp_ms = int(dt.datetime.combine(report_date, dt.time.min).timestamp() * 1000)
 
     if metric_name in counters:
-        counter = counters[metric_name]
+        metric = counters[metric_name]
         # Build labels from the mapping configuration for this specific metric
-        labels = {"app": app_info["name"]}  # Fixed app label from app config
+        labels = {"package": app_info["name"]}  # Fixed package label from app config
         metric_config = next((m for m in METRICS if m["key"] == metric_name), None)
         if metric_config and "labels" in metric_config:
             for label_name, field_name in metric_config["labels"].items():
                 labels[label_name] = row.get(field_name, "")
 
-        if hasattr(counter.labels(**labels), '_value'):
-            counter.labels(**labels)._value.set(value, timestamp=timestamp_ms)
+        if hasattr(metric.labels(**labels), '_value'):
+            metric.labels(**labels)._value.set(value, timestamp=timestamp_ms)
 
         if LOG.isEnabledFor(logging.DEBUG) and value > 0:
             LOG.debug("Exported %s=%s with labels %s", metric_name, value, labels)
@@ -746,65 +746,65 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
                 seg_id = row.get("__segment_id") or "NO_SEGMENT"
                 filtered_rows.append((seg_id, row))
 
-                # Group rows by schema (set of non-metadata columns) to handle different data slices separately
-                LOG.debug("Built filtered_rows=%d for candidate '%s', instance %s", len(filtered_rows), candidate, instance_id)
+            # Group rows by schema (set of non-metadata columns) to handle different data slices separately
+            LOG.debug("Built filtered_rows=%d for candidate '%s', instance %s", len(filtered_rows), candidate, instance_id)
 
-                # Group rows by their schema signature (excluding internal metadata columns)
-                for seg_id, row in filtered_rows:
-                    # Get schema signature (all non-metadata columns)
-                    schema_cols = tuple(sorted(k for k in row.keys() if not k.startswith('__')))
-                    if schema_cols not in rows_by_schema:
-                        rows_by_schema[schema_cols] = []
-                    rows_by_schema[schema_cols].append((seg_id, row))
+            # Group rows by their schema signature (excluding internal metadata columns)
+            for seg_id, row in filtered_rows:
+                # Get schema signature (all non-metadata columns)
+                schema_cols = tuple(sorted(k for k in row.keys() if not k.startswith('__')))
+                if schema_cols not in rows_by_schema:
+                    rows_by_schema[schema_cols] = []
+                rows_by_schema[schema_cols].append((seg_id, row))
 
-                # Process each schema group separately
-                for schema_cols, schema_rows in rows_by_schema.items():
-                    LOG.debug("Processing schema group with %d rows, columns: %s", len(schema_rows), schema_cols)
+            # Process each schema group separately
+            for schema_cols, schema_rows in rows_by_schema.items():
+                LOG.debug("Processing schema group with %d rows, columns: %s", len(schema_rows), schema_cols)
 
-                    schema_seen_keys = set()
-                    schema_duplicates = 0
+                schema_seen_keys = set()
+                schema_duplicates = 0
 
-                    for seg_id, row in schema_rows:
-                        # Strict value extraction: use the exact configured value column only
-                        if not value_col or (row.get(value_col) in (None, "")):
-                            continue
+                for seg_id, row in schema_rows:
+                    # Strict value extraction: use the exact configured value column only
+                    if not value_col or (row.get(value_col) in (None, "")):
+                        continue
 
-                        # Create comprehensive unique key including all dimensions
-                        date_val = (row.get("Date") or row.get("Processing Date") or row.get("__segment_start") or processing_date or "").strip()[:10]
+                    # Create comprehensive unique key including all dimensions
+                    date_val = (row.get("Date") or row.get("Processing Date") or row.get("__segment_start") or processing_date or "").strip()[:10]
 
-                        # Build key from all dimension columns except value column (no metadata)
-                        dimension_keys = []
-                        for col in schema_cols:
-                            if col != value_col and not col.startswith('__'):
-                                dim_value = str(row.get(col, '')).strip()
-                                dimension_keys.append(f"{col}={dim_value}")
+                    # Build key from all dimension columns except value column (no metadata)
+                    dimension_keys = []
+                    for col in schema_cols:
+                        if col != value_col and not col.startswith('__'):
+                            dim_value = str(row.get(col, '')).strip()
+                            dimension_keys.append(f"{col}={dim_value}")
 
-                        unique_key = f"{date_val}_" + "_".join(sorted(dimension_keys))
+                    unique_key = f"{date_val}_" + "_".join(sorted(dimension_keys))
 
-                        # Check for duplicates within this schema group
-                        if unique_key in schema_seen_keys:
-                            if LOG.isEnabledFor(logging.DEBUG):
-                                LOG.debug("Duplicate detected for key %s - skipping to avoid double-counting", unique_key)
-                            schema_duplicates += 1
-                            continue
-
-                        schema_seen_keys.add(unique_key)
-
-                        # Extract value and export immediately with proper labels
-                        value = _extract_number(row.get(value_col))
-                        if value < 0:
-                            continue
-
-                        _export_metrics(app_info, row, metric_name, value, date_val)
-                        exported_count += 1
-
+                    # Check for duplicates within this schema group
+                    if unique_key in schema_seen_keys:
                         if LOG.isEnabledFor(logging.DEBUG):
-                            LOG.debug("Exported %s=%s from segment %s (key: %s)",
-                                     value_col, value, seg_id, unique_key)
+                            LOG.debug("Duplicate detected for key %s - skipping to avoid double-counting", unique_key)
+                        schema_duplicates += 1
+                        continue
 
-                    total_duplicates += schema_duplicates
-                    if schema_duplicates > 0:
-                        LOG.info("Found %d duplicates in schema group with columns %s", schema_duplicates, schema_cols)
+                    schema_seen_keys.add(unique_key)
+
+                    # Extract value and export immediately with proper labels
+                    value = _extract_number(row.get(value_col))
+                    if value < 0:
+                        continue
+
+                    _export_metrics(app_info, row, metric_name, value, date_val)
+                    exported_count += 1
+
+                    if LOG.isEnabledFor(logging.DEBUG):
+                        LOG.debug("Exported %s=%s from segment %s (key: %s)",
+                                 value_col, value, seg_id, unique_key)
+
+                total_duplicates += schema_duplicates
+                if schema_duplicates > 0:
+                    LOG.info("Found %d duplicates in schema group with columns %s", schema_duplicates, schema_cols)
 
             # Use instance processing date as fallback for reporting
             report_date = processing_date or ""
@@ -828,7 +828,7 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
         LOG.error("Failed to process %s for %s: %s", report_type, app_name, e)
         # Increment error counter for this app and report type
         if 'parsing_errors_counter' in globals():
-            parsing_errors_counter.labels(app=app_name, report_type=report_type).inc()
+            parsing_errors_counter.labels(package=app_name, report_type=report_type).inc()
 
 def _process_app_metrics(app_info):
     """Process all configured metrics for a single app.
