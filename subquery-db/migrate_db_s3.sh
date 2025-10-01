@@ -25,6 +25,8 @@
 #   --force       Skip confirmation prompts
 #   --quiet       Reduce output verbosity (disable progress indicators)
 #   --debug       Enable debug output
+#   --s3-chunk-size SIZE  S3 multipart chunk size (e.g., 64MB, 128MB, 512MB)
+#                         Default: 512MB (supports files up to 512GB)
 #
 # ENVIRONMENT VARIABLES:
 #   Source database:
@@ -56,6 +58,7 @@
 #     DUMP_COMPRESS       Compression level 0-9 (default: 0)
 #     S3_MAX_RETRIES      Max retries for S3 ops (default: 3)
 #     SHOW_PROGRESS       Show progress indicators (default: true)
+#     S3_CHUNK_SIZE       S3 multipart chunk size (default: 64MB)
 #
 # EXAMPLES:
 #   # Full migration
@@ -87,6 +90,7 @@ SKIP_CHECKS=false
 FORCE=false
 QUIET=false
 DEBUG=false
+S3_CHUNK_SIZE=""
 
 show_help() {
   sed -n '/^# USAGE:/,/^# ---/p' "$0" | sed 's/^# //' | head -n -1
@@ -139,6 +143,14 @@ parse_args() {
         # Don't use set -x to avoid printing secrets
         shift
         ;;
+      --s3-chunk-size)
+        if [[ $# -lt 2 ]]; then
+          echo "❌ Error: --s3-chunk-size requires a value"
+          exit 1
+        fi
+        S3_CHUNK_SIZE="$2"
+        shift 2
+        ;;
       *)
         echo "❌ Error: Unknown option: $1"
         echo "Use --help for more information"
@@ -188,6 +200,8 @@ RESTORE_JOBS="${RESTORE_JOBS:-1}"
 DUMP_COMPRESS="${DUMP_COMPRESS:-0}"
 S3_MAX_RETRIES="${S3_MAX_RETRIES:-3}"
 SHOW_PROGRESS="${SHOW_PROGRESS:-true}"
+# Default 512MB chunk size supports files up to 512GB (512MB * 1000 parts)
+S3_CHUNK_SIZE="${S3_CHUNK_SIZE:-512MB}"
 
 # ---------- IMAGE BUILD ----------------------------------------------
 PG_BASE_IMG="${PG_BASE_IMG:-docker.io/library/postgres:16}"
@@ -396,6 +410,9 @@ aws_opts=""
 [[ -n "$S3_ENDPOINT_URL" ]] && aws_opts="--endpoint-url $S3_ENDPOINT_URL"
 [[ "$AWS_NO_VERIFY_SSL" == "true" ]] && aws_opts="$aws_opts --no-verify-ssl"
 
+# Configure multipart chunk size for large files
+aws configure set s3.multipart_chunksize "$S3_CHUNK_SIZE"
+
 verbose_flag=""
 [[ "$SHOW_PROGRESS" == "true" ]] && verbose_flag="--verbose"
 
@@ -422,6 +439,7 @@ SCRIPT
     -e "DUMP_COMPRESS=$DUMP_COMPRESS" \
     -e "S3_URI=$S3_URI" \
     -e "SHOW_PROGRESS=$SHOW_PROGRESS" \
+    -e "S3_CHUNK_SIZE=$S3_CHUNK_SIZE" \
     -e "PGOPTIONS=$PGOPTIONS" \
     "$PG_AWS_IMG" \
     bash -c "$script"; then

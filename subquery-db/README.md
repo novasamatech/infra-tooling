@@ -70,6 +70,8 @@ migrate_db_s3.sh — CLI
   - --force       skip confirmation prompts
   - --quiet       reduce verbosity (no progress indicators)
   - --debug       enable debug logs (secrets are masked)
+  - --s3-chunk-size SIZE  S3 multipart chunk size (e.g., 64MB, 128MB, 512MB)
+                         Default: 512MB (supports files up to 512GB)
 - Environment variables:
   - Source (required for --backup/--all):
     - SRC_PGHOST
@@ -97,6 +99,7 @@ migrate_db_s3.sh — CLI
     - DUMP_COMPRESS (0–9, default: 0)
     - S3_MAX_RETRIES (default: 3)
     - SHOW_PROGRESS=true|false
+    - S3_CHUNK_SIZE (default: 512MB; S3 multipart chunk size for large files)
     - PG_BASE_IMG, PG_AWS_IMG (optional image overrides)
 
 migrate_db_local.sh — how to run
