@@ -1,157 +1,109 @@
-# Google Play Console Metrics Exporter for Prometheus
+# Google Play Console Metrics Exporter
 
 This exporter extracts and exposes multiple metrics from Google Play Console CSV reports
-as Prometheus counters. It automatically discovers packages, processes the latest daily
-CSV files, and exports metrics for monitoring and alerting.
-
-## Dependencies
-
-* prometheus_client
-* google-cloud-storage
-* google-auth
-
-## Key Features
-
-- **Multi-metric Support**: Exports five distinct counter metrics simultaneously
-- **Automatic Package Discovery**: Scans GCS bucket to find all available packages
-- **Latest Data Processing**: Always processes the most recent CSV file for each package
-- **Country-level Granularity**: Metrics are exported per country with proper labels
-- **Zero-value Handling**: Only exports metrics with non-zero values to avoid empty series
-- **Performance Optimized**: Debug calculations only performed when debug logging is enabled
-- **Health Check**: Simple health status endpoint for monitoring
-- **Quiet Operation**: HTTP request logging only in DEBUG mode
+as Prometheus counters. It automatically discovers packages, processes CSV files, and exports metrics for monitoring and alerting.
 
 ## Exported Metrics
 
-All metrics are exported as Prometheus counters with absolute daily values:
+All metrics are exported as Prometheus counters with proper timestamps:
 
-1. **gplay_daily_device_installs_total{package,country}**
-   - Daily device installs by country from Google Play Console
-   - **CSV Column**: "Daily Device Installs"
-   - Type: Counter (absolute daily value)
+1. **gplay_device_installs{package,country}**
+   - Sum of device installs for the month
+   - Aggregation: SUM of all days
+   - Type: Counter with timestamp
 
-2. **gplay_daily_device_uninstalls_total{package,country}**
-   - Daily device uninstalls by country from Google Play Console
-   - **CSV Column**: "Daily Device Uninstalls"
-   - Type: Counter (absolute daily value)
+2. **gplay_device_uninstalls{package,country}**
+   - Sum of device uninstalls for the month
+   - Aggregation: SUM of all days
+   - Type: Counter with timestamp
 
-3. **gplay_active_device_installs_total{package,country}**
-   - Active device installs by country from Google Play Console
-   - **CSV Column**: "Active Device Installs"
-   - Type: Counter (absolute daily value)
+3. **gplay_active_device_installs{package,country}**
+   - Current active device installs (absolute value)
+   - Aggregation: LAST value from the latest date
+   - Type: Counter with timestamp
 
-4. **gplay_daily_user_installs_total{package,country}**
-   - Daily user installs by country from Google Play Console
-   - **CSV Column**: "Daily User Installs"
-   - Type: Counter (absolute daily value)
+4. **gplay_user_installs{package,country}**
+   - Sum of user installs for the month
+   - Aggregation: SUM of all days
+   - Type: Counter with timestamp
 
-5. **gplay_daily_user_uninstalls_total{package,country}**
-   - Daily user uninstalls by country from Google Play Console
-   - **CSV Column**: "Daily User Uninstalls"
-   - Type: Counter (absolute daily value)
+5. **gplay_user_uninstalls{package,country}**
+   - Sum of user uninstalls for the month
+   - Aggregation: SUM of all days
+   - Type: Counter with timestamp
 
-## Why Counters Instead of Gauges?
+## How It Works
 
-The exporter uses Prometheus Counters despite setting absolute values because:
-- Google Play Console provides cumulative daily statistics that reset each day
-- The metrics represent cumulative counts for each date (installs, uninstalls, etc.)
-- Counters are recreated on each collection cycle to handle date transitions
-- This approach maintains the semantic meaning of the metrics as cumulative values
+### Data Processing Flow
 
-## Data Source & Processing
+1. **File Discovery**: Finds the latest monthly CSV file for each package (e.g., `installs_com.app_202501_country.csv`)
 
-- **Source**: Google Cloud Storage bucket containing Play Console CSV exports
-- **File Pattern**: `stats/installs/installs_<package>_<YYYYMM>_country.csv`
-- **Processing**: Only processes rows with the latest date found in each CSV
-- **Column Mapping**: Automatically handles different column name variations
-- **Encoding Support**: Handles UTF-16, UTF-8 and other common encodings
+2. **Data Aggregation**: 
+   - For **daily metrics** (installs, uninstalls): Sums values across all dates in the file
+   - For **absolute metrics** (active_device_installs): Takes only the value from the latest date
+   - This ensures correct representation of both flow and stock metrics
 
-## Architecture
+3. **Timestamp Assignment**: 
+   - Identifies the maximum (latest) date in the file
+   - Converts this date to milliseconds timestamp
+   - Applies this timestamp to all metrics from that file
 
-- **Background Collection**: Periodic collection runs in background thread
-- **Fresh Counters**: Creates new counter instances for each collection cycle
-- **HTTP Server**: Exposes metrics on `/metrics` endpoint (Prometheus format)
-- **Health Check**: Provides `/healthz` endpoint returning 200 (ok) or 503 (not ok)
-- **Thread Safety**: Uses locks to ensure thread-safe registry updates
+4. **Format Generation**: 
+   - Manually creates Prometheus text format
+   - Includes timestamp on the same line as the metric value
+   - Filters out zero values to avoid empty series
+
+### Example Output
+
+```prometheus
+# HELP gplay_device_installs Device installs by country from Google Play Console
+# TYPE gplay_device_installs counter
+gplay_device_installs{package="com.example.app",country="US"} 12450.0 1737734400000
+gplay_device_installs{package="com.example.app",country="GB"} 5678.0 1737734400000
+
+# HELP gplay_active_device_installs Active device installs by country from Google Play Console
+# TYPE gplay_active_device_installs counter
+gplay_active_device_installs{package="com.example.app",country="US"} 850000.0 1737734400000
+```
+
+## Dependencies
+
+* google-cloud-storage
 
 ## Environment Variables
 
 ### REQUIRED:
 - **GPLAY_EXPORTER_GOOGLE_APPLICATION_CREDENTIALS**: Path to Google service account credentials JSON file
 - **GPLAY_EXPORTER_BUCKET_ID**: Google Cloud Storage bucket ID containing Play Console CSVs
-  - Example: "pubsite_prod_rev_01234567890987654321"
 
 ### OPTIONAL:
 - **GPLAY_EXPORTER_PORT**: HTTP server port (default: 8000)
-- **GPLAY_EXPORTER_COLLECTION_INTERVAL_SECONDS**: Metrics collection interval in seconds (default: 43200 = 12 hours)
-- **GPLAY_EXPORTER_GCS_PROJECT**: Google Cloud project ID (optional, uses default project from credentials)
-- **GPLAY_EXPORTER_TEST_MODE**: If set, runs one collection cycle and exits (values: "1", "true", etc.)
-- **GPLAY_EXPORTER_LOG_LEVEL**: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL - default: INFO)
+- **GPLAY_EXPORTER_COLLECTION_INTERVAL_SECONDS**: Metrics collection interval (default: 43200 = 12 hours)
+- **GPLAY_EXPORTER_GCS_PROJECT**: Google Cloud project ID (optional)
+- **GPLAY_EXPORTER_TEST_MODE**: Run single collection and exit
+- **GPLAY_EXPORTER_LOG_LEVEL**: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 
-## Health Check
+## Usage
 
-The `/healthz` endpoint provides simple health status:
-- **200 OK**: Returns "ok" - Service is healthy (at least one successful collection)
-- **503 Service Unavailable**: Returns "not ok" - Service is unhealthy (no successful collections yet)
-
-The service becomes healthy after the first successful collection and remains healthy even if
-subsequent collections fail (as cached metrics are still being served).
-
-## Performance Characteristics
-
-- **Memory Efficient**: Processes CSV files in memory with streaming
-- **Debug Optimization**: Expensive debug calculations only performed when LOG_LEVEL=DEBUG
-- **Set-based Operations**: Uses efficient set operations for date parsing and deduplication
-- **Single Pass Processing**: Extracts all five metrics in a single pass through CSV data
-- **C Extension Support**: Dockerfile includes build dependencies for google-crc32c C extension
-- **Empty Series Prevention**: Zero-value metrics are not exported to avoid creating empty series
-
-## Error Handling
-
-- **Graceful Degradation**: Continues processing other packages if one fails
-- **Comprehensive Logging**: Detailed debug logs available when needed
-- **Input Validation**: Handles malformed CSV data and missing columns
-- **Authentication Errors**: Proper error messages for credential issues
-- **Health Status**: Tracks collection success for monitoring
-
-## Usage Examples
-
-1. **Production Deployment**:
-   ```bash
-   GPLAY_EXPORTER_GOOGLE_APPLICATION_CREDENTIALS=/path/to/creds.json \
-   GPLAY_EXPORTER_BUCKET_ID=pubsite_prod_123456789 \
-   python exporter.py
-   ```
-
-2. **Debug Mode**:
-   ```bash
-   GPLAY_EXPORTER_LOG_LEVEL=DEBUG \
-   GPLAY_EXPORTER_GOOGLE_APPLICATION_CREDENTIALS=/path/to/creds.json \
-   GPLAY_EXPORTER_BUCKET_ID=pubsite_prod_123456789 \
-   GPLAY_EXPORTER_TEST_MODE=1 \
-   python exporter.py
-   ```
-
-3. **Custom Configuration**:
-   ```bash
-   GPLAY_EXPORTER_PORT=9090 \
-   GPLAY_EXPORTER_COLLECTION_INTERVAL_SECONDS=21600 \
-   GPLAY_EXPORTER_GOOGLE_APPLICATION_CREDENTIALS=/path/to/creds.json \
-   GPLAY_EXPORTER_BUCKET_ID=pubsite_prod_123456789 \
-   python exporter.py
-   ```
-
-## Docker Usage
-
-The exporter includes a Dockerfile with:
-- Alpine-based Python 3.13 image
-- Non-root user execution (uid/gid 1000)
-- Build dependencies for C extensions (google-crc32c)
-- Optimized layer caching
-
-Build and run:
+### Production Deployment
 ```bash
-docker build -t gplay-exporter .
+GPLAY_EXPORTER_GOOGLE_APPLICATION_CREDENTIALS=/path/to/creds.json \
+GPLAY_EXPORTER_BUCKET_ID=pubsite_prod_123456789 \
+python exporter.py
+```
+
+### Test Mode
+```bash
+GPLAY_EXPORTER_LOG_LEVEL=DEBUG \
+GPLAY_EXPORTER_GOOGLE_APPLICATION_CREDENTIALS=/path/to/creds.json \
+GPLAY_EXPORTER_BUCKET_ID=pubsite_prod_123456789 \
+GPLAY_EXPORTER_TEST_MODE=1 \
+python exporter.py
+```
+
+### Docker Usage
+```bash
+docker build -f Dockerfile -t gplay-exporter .
 docker run -e GPLAY_EXPORTER_GOOGLE_APPLICATION_CREDENTIALS=/creds/key.json \
            -e GPLAY_EXPORTER_BUCKET_ID=pubsite_prod_123456789 \
            -v /path/to/creds:/creds:ro \
@@ -159,83 +111,147 @@ docker run -e GPLAY_EXPORTER_GOOGLE_APPLICATION_CREDENTIALS=/creds/key.json \
            gplay-exporter
 ```
 
+## Prometheus Configuration
+
+### Scrape Configuration
+```yaml
+scrape_configs:
+  - job_name: 'gplay-exporter'
+    static_configs:
+      - targets: ['exporter-host:8000']
+    # Honor timestamps from the exporter
+    honor_timestamps: true
+```
+
+### Important: Honor Timestamps
+Make sure your Prometheus configuration includes `honor_timestamps: true` to use the timestamps provided by the exporter. This ensures metrics are stored with the correct time from the Play Console reports, not the scrape time.
+
+## Aggregation Strategy
+
+The exporter uses different aggregation strategies based on the metric type:
+
+### Sum Aggregation
+Used for flow metrics that represent events over time:
+- `gplay_device_installs` - each day adds to the monthly total
+- `gplay_device_uninstalls` - each day adds to the monthly total  
+- `gplay_user_installs` - each day adds to the monthly total
+- `gplay_user_uninstalls` - each day adds to the monthly total
+
+### Last Value Aggregation
+Used for stock metrics that represent current state:
+- `gplay_active_device_installs` - represents the current number of active installations
+
+This approach ensures that:
+- Daily statistics are properly accumulated for the entire month
+- Absolute values (like active installs) aren't incorrectly summed
+
 ## Testing
 
-Run the included test suite to validate functionality:
+Run the test suite to validate functionality:
 ```bash
 python test_local.py
+python test_integration.py
 ```
 
 The test suite validates:
-- Environment variable handling
-- Counter creation and value setting
-- Health check logic
-- Date parsing (multiple formats)
-- Number extraction (with commas and decimals)
-- WSGI endpoints (/metrics, /healthz, 404 handling)
-- Metric export functionality
+- Prometheus format generation with timestamps
+- Correct aggregation strategies (sum vs last value)
+- Timestamp selection (latest date)
+- Health check functionality
+- Date parsing and number extraction
+- Zero value filtering
 
-## Monitoring & Alerting
+## Monitoring
 
-The exporter provides Prometheus metrics that can be used for:
-- Data freshness monitoring (track when metrics stop updating)
-- Package discovery status (number of packages found)
-- Collection cycle timing (via logs)
-- Service health (via /healthz endpoint)
+### Example Prometheus Queries
 
-Example Prometheus queries:
 ```promql
-# Total installs per package
-sum by (package) (gplay_daily_device_installs_total)
+# Total installs for the current month
+gplay_device_installs
+
+# Current active installations
+gplay_active_device_installs
 
 # Uninstall rate by country
-gplay_daily_device_uninstalls_total / gplay_daily_device_installs_total
+gplay_device_uninstalls / gplay_device_installs
 
-# Active installs trend
-rate(gplay_active_device_installs_total[7d])
+# Growth in active installs over time
+increase(gplay_active_device_installs[30d])
 ```
 
-## CSV Column Support
-
-Automatically handles these column names:
-- Date: "Date"
-- Country: "Country"
-- Daily Device Installs: "Daily Device Installs"
-- Daily Device Uninstalls: "Daily Device Uninstalls"
-- Active Device Installs: "Active Device Installs"
-- Daily User Installs: "Daily User Installs"
-- Daily User Uninstalls: "Daily User Uninstalls"
-
-## Date Format Support
-
-Parses multiple date formats:
-- YYYY-MM-DD (2025-01-15)
-- DD-MMM-YYYY (15-Jan-2025)
-- MM/DD/YYYY (01/15/2025)
+### Data Freshness Monitoring
+Since metrics include explicit timestamps, you can monitor data freshness:
+```promql
+# Alert if data is older than 48 hours
+time() - timestamp(gplay_device_installs) > 172800
+```
 
 ## Troubleshooting
 
-### No metrics exported
-- Check debug logs: `GPLAY_EXPORTER_LOG_LEVEL=DEBUG`
-- Verify GCS bucket permissions
-- Ensure CSV files exist in expected location
-- Check health endpoint: `curl http://localhost:8000/healthz`
+### Metrics appear with old timestamps
+- **Cause**: Play Console reports may be delayed
+- **Solution**: This is expected behavior; timestamp reflects the actual data date
 
-### Authentication errors
-- Verify credentials file exists and is readable
-- Check service account has Storage Object Viewer permission
-- Ensure GPLAY_EXPORTER_GOOGLE_APPLICATION_CREDENTIALS points to valid JSON file
+### Active installs value seems low
+- **Cause**: correctly uses only the latest value, not a sum
+- **Solution**: This is correct behavior for absolute metrics
 
-### High memory usage
-- Normal for large CSV files
-- Consider reducing collection interval if processing many packages
+### Daily metrics values are high
+- **Cause**: sums all days in the month for flow metrics
+- **Solution**: This is correct behavior; values represent monthly totals
 
-### Metrics not updating
-- Check latest CSV file dates in GCS
-- Verify collection interval setting
-- Look for errors in logs
+### Prometheus not using timestamps
+- **Cause**: Missing `honor_timestamps: true` in scrape config
+- **Solution**: Update Prometheus configuration and reload
+
+## Technical Details
+
+### Why Different Aggregation Strategies?
+
+**Flow Metrics** (installs/uninstalls per day):
+- Represent events that occur over time
+- Should be summed to get total monthly activity
+- Example: 100 installs on day 1 + 150 on day 2 = 250 total installs
+
+**Stock Metrics** (active installations):
+- Represent current state at a point in time
+- Should use only the latest value
+- Example: 1000 active on day 1, 1100 active on day 2 = current value is 1100 (not 2100)
+
+### Manual Format Generation
+
+The prometheus_client Python library has a limitation where it cannot set timestamps in the standard Prometheus format. By generating the format manually, we achieve:
+- Correct Prometheus text exposition format
+- Proper inline timestamp support
+- Full control over metric output
+
+### CSV Data Source
+
+- **Source**: Google Cloud Storage bucket with Play Console exports
+- **File Pattern**: `stats/installs/installs_<package>_<YYYYMM>_country.csv`
+- **Processing**: Aggregates data based on metric type
+- **Encoding**: Handles UTF-16, UTF-8 and other common encodings
 
 ## Changelog
+
+### Version 2.0.0 (2025-01-24)
+
+#### Major Changes
+- **Timestamp Support**: Manually generates Prometheus text format to support proper inline timestamps (milliseconds)
+- **Intelligent Aggregation**: 
+  - Daily metrics (installs/uninstalls) are summed across all days in monthly report
+  - Absolute metrics (active_device_installs) use only the latest value
+  - Fixes data loss issue when multiple days are added to reports at once
+- **Improved Metric Names**:
+  - Removed redundant "daily" prefix: `gplay_daily_device_installs_total` → `gplay_device_installs`
+  - Removed unnecessary "total" suffix except for semantically appropriate metrics
+  - `gplay_active_device_installs_total` → `gplay_active_device_installs`
+- **No prometheus_client dependency**: Generates Prometheus format manually
+
+#### Important Notes
+- Metric values will be different from v1 (higher for daily metrics due to summing)
+- Requires `honor_timestamps: true` in Prometheus scrape configuration
+- Active device installs now correctly shows current value, not sum
 
 ### Version 1.1.2 (2025-01-24)
 
