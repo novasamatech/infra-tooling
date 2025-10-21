@@ -1,385 +1,554 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# Copyright © 2025 Novasama Technologies GmbH
-# SPDX-License-Identifier: Apache-2.0
-
 """
-Local test script for gplay-exporter validation.
-Tests core functionality without requiring actual GCS access.
+Test suite for Google Play Console Metrics Exporter
+
+Tests the new functionality including:
+- Manual Prometheus format generation with timestamps
+- Summing data across all days for daily metrics
+- Using last value for absolute metrics (active_device_installs)
+- Health check endpoints
+- Date parsing utilities
+- Number extraction utilities
 """
 
 import os
 import sys
-import tempfile
-import logging
+import unittest
+import datetime as dt
+import threading
+from unittest.mock import patch, MagicMock, Mock
 
-# Setup logging
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s")
-LOG = logging.getLogger(__name__)
+# Set up test environment variables before importing the exporter
+os.environ["GPLAY_EXPORTER_GOOGLE_APPLICATION_CREDENTIALS"] = "/tmp/test-creds.json"
+os.environ["GPLAY_EXPORTER_BUCKET_ID"] = "test-bucket"
+os.environ["GPLAY_EXPORTER_LOG_LEVEL"] = "WARNING"  # Reduce log noise during tests
 
-def test_environment_variables():
-    """Test environment variable handling."""
-    print("\n=== Testing Environment Variables ===")
+# Add the parent directory to sys.path to import the exporter
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-    # Test with new prefixed variables
-    os.environ["GPLAY_EXPORTER_GOOGLE_APPLICATION_CREDENTIALS"] = "/tmp/fake-creds.json"
-    os.environ["GPLAY_EXPORTER_BUCKET_ID"] = "test-bucket-123"
-    os.environ["GPLAY_EXPORTER_PORT"] = "9999"
-    os.environ["GPLAY_EXPORTER_LOG_LEVEL"] = "DEBUG"
-    os.environ["GPLAY_EXPORTER_TEST_MODE"] = "1"
-    os.environ["GPLAY_EXPORTER_COLLECTION_INTERVAL_SECONDS"] = "3600"
+import exporter
 
-    # Import after setting env vars
-    try:
-        import exporter
-        print("✓ Environment variables loaded successfully")
-        print(f"  - GOOGLE_CREDS: {exporter.GOOGLE_CREDS}")
-        print(f"  - BUCKET_ID: {exporter.BUCKET_ID}")
-        print(f"  - PORT: {exporter.PORT}")
-        print(f"  - COLLECTION_INTERVAL: {exporter.COLLECTION_INTERVAL}")
-        print(f"  - TEST_MODE: {exporter.TEST_MODE}")
 
-        # Verify values
-        assert exporter.BUCKET_ID == "test-bucket-123", "BUCKET_ID not set correctly"
-        assert exporter.PORT == 9999, "PORT not set correctly"
-        assert exporter.COLLECTION_INTERVAL == 3600, "COLLECTION_INTERVAL not set correctly"
-        assert exporter.TEST_MODE == "1", "TEST_MODE not set correctly"
+class TestPrometheusFormatting(unittest.TestCase):
+    """Test Prometheus format generation with timestamps"""
 
-        return True
-    except SystemExit as e:
-        print(f"✗ Failed to load environment variables: {e}")
-        return False
-    except AssertionError as e:
-        print(f"✗ Environment variable validation failed: {e}")
-        return False
+    def setUp(self):
+        """Clear metrics before each test"""
+        with exporter._metrics_lock:
+            exporter._metrics_data = {}
 
-def test_counter_creation():
-    """Test Prometheus counter creation."""
-    print("\n=== Testing Counter Creation ===")
+    def test_empty_metrics(self):
+        """Test formatting when no metrics are present"""
+        output = exporter._format_prometheus_output()
 
-    from prometheus_client import CollectorRegistry, Counter
+        # Should contain HELP and TYPE for each metric but no values
+        for metric_name, metric_info in exporter.METRIC_DEFINITIONS.items():
+            self.assertIn(f"# HELP {metric_name}", output)
+            self.assertIn(f"# TYPE {metric_name}", output)
+            # Should not contain actual metric values
+            self.assertNotIn(f"{metric_name}{{", output)
 
-    registry = CollectorRegistry()
+    def test_metrics_with_timestamp(self):
+        """Test that metrics are formatted with timestamps"""
+        # Add test metrics with timestamp
+        test_timestamp = 1737734400000  # 2025-01-24 00:00:00 UTC in milliseconds
 
-    try:
-        # Create test counter similar to the exporter
-        counter = Counter(
-            "test_metric_total",
-            "Test metric description",
-            ["label1", "label2"],
-            registry=registry
+        with exporter._metrics_lock:
+            exporter._metrics_data = {
+                "gplay_device_installs": {
+                    ("com.test.app", "US"): (1234.0, test_timestamp),
+                    ("com.test.app", "GB"): (567.0, test_timestamp),
+                }
+            }
+
+        output = exporter._format_prometheus_output()
+
+        # Check that metrics contain timestamps
+        self.assertIn(
+            'gplay_device_installs{package="com.test.app",country="US"} 1234.0 1737734400000',
+            output,
+        )
+        self.assertIn(
+            'gplay_device_installs{package="com.test.app",country="GB"} 567.0 1737734400000',
+            output,
         )
 
-        # Test setting values using internal API (as exporter does)
-        counter.labels(label1="value1", label2="value2")._value.set(100.0)
-        counter.labels(label1="value3", label2="value4")._value.set(200.0)
+    def test_zero_values_filtered(self):
+        """Test that zero values are not included in output"""
+        test_timestamp = 1737734400000
 
-        print("✓ Counters created and values set successfully")
-        return True
-    except Exception as e:
-        print(f"✗ Failed to create counters: {e}")
-        return False
+        with exporter._metrics_lock:
+            exporter._metrics_data = {
+                "gplay_device_installs": {
+                    ("com.test.app", "US"): (100.0, test_timestamp),
+                    ("com.test.app", "GB"): (0.0, test_timestamp),  # Zero value
+                    ("com.test.app", "FR"): (-5.0, test_timestamp),  # Negative value
+                }
+            }
 
-def test_health_check():
-    """Test health check logic."""
-    print("\n=== Testing Health Check ===")
+        output = exporter._format_prometheus_output()
 
-    import exporter
+        # Should include positive value
+        self.assertIn(
+            'gplay_device_installs{package="com.test.app",country="US"} 100.0',
+            output,
+        )
+        # Should not include zero or negative values
+        self.assertNotIn('country="GB"', output)
+        self.assertNotIn('country="FR"', output)
 
-    # Reset health status for testing
-    exporter._health_status = {
-        "healthy": False,
-        "first_collection_done": False,
-        "last_collection_time": None,
-        "last_error": None
-    }
+    def test_multiple_metrics_types(self):
+        """Test formatting multiple metric types"""
+        test_timestamp = 1737734400000
 
-    # Test initial state (should be unhealthy)
-    assert exporter._is_healthy() == False, "Should be unhealthy initially"
-    print("✓ Initial unhealthy state correct")
+        with exporter._metrics_lock:
+            exporter._metrics_data = {
+                "gplay_device_installs": {
+                    ("com.app1", "US"): (100.0, test_timestamp),
+                },
+                "gplay_device_uninstalls": {
+                    ("com.app1", "US"): (10.0, test_timestamp),
+                },
+                "gplay_active_device_installs": {
+                    ("com.app2", "GB"): (5000.0, test_timestamp),
+                },
+            }
 
-    # Simulate successful collection
-    exporter._update_health_status(True)
-    assert exporter._is_healthy() == True, "Should be healthy after success"
-    assert exporter._health_status["first_collection_done"] == True
-    print("✓ Healthy state after successful collection")
+        output = exporter._format_prometheus_output()
 
-    # Simulate failed collection after success (should remain healthy)
-    exporter._update_health_status(False, "Test error")
-    assert exporter._is_healthy() == True, "Should remain healthy after first success"
-    assert exporter._health_status["last_error"] == "Test error"
-    print("✓ Remains healthy after failure when first collection was successful")
-
-    # Reset and test failure before any success
-    exporter._health_status = {
-        "healthy": False,
-        "first_collection_done": False,
-        "last_collection_time": None,
-        "last_error": None
-    }
-    exporter._update_health_status(False, "Initial failure")
-    assert exporter._is_healthy() == False, "Should be unhealthy when no success yet"
-    print("✓ Unhealthy when no successful collection yet")
-
-    return True
-
-def test_date_parsing():
-    """Test date parsing functionality."""
-    print("\n=== Testing Date Parsing ===")
-
-    import exporter
-    from datetime import date
-
-    test_dates = [
-        ("2025-01-15", date(2025, 1, 15)),
-        ("15-Jan-2025", date(2025, 1, 15)),
-        ("01/15/2025", date(2025, 1, 15)),
-        ("invalid", None),
-        ("", None),
-    ]
-
-    for date_str, expected in test_dates:
-        result = exporter._parse_date(date_str)
-        if result == expected:
-            print(f"✓ Parsed '{date_str}' -> {result}")
-        else:
-            print(f"✗ Failed to parse '{date_str}': got {result}, expected {expected}")
-            return False
-
-    return True
-
-def test_number_extraction():
-    """Test number extraction from strings."""
-    print("\n=== Testing Number Extraction ===")
-
-    import exporter
-
-    test_cases = [
-        ("123", 123.0),
-        ("1,234", 1234.0),
-        ("1,234,567", 1234567.0),
-        ("", 0.0),
-        (None, 0.0),
-        ("invalid", 0.0),
-        ("  456  ", 456.0),
-        ("12.34", 12.34),
-    ]
-
-    for input_val, expected in test_cases:
-        result = exporter._extract_number(input_val)
-        if result == expected:
-            print(f"✓ Extracted '{input_val}' -> {result}")
-        else:
-            print(f"✗ Failed to extract '{input_val}': got {result}, expected {expected}")
-            return False
-
-    return True
-
-def test_wsgi_endpoints():
-    """Test WSGI application endpoints."""
-    print("\n=== Testing WSGI Endpoints ===")
-
-    import exporter
-
-    # Mock environment for testing
-    def create_environ(path, method="GET"):
-        return {
-            "PATH_INFO": path,
-            "REQUEST_METHOD": method,
-        }
-
-    # Mock start_response
-    responses = []
-    def start_response(status, headers):
-        responses.append({"status": status, "headers": headers})
-
-    # Test /metrics endpoint
-    environ = create_environ("/metrics")
-    result = exporter.app(environ, start_response)
-    assert responses[-1]["status"] == "200 OK", "Metrics endpoint should return 200"
-    print("✓ /metrics endpoint returns 200 OK")
-
-    # Test /healthz endpoint (unhealthy state)
-    exporter._health_status["healthy"] = False
-    environ = create_environ("/healthz")
-    result = exporter.app(environ, start_response)
-    response_body = b"".join(result).decode('utf-8')
-    assert responses[-1]["status"] == "503 Service Unavailable", "Health check should return 503 when unhealthy"
-    assert "not ok" in response_body or "unhealthy" in response_body
-    print("✓ /healthz endpoint returns 503 when unhealthy")
-
-    # Test /healthz endpoint (healthy state)
-    exporter._health_status["healthy"] = True
-    environ = create_environ("/healthz")
-    result = exporter.app(environ, start_response)
-    response_body = b"".join(result).decode('utf-8')
-    assert responses[-1]["status"] == "200 OK", "Health check should return 200 when healthy"
-    assert "ok" in response_body
-    print("✓ /healthz endpoint returns 200 when healthy")
-
-    # Test 404 for unknown endpoint
-    environ = create_environ("/unknown")
-    result = exporter.app(environ, start_response)
-    assert responses[-1]["status"] == "404 Not Found", "Unknown endpoint should return 404"
-    print("✓ Unknown endpoints return 404")
-
-    return True
-
-def test_metric_export():
-    """Test metric export functionality with counters."""
-    print("\n=== Testing Metric Export ===")
-
-    import exporter
-    from datetime import date
-    from prometheus_client import generate_latest
-
-    # Reset registry and counters
-    exporter.REGISTRY = exporter.CollectorRegistry()
-    exporter.counters = exporter._create_prometheus_counters()
-
-    # Export test metrics with non-zero values
-    test_metrics = {
-        "daily_device_installs": 100.0,
-        "daily_device_uninstalls": 20.0,
-        "active_device_installs": 500.0,
-        "daily_user_installs": 80.0,
-        "daily_user_uninstalls": 15.0,
-    }
-
-    exporter._export_metrics("com.test.app", "US", test_metrics, date(2025, 1, 15))
-
-    # Generate and check output
-    output = generate_latest(exporter.REGISTRY).decode('utf-8')
-
-    # Verify all metrics are present with _total suffix
-    for metric_name in test_metrics:
-        full_metric_name = f"gplay_{metric_name}_total"
-        if full_metric_name in output:
-            print(f"✓ Metric {full_metric_name} exported")
-        else:
-            print(f"✗ Metric {full_metric_name} not found in output")
-            return False
-
-    # Check for proper labels
-    if 'package="com.test.app"' in output and 'country="US"' in output:
-        print("✓ Labels properly set in metrics")
-    else:
-        print("✗ Labels not found in metrics output")
-        return False
-
-    # Test zero-value filtering
-    print("\n  Testing zero-value filtering...")
-
-    # Reset registry for clean test
-    exporter.REGISTRY = exporter.CollectorRegistry()
-    exporter.counters = exporter._create_prometheus_counters()
-
-    # Export metrics with some zero values
-    mixed_metrics = {
-        "daily_device_installs": 50.0,  # non-zero
-        "daily_device_uninstalls": 0.0,  # zero - should not be exported
-        "active_device_installs": 100.0,  # non-zero
-        "daily_user_installs": 0.0,  # zero - should not be exported
-        "daily_user_uninstalls": 5.0,  # non-zero
-    }
-
-    exporter._export_metrics("com.test.app2", "GB", mixed_metrics, date(2025, 1, 15))
-
-    # Generate output
-    output = generate_latest(exporter.REGISTRY).decode('utf-8')
-
-    # Check that non-zero metrics are present (look for both metric name and label values)
-    if 'gplay_daily_device_installs_total' in output and 'com.test.app2' in output and 'GB' in output and '50.0' in output:
-        print("  ✓ Non-zero daily_device_installs exported")
-    else:
-        print("  ✗ Non-zero daily_device_installs not found")
-        return False
-
-    if 'gplay_active_device_installs_total' in output and '100.0' in output:
-        print("  ✓ Non-zero active_device_installs exported")
-    else:
-        print("  ✗ Non-zero active_device_installs not found")
-        return False
-
-    if 'gplay_daily_user_uninstalls_total' in output and '5.0' in output:
-        print("  ✓ Non-zero daily_user_uninstalls exported")
-    else:
-        print("  ✗ Non-zero daily_user_uninstalls not found")
-        return False
-
-    # Check that zero metrics are NOT present by looking for lines with the metric AND the specific labels
-    output_lines = output.split('\n')
-    gb_lines = [line for line in output_lines if 'country="GB"' in line and 'package="com.test.app2"' in line]
-
-    # Check for absence of zero-value metrics in GB lines
-    zero_uninstalls_found = any('daily_device_uninstalls_total' in line for line in gb_lines)
-    zero_user_installs_found = any('daily_user_installs_total' in line for line in gb_lines)
-
-    if not zero_uninstalls_found:
-        print("  ✓ Zero-value daily_device_uninstalls correctly filtered out")
-    else:
-        print("  ✗ Zero-value daily_device_uninstalls was incorrectly exported")
-        return False
-
-    if not zero_user_installs_found:
-        print("  ✓ Zero-value daily_user_installs correctly filtered out")
-    else:
-        print("  ✗ Zero-value daily_user_installs was incorrectly exported")
-        return False
-
-    print("✓ Zero-value filtering works correctly")
-
-    return True
+        # Check all metrics are present
+        self.assertIn(
+            'gplay_device_installs{package="com.app1",country="US"} 100.0',
+            output,
+        )
+        self.assertIn(
+            'gplay_device_uninstalls{package="com.app1",country="US"} 10.0',
+            output,
+        )
+        self.assertIn(
+            'gplay_active_device_installs{package="com.app2",country="GB"} 5000.0',
+            output,
+        )
 
 
+class TestHealthCheck(unittest.TestCase):
+    """Test health check functionality"""
 
-def main():
-    """Run all tests."""
-    print("=" * 50)
-    print("Google Play Exporter Local Test Suite")
-    print("=" * 50)
+    def setUp(self):
+        """Reset health status before each test"""
+        with exporter._health_lock:
+            exporter._health_status = {
+                "healthy": False,
+                "first_collection_done": False,
+                "last_collection_time": None,
+                "last_error": None,
+            }
 
-    tests = [
-        ("Environment Variables", test_environment_variables),
-        ("Counter Creation", test_counter_creation),
-        ("Health Check", test_health_check),
-        ("Date Parsing", test_date_parsing),
-        ("Number Extraction", test_number_extraction),
-        ("WSGI Endpoints", test_wsgi_endpoints),
-        ("Metric Export", test_metric_export),
-    ]
+    def test_initially_unhealthy(self):
+        """Test that service starts as unhealthy"""
+        self.assertFalse(exporter._is_healthy())
 
-    results = []
-    for name, test_func in tests:
-        try:
-            success = test_func()
-            results.append((name, success))
-        except Exception as e:
-            print(f"\n✗ Test '{name}' failed with exception: {e}")
-            import traceback
-            traceback.print_exc()
-            results.append((name, False))
+    def test_becomes_healthy_after_success(self):
+        """Test that service becomes healthy after successful collection"""
+        exporter._update_health_status(True)
+        self.assertTrue(exporter._is_healthy())
 
-    print("\n" + "=" * 50)
-    print("Test Results Summary")
-    print("=" * 50)
+    def test_stays_healthy_after_failure(self):
+        """Test that service stays healthy even after subsequent failures"""
+        # First successful collection
+        exporter._update_health_status(True)
+        self.assertTrue(exporter._is_healthy())
 
-    passed = 0
-    failed = 0
-    for name, success in results:
-        status = "PASS" if success else "FAIL"
-        symbol = "✓" if success else "✗"
-        print(f"{symbol} {name}: {status}")
-        if success:
-            passed += 1
-        else:
-            failed += 1
+        # Subsequent failure
+        exporter._update_health_status(False, "Test error")
+        # Should still be healthy (serving cached metrics)
+        self.assertTrue(exporter._is_healthy())
 
-    print("=" * 50)
-    print(f"Total: {passed} passed, {failed} failed")
+    def test_unhealthy_if_never_succeeded(self):
+        """Test that service stays unhealthy if no successful collection"""
+        exporter._update_health_status(False, "Error 1")
+        self.assertFalse(exporter._is_healthy())
 
-    return 0 if failed == 0 else 1
+        exporter._update_health_status(False, "Error 2")
+        self.assertFalse(exporter._is_healthy())
+
+
+class TestDateParsing(unittest.TestCase):
+    """Test date parsing functionality"""
+
+    def test_parse_iso_date(self):
+        """Test parsing ISO format dates (YYYY-MM-DD)"""
+        result = exporter._parse_date("2025-01-24")
+        self.assertEqual(result, dt.date(2025, 1, 24))
+
+    def test_parse_dmy_date(self):
+        """Test parsing DD-MMM-YYYY format"""
+        result = exporter._parse_date("24-Jan-2025")
+        self.assertEqual(result, dt.date(2025, 1, 24))
+
+    def test_parse_us_date(self):
+        """Test parsing US format (MM/DD/YYYY)"""
+        result = exporter._parse_date("01/24/2025")
+        self.assertEqual(result, dt.date(2025, 1, 24))
+
+    def test_parse_with_whitespace(self):
+        """Test parsing dates with surrounding whitespace"""
+        result = exporter._parse_date("  2025-01-24  ")
+        self.assertEqual(result, dt.date(2025, 1, 24))
+
+    def test_parse_invalid_date(self):
+        """Test that invalid dates return None"""
+        self.assertIsNone(exporter._parse_date("not-a-date"))
+        self.assertIsNone(exporter._parse_date(""))
+        self.assertIsNone(exporter._parse_date(None))
+        self.assertIsNone(exporter._parse_date("2025/13/45"))  # Invalid date
+
+
+class TestNumberExtraction(unittest.TestCase):
+    """Test number extraction functionality"""
+
+    def test_extract_integer(self):
+        """Test extracting integer values"""
+        self.assertEqual(exporter._extract_number("123"), 123.0)
+        self.assertEqual(exporter._extract_number("0"), 0.0)
+        self.assertEqual(exporter._extract_number("-456"), -456.0)
+
+    def test_extract_with_commas(self):
+        """Test extracting numbers with thousand separators"""
+        self.assertEqual(exporter._extract_number("1,234"), 1234.0)
+        self.assertEqual(exporter._extract_number("1,234,567"), 1234567.0)
+
+    def test_extract_decimal(self):
+        """Test extracting decimal numbers"""
+        self.assertEqual(exporter._extract_number("123.45"), 123.45)
+        self.assertEqual(exporter._extract_number("1,234.56"), 1234.56)
+
+    def test_extract_with_whitespace(self):
+        """Test extracting numbers with surrounding whitespace"""
+        self.assertEqual(exporter._extract_number("  123  "), 123.0)
+        self.assertEqual(exporter._extract_number(" 1,234.56 "), 1234.56)
+
+    def test_extract_invalid(self):
+        """Test that invalid inputs return 0.0"""
+        self.assertEqual(exporter._extract_number("not-a-number"), 0.0)
+        self.assertEqual(exporter._extract_number(""), 0.0)
+        self.assertEqual(exporter._extract_number(None), 0.0)
+        self.assertEqual(exporter._extract_number("abc123"), 0.0)
+
+
+class TestProcessPackageCSV(unittest.TestCase):
+    """Test CSV processing with different aggregation strategies"""
+
+    @patch("exporter._download_csv")
+    @patch("exporter.storage.Client")
+    def test_sum_aggregation_for_daily_metrics(
+        self, mock_client_class, mock_download_csv
+    ):
+        """Test that daily metrics are summed across all dates"""
+        # Setup mock client
+        mock_client = MagicMock()
+        mock_client_class.return_value = mock_client
+
+        # Mock blob listing
+        mock_blob = MagicMock()
+        mock_blob.name = "stats/installs/installs_com.test.app_202501_country.csv"
+        mock_client.list_blobs.return_value = [mock_blob]
+
+        # Mock CSV data with multiple dates
+        mock_download_csv.return_value = [
+            {
+                "Date": "2025-01-01",
+                "Country": "US",
+                "Daily Device Installs": "100",
+                "Daily Device Uninstalls": "10",
+                "Active Device Installs": "1000",
+                "Daily User Installs": "90",
+                "Daily User Uninstalls": "8",
+            },
+            {
+                "Date": "2025-01-02",
+                "Country": "US",
+                "Daily Device Installs": "150",
+                "Daily Device Uninstalls": "15",
+                "Active Device Installs": "1100",  # This should NOT be summed
+                "Daily User Installs": "140",
+                "Daily User Uninstalls": "12",
+            },
+            {
+                "Date": "2025-01-03",
+                "Country": "US",
+                "Daily Device Installs": "200",
+                "Daily Device Uninstalls": "20",
+                "Active Device Installs": "1200",  # Only this value should be used
+                "Daily User Installs": "180",
+                "Daily User Uninstalls": "18",
+            },
+        ]
+
+        # Clear metrics
+        with exporter._metrics_lock:
+            exporter._metrics_data = {}
+
+        # Process the package
+        exporter._process_package_csv(mock_client, "com.test.app")
+
+        # Check that daily metrics were summed correctly
+        with exporter._metrics_lock:
+            # Daily device installs: 100 + 150 + 200 = 450
+            self.assertEqual(
+                exporter._metrics_data["gplay_device_installs"][
+                    ("com.test.app", "US")
+                ][0],
+                450.0,
+            )
+            # Daily device uninstalls: 10 + 15 + 20 = 45
+            self.assertEqual(
+                exporter._metrics_data["gplay_device_uninstalls"][
+                    ("com.test.app", "US")
+                ][0],
+                45.0,
+            )
+            # Active device installs: Should use ONLY the last value (1200)
+            self.assertEqual(
+                exporter._metrics_data["gplay_active_device_installs"][
+                    ("com.test.app", "US")
+                ][0],
+                1200.0,  # NOT summed, just the last value
+            )
+            # User installs: 90 + 140 + 180 = 410
+            self.assertEqual(
+                exporter._metrics_data["gplay_user_installs"][
+                    ("com.test.app", "US")
+                ][0],
+                410.0,
+            )
+
+    @patch("exporter._download_csv")
+    @patch("exporter.storage.Client")
+    def test_last_value_aggregation_for_active_installs(
+        self, mock_client_class, mock_download_csv
+    ):
+        """Test that active_device_installs uses last value, not sum"""
+        # Setup mock client
+        mock_client = MagicMock()
+        mock_client_class.return_value = mock_client
+
+        # Mock blob listing
+        mock_blob = MagicMock()
+        mock_blob.name = "stats/installs/installs_com.test.app_202501_country.csv"
+        mock_client.list_blobs.return_value = [mock_blob]
+
+        # Mock CSV data with different values for active installs
+        mock_download_csv.return_value = [
+            {
+                "Date": "2025-01-10",  # Latest date but appears first in CSV
+                "Country": "US",
+                "Active Device Installs": "5000",  # This should be used
+                "Daily Device Installs": "100",
+            },
+            {
+                "Date": "2025-01-05",
+                "Country": "US",
+                "Active Device Installs": "3000",  # This should be ignored
+                "Daily Device Installs": "200",
+            },
+            {
+                "Date": "2025-01-01",
+                "Country": "US",
+                "Active Device Installs": "1000",  # This should be ignored
+                "Daily Device Installs": "300",
+            },
+        ]
+
+        # Clear metrics
+        with exporter._metrics_lock:
+            exporter._metrics_data = {}
+
+        # Process the package
+        exporter._process_package_csv(mock_client, "com.test.app")
+
+        # Check that active installs uses only the last date's value
+        with exporter._metrics_lock:
+            # Active device installs should be 5000 (from 2025-01-10)
+            self.assertEqual(
+                exporter._metrics_data["gplay_active_device_installs"][
+                    ("com.test.app", "US")
+                ][0],
+                5000.0,
+            )
+            # Daily installs should be summed: 100 + 200 + 300 = 600
+            self.assertEqual(
+                exporter._metrics_data["gplay_device_installs"][
+                    ("com.test.app", "US")
+                ][0],
+                600.0,
+            )
+
+    @patch("exporter._download_csv")
+    @patch("exporter.storage.Client")
+    def test_timestamp_uses_latest_date(self, mock_client_class, mock_download_csv):
+        """Test that timestamp is set to the latest date in the file"""
+        # Setup mock client
+        mock_client = MagicMock()
+        mock_client_class.return_value = mock_client
+
+        # Mock blob listing
+        mock_blob = MagicMock()
+        mock_blob.name = "stats/installs/installs_com.test.app_202501_country.csv"
+        mock_client.list_blobs.return_value = [mock_blob]
+
+        # Mock CSV data with multiple dates (not in order)
+        mock_download_csv.return_value = [
+            {
+                "Date": "2025-01-05",
+                "Country": "US",
+                "Daily Device Installs": "100",
+            },
+            {
+                "Date": "2025-01-03",
+                "Country": "US",
+                "Daily Device Installs": "150",
+            },
+            {
+                "Date": "2025-01-10",  # Latest date
+                "Country": "US",
+                "Daily Device Installs": "200",
+            },
+        ]
+
+        # Clear metrics
+        with exporter._metrics_lock:
+            exporter._metrics_data = {}
+
+        # Process the package
+        exporter._process_package_csv(mock_client, "com.test.app")
+
+        # Check that timestamp corresponds to 2025-01-10
+        with exporter._metrics_lock:
+            # Get the timestamp
+            _, timestamp_ms = exporter._metrics_data["gplay_device_installs"][
+                ("com.test.app", "US")
+            ]
+
+            # Convert back to date
+            timestamp_date = dt.datetime.fromtimestamp(timestamp_ms / 1000).date()
+            self.assertEqual(timestamp_date, dt.date(2025, 1, 10))
+
+
+class TestWSGIApp(unittest.TestCase):
+    """Test WSGI application endpoints"""
+
+    def setUp(self):
+        """Setup mock environment"""
+        self.start_response = Mock()
+
+    def test_healthz_endpoint_healthy(self):
+        """Test /healthz endpoint when healthy"""
+        with exporter._health_lock:
+            exporter._health_status["healthy"] = True
+
+        environ = {"PATH_INFO": "/healthz", "REQUEST_METHOD": "GET"}
+        response = exporter.app(environ, self.start_response)
+
+        self.start_response.assert_called_once_with(
+            "200 OK", [("Content-Type", "text/plain; charset=utf-8")]
+        )
+        self.assertEqual(response, [b"ok\n"])
+
+    def test_healthz_endpoint_unhealthy(self):
+        """Test /healthz endpoint when unhealthy"""
+        with exporter._health_lock:
+            exporter._health_status["healthy"] = False
+
+        environ = {"PATH_INFO": "/healthz", "REQUEST_METHOD": "GET"}
+        response = exporter.app(environ, self.start_response)
+
+        self.start_response.assert_called_once_with(
+            "503 Service Unavailable", [("Content-Type", "text/plain; charset=utf-8")]
+        )
+        self.assertEqual(response, [b"not ok\n"])
+
+    def test_metrics_endpoint(self):
+        """Test /metrics endpoint"""
+        # Add some test metrics
+        with exporter._metrics_lock:
+            exporter._metrics_data = {
+                "gplay_device_installs": {
+                    ("com.test.app", "US"): (1000.0, 1737734400000),
+                }
+            }
+
+        environ = {"PATH_INFO": "/metrics", "REQUEST_METHOD": "GET"}
+        response = exporter.app(environ, self.start_response)
+
+        self.start_response.assert_called_once_with(
+            "200 OK", [("Content-Type", "text/plain; version=0.0.4")]
+        )
+
+        # Check response contains metrics
+        response_text = b"".join(response).decode("utf-8")
+        self.assertIn("gplay_device_installs", response_text)
+        self.assertIn('package="com.test.app"', response_text)
+        self.assertIn('country="US"', response_text)
+        self.assertIn("1000.0", response_text)
+        self.assertIn("1737734400000", response_text)
+
+    def test_404_endpoint(self):
+        """Test unknown endpoint returns 404"""
+        environ = {"PATH_INFO": "/unknown", "REQUEST_METHOD": "GET"}
+        response = exporter.app(environ, self.start_response)
+
+        self.start_response.assert_called_once_with(
+            "404 Not Found", [("Content-Type", "text/plain; charset=utf-8")]
+        )
+        self.assertEqual(response, [b"not found\n"])
+
+
+class TestMetricDefinitions(unittest.TestCase):
+    """Test metric definitions and aggregation strategies"""
+
+    def test_aggregation_strategies_defined(self):
+        """Test that all metrics have aggregation strategy defined"""
+        for metric_name, metric_info in exporter.METRIC_DEFINITIONS.items():
+            self.assertIn(
+                "aggregation",
+                metric_info,
+                f"Metric {metric_name} missing aggregation strategy",
+            )
+            self.assertIn(
+                metric_info["aggregation"],
+                ["sum", "last"],
+                f"Invalid aggregation strategy for {metric_name}",
+            )
+
+    def test_active_installs_uses_last_aggregation(self):
+        """Test that active_device_installs uses 'last' aggregation"""
+        self.assertEqual(
+            exporter.METRIC_DEFINITIONS["gplay_active_device_installs"][
+                "aggregation"
+            ],
+            "last",
+            "Active device installs should use 'last' aggregation, not 'sum'",
+        )
+
+    def test_daily_metrics_use_sum_aggregation(self):
+        """Test that daily metrics use 'sum' aggregation"""
+        daily_metrics = [
+            "gplay_device_installs",
+            "gplay_device_uninstalls",
+            "gplay_user_installs",
+            "gplay_user_uninstalls",
+        ]
+        for metric_name in daily_metrics:
+            self.assertEqual(
+                exporter.METRIC_DEFINITIONS[metric_name]["aggregation"],
+                "sum",
+                f"{metric_name} should use 'sum' aggregation",
+            )
+
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Run tests
+    unittest.main()
