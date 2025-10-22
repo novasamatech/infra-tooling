@@ -1,69 +1,66 @@
 # Google Play Console Metrics Exporter
 
-This exporter extracts and exposes multiple metrics from Google Play Console CSV reports
-as Prometheus counters. It automatically discovers packages, processes CSV files, and exports metrics for monitoring and alerting.
+This exporter extracts and exposes metrics from Google Play Console CSV reports
+as Prometheus gauge metrics. It automatically discovers packages, processes CSV files for configurable time periods, and exports metrics with proper timestamps for each individual date.
 
 ## Exported Metrics
 
-All metrics are exported as Prometheus counters with proper timestamps:
+All metrics are exported as Prometheus gauges with proper timestamps. Each date in the CSV reports generates a separate metric entry with the corresponding timestamp:
 
-1. **gplay_device_installs_v2{package,country}**
-   - Sum of device installs for the month
-   - Aggregation: SUM of all days
-   - Type: Counter with timestamp
+1. **gplay_device_installs_v3{package,country}**
+   - Daily device installs for a specific date
+   - Type: Gauge with timestamp
 
-2. **gplay_device_uninstalls_v2{package,country}**
-   - Sum of device uninstalls for the month
-   - Aggregation: SUM of all days
-   - Type: Counter with timestamp
+2. **gplay_device_uninstalls_v3{package,country}**
+   - Daily device uninstalls for a specific date
+   - Type: Gauge with timestamp
 
-3. **gplay_active_device_installs_v2{package,country}**
-   - Current active device installs (absolute value)
-   - Aggregation: LAST value from the latest date
-   - Type: Counter with timestamp
+3. **gplay_active_device_installs_v3{package,country}**
+   - Active device installations on a specific date
+   - Type: Gauge with timestamp
 
-4. **gplay_user_installs_v2{package,country}**
-   - Sum of user installs for the month
-   - Aggregation: SUM of all days
-   - Type: Counter with timestamp
+4. **gplay_user_installs_v3{package,country}**
+   - Daily user installs for a specific date
+   - Type: Gauge with timestamp
 
-5. **gplay_user_uninstalls_v2{package,country}**
-   - Sum of user uninstalls for the month
-   - Aggregation: SUM of all days
-   - Type: Counter with timestamp
+5. **gplay_user_uninstalls_v3{package,country}**
+   - Daily user uninstalls for a specific date
+   - Type: Gauge with timestamp
 
 ## How It Works
 
 ### Data Processing Flow
 
-1. **File Discovery**: Finds the latest monthly CSV file for each package (e.g., `installs_com.app_202501_country.csv`)
+1. **File Discovery**: Finds monthly CSV files for each package based on the configured lookback period (e.g., `installs_com.app_202501_country.csv`)
 
-2. **Data Aggregation**: 
-   - For **daily metrics** (installs, uninstalls): Sums values across all dates in the file
-   - For **absolute metrics** (active_device_installs): Takes only the value from the latest date
-   - This ensures correct representation of both flow and stock metrics
+2. **Date-Specific Metrics**: 
+   - Each row in the CSV (representing a specific date) becomes a separate gauge metric
+   - No aggregation is performed - each date's data is preserved individually
+   - Metrics include the proper timestamp for their specific date
 
 3. **Timestamp Assignment**: 
-   - Identifies the maximum (latest) date in the file
-   - Converts this date to milliseconds timestamp
-   - Applies this timestamp to all metrics from that file
+   - Each date in the CSV gets its own millisecond timestamp
+   - This timestamp is applied to the metric for that specific date
+   - Ensures accurate time-series data in Prometheus
 
-4. **Format Generation**: 
-   - Manually creates Prometheus text format
-   - Includes timestamp on the same line as the metric value
-   - Filters out zero values to avoid empty series
+4. **Storage Refresh**: 
+   - Metrics are completely cleared and refreshed on each collection cycle
+   - Prevents infinite accumulation of historical data
+   - Keeps only the data from the configured lookback period
 
 ### Example Output
 
 ```prometheus
-# HELP gplay_device_installs_v2 Device installs by country from Google Play Console
-# TYPE gplay_device_installs_v2 counter
-gplay_device_installs_v2{package="com.example.app",country="US"} 12450.0 1737734400000
-gplay_device_installs_v2{package="com.example.app",country="GB"} 5678.0 1737734400000
+# HELP gplay_device_installs_v3 Device installs by country and date from Google Play Console
+# TYPE gplay_device_installs_v3 gauge
+gplay_device_installs_v3{package="com.example.app",country="US"} 1250.0 1737676800000
+gplay_device_installs_v3{package="com.example.app",country="US"} 1300.0 1737763200000
+gplay_device_installs_v3{package="com.example.app",country="GB"} 567.0 1737676800000
 
-# HELP gplay_active_device_installs_v2 Active device installs by country from Google Play Console
-# TYPE gplay_active_device_installs_v2 counter
-gplay_active_device_installs_v2{package="com.example.app",country="US"} 850000.0 1737734400000
+# HELP gplay_active_device_installs_v3 Active device installs by country and date from Google Play Console
+# TYPE gplay_active_device_installs_v3 gauge
+gplay_active_device_installs_v3{package="com.example.app",country="US"} 850000.0 1737676800000
+gplay_active_device_installs_v3{package="com.example.app",country="US"} 851300.0 1737763200000
 ```
 
 ## Dependencies
@@ -79,6 +76,7 @@ gplay_active_device_installs_v2{package="com.example.app",country="US"} 850000.0
 ### OPTIONAL:
 - **GPLAY_EXPORTER_PORT**: HTTP server port (default: 8000)
 - **GPLAY_EXPORTER_COLLECTION_INTERVAL_SECONDS**: Metrics collection interval (default: 43200 = 12 hours)
+- **GPLAY_EXPORTER_MONTHS_LOOKBACK**: Number of months to look back for reports (default: 1)
 - **GPLAY_EXPORTER_GCS_PROJECT**: Google Cloud project ID (optional)
 - **GPLAY_EXPORTER_TEST_MODE**: Run single collection and exit
 - **GPLAY_EXPORTER_LOG_LEVEL**: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
@@ -89,6 +87,7 @@ gplay_active_device_installs_v2{package="com.example.app",country="US"} 850000.0
 ```bash
 GPLAY_EXPORTER_GOOGLE_APPLICATION_CREDENTIALS=/path/to/creds.json \
 GPLAY_EXPORTER_BUCKET_ID=pubsite_prod_123456789 \
+GPLAY_EXPORTER_MONTHS_LOOKBACK=2 \
 python exporter.py
 ```
 
@@ -106,6 +105,7 @@ python exporter.py
 docker build -f Dockerfile -t gplay-exporter .
 docker run -e GPLAY_EXPORTER_GOOGLE_APPLICATION_CREDENTIALS=/creds/key.json \
            -e GPLAY_EXPORTER_BUCKET_ID=pubsite_prod_123456789 \
+           -e GPLAY_EXPORTER_MONTHS_LOOKBACK=3 \
            -v /path/to/creds:/creds:ro \
            -p 8000:8000 \
            gplay-exporter
@@ -126,24 +126,25 @@ scrape_configs:
 ### Important: Honor Timestamps
 Make sure your Prometheus configuration includes `honor_timestamps: true` to use the timestamps provided by the exporter. This ensures metrics are stored with the correct time from the Play Console reports, not the scrape time.
 
-## Aggregation Strategy
+## Data Model
 
-The exporter uses different aggregation strategies based on the metric type:
+### Individual Date Metrics
+In v3, each date in the CSV reports generates its own metric entry:
+- No aggregation across dates
+- Each metric represents the exact value for that specific date
+- Timestamps correspond to the actual date of the data
 
-### Sum Aggregation
-Used for flow metrics that represent events over time:
-- `gplay_device_installs_v2` - each day adds to the monthly total
-- `gplay_device_uninstalls_v2` - each day adds to the monthly total  
-- `gplay_user_installs_v2` - each day adds to the monthly total
-- `gplay_user_uninstalls_v2` - each day adds to the monthly total
+### Storage Refresh
+The exporter completely refreshes its metric storage on each collection cycle:
+- Old metrics are cleared before new ones are added
+- Only metrics from the configured lookback period are retained
+- Prevents unbounded memory growth
 
-### Last Value Aggregation
-Used for stock metrics that represent current state:
-- `gplay_active_device_installs_v2` - represents the current number of active installations
-
-This approach ensures that:
-- Daily statistics are properly accumulated for the entire month
-- Absolute values (like active installs) aren't incorrectly summed
+### Months Lookback
+The `GPLAY_EXPORTER_MONTHS_LOOKBACK` variable controls how far back to look for reports:
+- Default: 1 (current month only)
+- Setting to 3 would process the current month and 2 previous months
+- Each month's CSV file is processed independently
 
 ## Testing
 
@@ -154,9 +155,11 @@ python test_integration.py
 ```
 
 The test suite validates:
-- Prometheus format generation with timestamps
-- Correct aggregation strategies (sum vs last value)
-- Timestamp selection (latest date)
+- Gauge metric type for all metrics
+- Date-specific metric entries
+- Proper timestamp assignment per date
+- Metric storage refresh on collection
+- Months lookback functionality
 - Health check functionality
 - Date parsing and number extraction
 - Zero value filtering
@@ -166,39 +169,39 @@ The test suite validates:
 ### Example Prometheus Queries
 
 ```promql
-# Total installs for the current month
-gplay_device_installs_v2
+# View all device installs for the latest available dates
+gplay_device_installs_v3
 
-# Current active installations
-gplay_active_device_installs_v2
+# Current active installations by date
+gplay_active_device_installs_v3
 
-# Uninstall rate by country
-gplay_device_uninstalls_v2 / gplay_device_installs_v2
+# Device installs for a specific package over time
+gplay_device_installs_v3{package="com.example.app"}
 
-# Growth in active installs over time
-increase(gplay_active_device_installs_v2[30d])
+# Uninstall rate by country (for specific timestamps)
+gplay_device_uninstalls_v3 / gplay_device_installs_v3
 ```
 
 ### Data Freshness Monitoring
 Since metrics include explicit timestamps, you can monitor data freshness:
 ```promql
 # Alert if data is older than 48 hours
-time() - timestamp(gplay_device_installs_v2) > 172800
+time() - timestamp(gplay_device_installs_v3) > 172800
 ```
 
 ## Troubleshooting
 
-### Metrics appear with old timestamps
-- **Cause**: Play Console reports may be delayed
-- **Solution**: This is expected behavior; timestamp reflects the actual data date
+### Many duplicate-looking metrics
+- **Cause**: Each date generates its own metric entry
+- **Solution**: This is expected behavior in v3; use Prometheus queries to aggregate if needed
 
-### Active installs value seems low
-- **Cause**: correctly uses only the latest value, not a sum
-- **Solution**: This is correct behavior for absolute metrics
+### Metrics disappear after collection
+- **Cause**: Storage is refreshed on each collection cycle
+- **Solution**: This is by design; adjust MONTHS_LOOKBACK if you need more historical data
 
-### Daily metrics values are high
-- **Cause**: sums all days in the month for flow metrics
-- **Solution**: This is correct behavior; values represent monthly totals
+### Missing historical data
+- **Cause**: MONTHS_LOOKBACK is set too low
+- **Solution**: Increase MONTHS_LOOKBACK to include desired historical period
 
 ### Prometheus not using timestamps
 - **Cause**: Missing `honor_timestamps: true` in scrape config
@@ -206,33 +209,50 @@ time() - timestamp(gplay_device_installs_v2) > 172800
 
 ## Technical Details
 
-### Why Different Aggregation Strategies?
+### Why Gauge Metrics?
 
-**Flow Metrics** (installs/uninstalls per day):
-- Represent events that occur over time
-- Should be summed to get total monthly activity
-- Example: 100 installs on day 1 + 150 on day 2 = 250 total installs
+In v3, all metrics are gauges because:
+- Each metric represents a point-in-time value for a specific date
+- No aggregation is performed - raw daily values are preserved
+- Allows for more flexible querying in Prometheus
 
-**Stock Metrics** (active installations):
-- Represent current state at a point in time
-- Should use only the latest value
-- Example: 1000 active on day 1, 1100 active on day 2 = current value is 1100 (not 2100)
+### Storage Refresh Strategy
 
-### Manual Format Generation
-
-The prometheus_client Python library has a limitation where it cannot set timestamps in the standard Prometheus format. By generating the format manually, we achieve:
-- Correct Prometheus text exposition format
-- Proper inline timestamp support
-- Full control over metric output
+The complete refresh approach ensures:
+- No infinite accumulation of historical metrics
+- Predictable memory usage
+- Fresh data on each collection cycle
+- Simpler logic without complex state management
 
 ### CSV Data Source
 
 - **Source**: Google Cloud Storage bucket with Play Console exports
 - **File Pattern**: `stats/installs/installs_<package>_<YYYYMM>_country.csv`
-- **Processing**: Aggregates data based on metric type
+- **Processing**: Each row becomes an individual gauge metric
 - **Encoding**: Handles UTF-16, UTF-8 and other common encodings
 
 ## Changelog
+
+### Version 3.0.0 (2025-01-24)
+
+#### Major Changes
+- **All Metrics Are Now Gauges**: Changed from counter to gauge type for all metrics
+- **Date-Specific Metrics**: Each date in CSV reports generates its own metric entry with proper timestamp
+- **No Aggregation**: Removed sum/last value logic - each metric preserves its exact daily value
+- **Storage Refresh**: Metrics are completely cleared and refreshed on each collection cycle
+- **Configurable Lookback**: Added `GPLAY_EXPORTER_MONTHS_LOOKBACK` environment variable (default: 1)
+- **Metric Name Change**: All metrics now use `_v3` suffix
+
+#### Breaking Changes
+- Metric type changed from counter to gauge
+- Aggregation logic removed (no more summing or last-value selection)
+- Metric storage no longer accumulates indefinitely
+- Different data model requiring query adjustments
+
+#### Migration Notes
+- v3 can run alongside v2 during migration (different metric names)
+- Prometheus queries will need adjustment for the new gauge metrics
+- Consider historical data requirements when setting MONTHS_LOOKBACK
 
 ### Version 2.1.0 (2025-01-24)
 
@@ -258,11 +278,6 @@ The prometheus_client Python library has a limitation where it cannot set timest
   - Removed unnecessary "total" suffix except for semantically appropriate metrics
 - **No prometheus_client dependency**: Generates Prometheus format manually
 
-#### Important Notes
-- Metric values will be different from v1 (higher for daily metrics due to summing)
-- Requires `honor_timestamps: true` in Prometheus scrape configuration
-- Active device installs now correctly shows current value, not sum
-
 ### Version 1.1.2 (2025-01-24)
 
 #### Improvements
@@ -277,28 +292,15 @@ The prometheus_client Python library has a limitation where it cannot set timest
 ### Version 1.1.0 (2025-01-24)
 
 #### Breaking Changes
-- **Environment Variables**: Removed support for old unprefixed environment variable names. All variables must now use the `GPLAY_EXPORTER_` prefix:
-  - `GOOGLE_APPLICATION_CREDENTIALS` → `GPLAY_EXPORTER_GOOGLE_APPLICATION_CREDENTIALS`
-  - `GPLAY_BUCKET_ID` → `GPLAY_EXPORTER_BUCKET_ID`
-  - `PORT` → `GPLAY_EXPORTER_PORT`
-  - `COLLECTION_INTERVAL_SECONDS` → `GPLAY_EXPORTER_COLLECTION_INTERVAL_SECONDS`
-  - `GCS_PROJECT` → `GPLAY_EXPORTER_GCS_PROJECT`
-  - `TEST_MODE` → `GPLAY_EXPORTER_TEST_MODE`
-  - `LOG_LEVEL` → `GPLAY_EXPORTER_LOG_LEVEL`
+- **Environment Variables**: Removed support for old unprefixed environment variable names. All variables must now use the `GPLAY_EXPORTER_` prefix
 
 #### Improvements
-- **Health Check**: Simplified `/healthz` endpoint to return only status code (200/503) and simple text response ("ok"/"not ok"). Detailed information moved to debug logs
-- **Logging**: HTTP request logs now only appear in DEBUG mode via custom `QuietWSGIRequestHandler`
-- **Documentation**: Added extensive code comments and docstrings in English throughout the codebase
-- **Docker**: Fixed google-crc32c warning by adding build dependencies (gcc, musl-dev, python3-dev, libffi-dev) to Dockerfile for C extension compilation
-- **Performance**: Optimized Dockerfile layer ordering for better caching
-- **Metrics Export**: Zero-value metrics are no longer exported to prevent creating empty Prometheus series
-
-#### Technical Details
-- Metrics remain as Prometheus Counters (not Gauges) by design, as they represent cumulative daily values
-- Registry is recreated on each collection cycle to handle date changes properly
-- Health status becomes "healthy" after first successful collection and remains healthy even if subsequent collections fail
-- Empty metric series prevention reduces memory usage in Prometheus
+- **Health Check**: Simplified `/healthz` endpoint
+- **Logging**: HTTP request logs now only appear in DEBUG mode
+- **Documentation**: Added extensive code comments and docstrings
+- **Docker**: Fixed google-crc32c warning
+- **Performance**: Optimized Dockerfile layer ordering
+- **Metrics Export**: Zero-value metrics are no longer exported
 
 ### Version 1.0.0 (Initial Release)
 - Initial implementation with Google Play Console metrics export
