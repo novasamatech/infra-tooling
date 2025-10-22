@@ -125,7 +125,7 @@ _health_state_lock = threading.Lock()
 METRICS = [
     {
         "key": "daily_user_installs",
-        "prom_name": "appstore_daily_user_installs",
+        "prom_name": "appstore_daily_user_installs_v2",
         "help": "Daily user installs (App Units) by country",
         "labels": {
             "country": "Territory",
@@ -140,7 +140,7 @@ METRICS = [
     },
     {
         "key": "active_devices",
-        "prom_name": "appstore_active_devices",
+        "prom_name": "appstore_active_devices_v2",
         "help": "Active devices by country (proxy for active device installs)",
         "labels": {
             "country": "Territory",
@@ -155,7 +155,7 @@ METRICS = [
     },
     {
         "key": "uninstalls",
-        "prom_name": "appstore_uninstalls",
+        "prom_name": "appstore_uninstalls_v2",
         "help": "Uninstalls by country (Installation and Deletion). May be WEEKLY depending on availability",
         "labels": {
             "country": "Territory",
@@ -204,7 +204,8 @@ def _format_prometheus_output() -> str:
 
                     # Build labels string
                     labels_parts = []
-                    # key is (metric_name, package, country, platform_version, source_type, ...)
+                    # key is (metric_name, package, label1, label2, ..., date)
+                    # Last element is date, not a label
                     if len(key) >= 2:
                         labels_parts.append(f'package="{key[1]}"')
 
@@ -215,9 +216,8 @@ def _format_prometheus_output() -> str:
                     if metric_config and "labels" in metric_config:
                         label_names = list(metric_config["labels"].keys())
                         for i, label_name in enumerate(label_names):
-                            if (
-                                len(key) > i + 2
-                            ):  # +2 because index 0 is metric_name, 1 is package
+                            # +2 for metric_name and package, -1 to exclude date at the end
+                            if len(key) > i + 2 and i + 2 < len(key) - 1:
                                 labels_parts.append(f'{label_name}="{key[i + 2]}"')
 
                     labels = ",".join(labels_parts)
@@ -880,7 +880,7 @@ def _export_metrics(app_info, row, metric_name, value, row_date):
 
     metric_config = next((m for m in METRICS if m["key"] == metric_name), None)
     if metric_config:
-        # Build key tuple: (metric_name, package, label1_value, label2_value, ...)
+        # Build key tuple: (metric_name, package, label1_value, label2_value, ..., date)
         key_parts = [metric_config["prom_name"], app_info["name"]]
 
         # Add label values in the order defined in metric config
@@ -888,6 +888,8 @@ def _export_metrics(app_info, row, metric_name, value, row_date):
             for label_name, field_name in metric_config["labels"].items():
                 key_parts.append(row.get(field_name, ""))
 
+        # Add date to key to preserve historical data points
+        key_parts.append(row_date)
         key = tuple(key_parts)
 
         # Store value with timestamp
