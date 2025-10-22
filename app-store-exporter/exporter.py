@@ -17,12 +17,7 @@ import io
 from datetime import date, timedelta
 from urllib.parse import urlparse
 
-from prometheus_client import (
-    Counter,
-    CollectorRegistry,
-    generate_latest,
-    CONTENT_TYPE_LATEST,
-)
+from collections import defaultdict
 from wsgiref.simple_server import make_server, WSGIRequestHandler
 
 LOG = logging.getLogger("appstore_exporter")
@@ -109,8 +104,12 @@ DAYS_TO_FETCH = int(os.environ.get("APPSTORE_EXPORTER_DAYS_TO_FETCH", "14"))
 TEST_MODE = os.environ.get("APPSTORE_EXPORTER_TEST_MODE")
 
 API_BASE = "https://api.appstoreconnect.apple.com"
-REGISTRY = CollectorRegistry()
 _REPORTS_CACHE = {}
+
+# Metrics storage - similar to gplay-exporter
+_metrics_lock = threading.Lock()
+_metrics_data = {}  # Format: {metric_name: {(labels...): (value, timestamp_ms)}}
+CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
 
 # Health check state management with thread safety
 _health_state = {
@@ -120,11 +119,8 @@ _health_state = {
     "collections_count": 0,
 }
 _health_state_lock = threading.Lock()
-_registry_lock = threading.Lock()  # Lock for Registry access to prevent race conditions
 
 # ------------ Prometheus Metrics Config ------------
-# Add error tracking metrics
-from prometheus_client import Gauge
 
 METRICS = [
     {
@@ -176,35 +172,92 @@ METRICS = [
 ]
 
 
-def _init_metrics():
-    """Create Prometheus counters for all configured metrics and bind them to the current registry."""
-    global counters, parsing_errors_counter, last_collection_timestamp
-    counters = {}
-    for m in METRICS:
-        # Convert label mapping to list of label names for Prometheus
-        label_names = ["package"]  # Always include package label
-        if "labels" in m:
-            label_names.extend(m["labels"].keys())
-        c = Counter(m["prom_name"], m["help"], label_names, registry=REGISTRY)
-        m["counter"] = c
-        counters[m["key"]] = c
+def _format_prometheus_output() -> str:
+    """
+    Format metrics data as Prometheus text format with timestamps.
 
-    # Create internal metrics for monitoring
-    parsing_errors_counter = Counter(
-        "appstore_exporter_parsing_errors_total",
-        "Total number of parsing errors per app and report",
-        ["package", "report_type"],
-        registry=REGISTRY,
-    )
-    last_collection_timestamp = Gauge(
-        "appstore_exporter_last_collection_timestamp",
-        "Timestamp of last successful collection",
-        registry=REGISTRY,
-    )
+    Returns:
+        String in Prometheus text exposition format
+    """
+    lines = []
 
+    with _metrics_lock:
+        # Group metrics by name for proper formatting
+        metrics_by_name = defaultdict(list)
+        for key, values in _metrics_data.items():
+            if isinstance(key, tuple) and len(key) >= 1:
+                metric_name = key[0]
+                metrics_by_name[metric_name].append((key, values))
 
-# Initialize counters at import time
-_init_metrics()
+        # Add regular metrics
+        for m in METRICS:
+            metric_name = m["prom_name"]
+            lines.append(f"# HELP {metric_name} {m['help']}")
+            lines.append(f"# TYPE {metric_name} gauge")
+
+            # Get all entries for this metric
+            for key, (value, timestamp_ms) in _metrics_data.items():
+                if isinstance(key, tuple) and len(key) >= 1 and key[0] == metric_name:
+                    # Skip zero values
+                    if value <= 0:
+                        continue
+
+                    # Build labels string
+                    labels_parts = []
+                    # key is (metric_name, package, country, platform_version, source_type, ...)
+                    if len(key) >= 2:
+                        labels_parts.append(f'package="{key[1]}"')
+
+                    # Add other labels based on metric config
+                    metric_config = next(
+                        (m for m in METRICS if m["prom_name"] == metric_name), None
+                    )
+                    if metric_config and "labels" in metric_config:
+                        label_names = list(metric_config["labels"].keys())
+                        for i, label_name in enumerate(label_names):
+                            if (
+                                len(key) > i + 2
+                            ):  # +2 because index 0 is metric_name, 1 is package
+                                labels_parts.append(f'{label_name}="{key[i + 2]}"')
+
+                    labels = ",".join(labels_parts)
+                    lines.append(f"{metric_name}{{{labels}}} {value} {timestamp_ms}")
+
+        # Add exporter internal metrics
+        lines.append(
+            "# HELP appstore_exporter_parsing_errors_total Total number of parsing errors per app and report"
+        )
+        lines.append("# TYPE appstore_exporter_parsing_errors_total gauge")
+        for key, (value, timestamp_ms) in _metrics_data.items():
+            if (
+                isinstance(key, tuple)
+                and len(key) >= 1
+                and key[0] == "appstore_exporter_parsing_errors_total"
+            ):
+                if value > 0:
+                    # key is (metric_name, package, report_type)
+                    if len(key) >= 3:
+                        labels = f'package="{key[1]}",report_type="{key[2]}"'
+                        lines.append(
+                            f"appstore_exporter_parsing_errors_total{{{labels}}} {value} {timestamp_ms}"
+                        )
+
+        lines.append(
+            "# HELP appstore_exporter_last_collection_timestamp Timestamp of last successful collection"
+        )
+        lines.append("# TYPE appstore_exporter_last_collection_timestamp gauge")
+        for key, (value, timestamp_ms) in _metrics_data.items():
+            if (
+                isinstance(key, str)
+                and key == "appstore_exporter_last_collection_timestamp"
+            ):
+                lines.append(
+                    f"appstore_exporter_last_collection_timestamp {value} {timestamp_ms}"
+                )
+
+    # Add empty line at the end
+    lines.append("")
+    return "\n".join(lines)
 
 
 # ------------ Core Functions ------------
@@ -825,20 +878,24 @@ def _export_metrics(app_info, row, metric_name, value, row_date):
             dt.datetime.combine(report_date, dt.time.min).timestamp() * 1000
         )
 
-    if metric_name in counters:
-        metric = counters[metric_name]
-        # Build labels from the mapping configuration for this specific metric
-        labels = {"package": app_info["name"]}  # Fixed package label from app config
-        metric_config = next((m for m in METRICS if m["key"] == metric_name), None)
-        if metric_config and "labels" in metric_config:
-            for label_name, field_name in metric_config["labels"].items():
-                labels[label_name] = row.get(field_name, "")
+    metric_config = next((m for m in METRICS if m["key"] == metric_name), None)
+    if metric_config:
+        # Build key tuple: (metric_name, package, label1_value, label2_value, ...)
+        key_parts = [metric_config["prom_name"], app_info["name"]]
 
-        if hasattr(metric.labels(**labels), "_value"):
-            metric.labels(**labels)._value.set(value, timestamp=timestamp_ms)
+        # Add label values in the order defined in metric config
+        if "labels" in metric_config:
+            for label_name, field_name in metric_config["labels"].items():
+                key_parts.append(row.get(field_name, ""))
+
+        key = tuple(key_parts)
+
+        # Store value with timestamp
+        with _metrics_lock:
+            _metrics_data[key] = (value, timestamp_ms)
 
         if LOG.isEnabledFor(logging.DEBUG) and value > 0:
-            LOG.debug("Exported %s=%s with labels %s", metric_name, value, labels)
+            LOG.debug("Exported %s=%s with key %s", metric_name, value, key)
 
 
 def _process_analytics_data(
@@ -1196,10 +1253,15 @@ def _process_analytics_data(
     except Exception as e:
         LOG.error("Failed to process %s for %s: %s", report_type, app_name, e)
         # Increment error counter for this app and report type
-        if "parsing_errors_counter" in globals():
-            parsing_errors_counter.labels(
-                package=app_name, report_type=report_type
-            ).inc()
+        with _metrics_lock:
+            error_key = (
+                "appstore_exporter_parsing_errors_total",
+                app_name,
+                report_type,
+            )
+            current_value, _ = _metrics_data.get(error_key, (0, 0))
+            timestamp_ms = int(dt.datetime.now().timestamp() * 1000)
+            _metrics_data[error_key] = (current_value + 1, timestamp_ms)
 
 
 def _process_app_metrics(app_info):
@@ -1228,10 +1290,20 @@ def _process_app_metrics(app_info):
 
 def _run_metrics_collection():
     """Run metrics collection for all configured apps with health state tracking."""
-    global REGISTRY, counters, _health_state
-    with _registry_lock:
-        REGISTRY = CollectorRegistry()
-        _init_metrics()
+    global _health_state
+    # Clear old metrics data before new collection, but preserve error counters
+    with _metrics_lock:
+        # Save error counters
+        error_metrics = {
+            k: v
+            for k, v in _metrics_data.items()
+            if isinstance(k, tuple)
+            and len(k) > 0
+            and k[0] == "appstore_exporter_parsing_errors_total"
+        }
+        _metrics_data.clear()
+        # Restore error counters
+        _metrics_data.update(error_metrics)
 
     LOG.info("Starting metrics collection for %d apps", len(APPS))
 
@@ -1265,8 +1337,14 @@ def _run_metrics_collection():
             )
 
         # Update last collection timestamp
-        if _health_state["healthy"] and "last_collection_timestamp" in globals():
-            last_collection_timestamp.set(time.time())
+        if _health_state["healthy"]:
+            with _metrics_lock:
+                timestamp_now = time.time()
+                timestamp_ms = int(timestamp_now * 1000)
+                _metrics_data["appstore_exporter_last_collection_timestamp"] = (
+                    timestamp_now,
+                    timestamp_ms,
+                )
 
 
 # ------------ Background Collection ------------
@@ -1291,9 +1369,13 @@ def _background_collection():
             # Print summary in test mode
             metrics_summary = []
             for m in METRICS:
-                c = m.get("counter")
                 prom_name = m.get("prom_name")
-                series = len(c._metrics) if c is not None else 0
+                # Count series for this metric
+                series = sum(
+                    1
+                    for k in _metrics_data.keys()
+                    if isinstance(k, tuple) and len(k) > 0 and k[0] == prom_name
+                )
                 metrics_summary.append((prom_name, series))
 
             LOG.info("Collection summary:")
@@ -1384,9 +1466,8 @@ def app(environ, start_response):
     if LOG.isEnabledFor(logging.DEBUG):
         LOG.debug("Serving metrics endpoint")
 
-    # Use lock to prevent reading REGISTRY during recreation
-    with _registry_lock:
-        output = generate_latest(REGISTRY)
+    # Generate Prometheus format output
+    output = _format_prometheus_output().encode("utf-8")
     start_response("200 OK", [("Content-Type", CONTENT_TYPE_LATEST)])
     return [output]
 

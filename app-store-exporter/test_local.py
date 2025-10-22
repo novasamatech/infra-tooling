@@ -350,6 +350,159 @@ class TestMetricsEndpoint(unittest.TestCase):
         self.assertIn(b"not found", response[0])
 
 
+class TestPrometheusFormat(unittest.TestCase):
+    """Test Prometheus format output validation"""
+
+    def test_format_prometheus_output_empty_metrics(self):
+        """Test format output with empty metrics"""
+        with patch.dict(exporter._metrics_data, clear=True):
+            output = exporter._format_prometheus_output()
+
+            # Should contain HELP and TYPE for each metric
+            self.assertIn("# HELP appstore_daily_user_installs", output)
+            self.assertIn("# TYPE appstore_daily_user_installs gauge", output)
+            self.assertIn("# HELP appstore_active_devices", output)
+            self.assertIn("# TYPE appstore_active_devices gauge", output)
+            self.assertIn("# HELP appstore_uninstalls", output)
+            self.assertIn("# TYPE appstore_uninstalls gauge", output)
+
+            # Should contain internal metrics
+            self.assertIn("# HELP appstore_exporter_parsing_errors_total", output)
+            self.assertIn("# TYPE appstore_exporter_parsing_errors_total gauge", output)
+            self.assertIn("# HELP appstore_exporter_last_collection_timestamp", output)
+            self.assertIn(
+                "# TYPE appstore_exporter_last_collection_timestamp gauge", output
+            )
+
+    def test_format_prometheus_output_with_metrics(self):
+        """Test format output with actual metrics"""
+        test_timestamp_ms = 1704067200000  # 2024-01-01 00:00:00 UTC
+        test_metrics = {
+            (
+                "appstore_daily_user_installs",
+                "com.test.app",
+                "US",
+                "iOS 17",
+                "App Store",
+            ): (100, test_timestamp_ms),
+            (
+                "appstore_active_devices",
+                "com.test.app",
+                "DE",
+                "iPhone",
+                "iOS 16",
+                "Web",
+            ): (50, test_timestamp_ms),
+            (
+                "appstore_uninstalls",
+                "com.test.app",
+                "JP",
+                "iPad",
+                "iOS 15",
+                "App Store",
+            ): (25, test_timestamp_ms),
+            (
+                "appstore_exporter_parsing_errors_total",
+                "com.test.app",
+                "App Downloads Standard",
+            ): (2, test_timestamp_ms),
+            "appstore_exporter_last_collection_timestamp": (
+                1704067200.0,
+                test_timestamp_ms,
+            ),
+        }
+
+        with patch.dict(exporter._metrics_data, test_metrics, clear=True):
+            output = exporter._format_prometheus_output()
+
+            # Verify metric format: metric_name{labels} value timestamp
+            self.assertIn(
+                'appstore_daily_user_installs{package="com.test.app",country="US",platform_version="iOS 17",source_type="App Store"} 100 1704067200000',
+                output,
+            )
+            self.assertIn(
+                'appstore_active_devices{package="com.test.app",country="DE",device="iPhone",platform_version="iOS 16",source_type="Web"} 50 1704067200000',
+                output,
+            )
+            self.assertIn(
+                'appstore_uninstalls{package="com.test.app",country="JP",device="iPad",platform_version="iOS 15",source_type="App Store"} 25 1704067200000',
+                output,
+            )
+
+            # Verify internal metrics format
+            self.assertIn(
+                'appstore_exporter_parsing_errors_total{package="com.test.app",report_type="App Downloads Standard"} 2 1704067200000',
+                output,
+            )
+            self.assertIn(
+                "appstore_exporter_last_collection_timestamp 1704067200.0 1704067200000",
+                output,
+            )
+
+    def test_format_prometheus_output_skips_zero_values(self):
+        """Test that zero values are skipped in output"""
+        test_timestamp_ms = 1704067200000
+        test_metrics = {
+            (
+                "appstore_daily_user_installs",
+                "com.test.app",
+                "US",
+                "iOS 17",
+                "App Store",
+            ): (0, test_timestamp_ms),
+            (
+                "appstore_active_devices",
+                "com.test.app",
+                "DE",
+                "iPhone",
+                "iOS 16",
+                "Web",
+            ): (50, test_timestamp_ms),
+        }
+
+        with patch.dict(exporter._metrics_data, test_metrics, clear=True):
+            output = exporter._format_prometheus_output()
+
+            # Zero value should not appear
+            self.assertNotIn(
+                'appstore_daily_user_installs{package="com.test.app"', output
+            )
+
+            # Non-zero value should appear
+            self.assertIn('appstore_active_devices{package="com.test.app"', output)
+
+    def test_metrics_endpoint_returns_prometheus_format(self):
+        """Test that /metrics endpoint returns properly formatted output"""
+        test_timestamp_ms = int(time.time() * 1000)
+        test_metrics = {
+            (
+                "appstore_daily_user_installs",
+                "com.test.app",
+                "US",
+                "iOS 17",
+                "App Store",
+            ): (100, test_timestamp_ms),
+        }
+
+        with patch.dict(exporter._metrics_data, test_metrics, clear=True):
+            environ = {"PATH_INFO": "/metrics", "REQUEST_METHOD": "GET"}
+            start_response = Mock()
+
+            response = exporter.app(environ, start_response)
+
+            # Decode response
+            output = response[0].decode("utf-8")
+
+            # Verify format
+            self.assertIn("# HELP appstore_daily_user_installs", output)
+            self.assertIn("# TYPE appstore_daily_user_installs gauge", output)
+            self.assertIn(
+                'appstore_daily_user_installs{package="com.test.app",country="US"',
+                output,
+            )
+            self.assertIn(f" 100 {test_timestamp_ms}", output)
+
+
 class TestDataProcessing(unittest.TestCase):
     """Test data processing and parsing functions"""
 
@@ -387,15 +540,12 @@ class TestCollectionLogic(unittest.TestCase):
     """Test metrics collection logic"""
 
     @patch("exporter._process_app_metrics")
-    @patch("exporter._init_metrics")
-    def test_run_metrics_collection_success(self, mock_init_metrics, mock_process):
+    def test_run_metrics_collection_success(self, mock_process):
         """Test successful metrics collection updates health state"""
         # Reset health state
         exporter._health_state["collections_count"] = 0
         exporter._health_state["healthy"] = False
 
-        # Ensure metrics are initialized
-        mock_init_metrics.return_value = None
         mock_process.return_value = None  # Success
 
         exporter._run_metrics_collection()
@@ -406,10 +556,7 @@ class TestCollectionLogic(unittest.TestCase):
         self.assertIsNone(exporter._health_state["last_error"])
 
     @patch("exporter._process_app_metrics")
-    @patch("exporter._init_metrics")
-    def test_run_metrics_collection_partial_failure(
-        self, mock_init_metrics, mock_process
-    ):
+    def test_run_metrics_collection_partial_failure(self, mock_process):
         """Test partial collection failure still marks as healthy"""
         # Save original APPS
         original_apps = exporter.APPS
@@ -421,8 +568,6 @@ class TestCollectionLogic(unittest.TestCase):
                 {"id": "2", "name": "app2", "bundle_id": "com.app2"},
             ]
 
-            # Ensure metrics are initialized
-            mock_init_metrics.return_value = None
             # First app succeeds, second fails
             mock_process.side_effect = [None, Exception("API Error")]
 
