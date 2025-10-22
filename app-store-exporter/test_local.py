@@ -29,19 +29,22 @@ from unittest.mock import Mock, patch, MagicMock, mock_open
 from datetime import datetime, timedelta
 import tempfile
 import requests
+from datetime import date
 
 # Set up test environment variables before importing exporter
-os.environ.update({
-    "APPSTORE_EXPORTER_ISSUER_ID": "test-issuer-id",
-    "APPSTORE_EXPORTER_KEY_ID": "test-key-id",
-    "APPSTORE_EXPORTER_PRIVATE_KEY": "/tmp/test-key.p8",
-    "APPSTORE_EXPORTER_APP_ID": "123456789",
-    "APPSTORE_EXPORTER_BUNDLE_ID": "com.test.app",
-    "APPSTORE_EXPORTER_PORT": "8001",
-    "APPSTORE_EXPORTER_COLLECTION_INTERVAL_SECONDS": "60",
-    "APPSTORE_EXPORTER_DAYS_TO_FETCH": "7",
-    "APPSTORE_EXPORTER_LOG_LEVEL": "INFO"
-})
+os.environ.update(
+    {
+        "APPSTORE_EXPORTER_ISSUER_ID": "test-issuer-id",
+        "APPSTORE_EXPORTER_KEY_ID": "test-key-id",
+        "APPSTORE_EXPORTER_PRIVATE_KEY": "/tmp/test-key.p8",
+        "APPSTORE_EXPORTER_APP_ID": "123456789",
+        "APPSTORE_EXPORTER_BUNDLE_ID": "com.test.app",
+        "APPSTORE_EXPORTER_PORT": "8001",
+        "APPSTORE_EXPORTER_COLLECTION_INTERVAL_SECONDS": "60",
+        "APPSTORE_EXPORTER_DAYS_TO_FETCH": "7",
+        "APPSTORE_EXPORTER_LOG_LEVEL": "INFO",
+    }
+)
 
 # Create a dummy private key file for testing
 TEST_PRIVATE_KEY = """-----BEGIN PRIVATE KEY-----
@@ -65,8 +68,12 @@ class TestExporterConfig(unittest.TestCase):
         """Test single app configuration parsing"""
         # Save original environment
         original_env = {}
-        for key in ["APPSTORE_EXPORTER_APP_ID", "APPSTORE_EXPORTER_APP_IDS",
-                    "APPSTORE_EXPORTER_BUNDLE_ID", "APPSTORE_EXPORTER_BUNDLE_IDS"]:
+        for key in [
+            "APPSTORE_EXPORTER_APP_ID",
+            "APPSTORE_EXPORTER_APP_IDS",
+            "APPSTORE_EXPORTER_BUNDLE_ID",
+            "APPSTORE_EXPORTER_BUNDLE_IDS",
+        ]:
             original_env[key] = os.environ.get(key)
 
         try:
@@ -92,8 +99,12 @@ class TestExporterConfig(unittest.TestCase):
         """Test multiple apps configuration parsing"""
         # Save original environment
         original_env = {}
-        for key in ["APPSTORE_EXPORTER_APP_ID", "APPSTORE_EXPORTER_APP_IDS",
-                    "APPSTORE_EXPORTER_BUNDLE_ID", "APPSTORE_EXPORTER_BUNDLE_IDS"]:
+        for key in [
+            "APPSTORE_EXPORTER_APP_ID",
+            "APPSTORE_EXPORTER_APP_IDS",
+            "APPSTORE_EXPORTER_BUNDLE_ID",
+            "APPSTORE_EXPORTER_BUNDLE_IDS",
+        ]:
             original_env[key] = os.environ.get(key)
 
         try:
@@ -120,6 +131,15 @@ class TestExporterConfig(unittest.TestCase):
 
     def test_health_state_initialization(self):
         """Test health state is properly initialized"""
+        # Reset health state to initial values
+        exporter._health_state.update(
+            {
+                "healthy": False,
+                "last_successful_collection": None,
+                "last_error": None,
+                "collections_count": 0,
+            }
+        )
         self.assertFalse(exporter._health_state["healthy"])
         self.assertIsNone(exporter._health_state["last_successful_collection"])
         self.assertEqual(exporter._health_state["collections_count"], 0)
@@ -134,10 +154,10 @@ class TestJWTGeneration(unittest.TestCase):
         self.assertIsNotNone(token)
         self.assertIsInstance(token, str)
         # JWT should have 3 parts separated by dots
-        parts = token.split('.')
+        parts = token.split(".")
         self.assertEqual(len(parts), 3)
 
-    @patch('builtins.open', side_effect=FileNotFoundError)
+    @patch("builtins.open", side_effect=FileNotFoundError)
     def test_make_token_file_not_found(self, mock_file):
         """Test token generation fails gracefully when key file not found"""
         with self.assertRaises(FileNotFoundError):
@@ -147,8 +167,8 @@ class TestJWTGeneration(unittest.TestCase):
 class TestAPIFunctions(unittest.TestCase):
     """Test App Store Connect API interaction functions"""
 
-    @patch('exporter.requests.get')
-    @patch('exporter._make_token')
+    @patch("exporter.requests.get")
+    @patch("exporter._make_token")
     def test_asc_api_call_get_success(self, mock_token, mock_get):
         """Test successful GET API call"""
         mock_token.return_value = "test-token"
@@ -165,15 +185,17 @@ class TestAPIFunctions(unittest.TestCase):
         self.assertIn("Authorization", kwargs["headers"])
         self.assertEqual(kwargs["params"]["limit"], 10)
 
-    @patch('exporter.requests.get')
-    @patch('exporter._make_token')
+    @patch("exporter.requests.get")
+    @patch("exporter._make_token")
     def test_asc_api_call_retry_on_429(self, mock_token, mock_get):
         """Test API call retries on rate limiting (429)"""
         mock_token.return_value = "test-token"
 
         # First call returns 429, second succeeds
         mock_response_429 = Mock()
-        mock_response_429.raise_for_status.side_effect = requests.HTTPError(response=Mock(status_code=429))
+        mock_response_429.raise_for_status.side_effect = requests.HTTPError(
+            response=Mock(status_code=429)
+        )
 
         mock_response_success = Mock()
         mock_response_success.json.return_value = {"data": []}
@@ -181,19 +203,17 @@ class TestAPIFunctions(unittest.TestCase):
 
         mock_get.side_effect = [mock_response_429, mock_response_success]
 
-        with patch('time.sleep'):  # Don't actually sleep in tests
+        with patch("time.sleep"):  # Don't actually sleep in tests
             result = exporter._asc_api_call("GET", "/v1/apps")
 
         self.assertEqual(result, {"data": []})
         self.assertEqual(mock_get.call_count, 2)
 
-    @patch('exporter._asc_api_call')
+    @patch("exporter._asc_api_call")
     def test_find_existing_report_request(self, mock_api):
         """Test finding existing report request"""
         mock_api.return_value = {
-            "data": [
-                {"id": "request-123", "attributes": {"accessType": "ONGOING"}}
-            ]
+            "data": [{"id": "request-123", "attributes": {"accessType": "ONGOING"}}]
         }
 
         request_id = exporter._find_existing_report_request("app-123")
@@ -201,13 +221,25 @@ class TestAPIFunctions(unittest.TestCase):
         self.assertEqual(request_id, "request-123")
         mock_api.assert_called()
 
-    @patch('exporter._asc_api_call')
+    @patch("exporter._asc_api_call")
     def test_find_report_id_with_cache(self, mock_api):
         """Test report ID finding with caching"""
         mock_api.return_value = {
             "data": [
-                {"id": "report-1", "attributes": {"name": "App Downloads Standard", "category": "METRICS"}},
-                {"id": "report-2", "attributes": {"name": "App Sessions Standard", "category": "METRICS"}}
+                {
+                    "id": "report-1",
+                    "attributes": {
+                        "name": "App Downloads Standard",
+                        "category": "METRICS",
+                    },
+                },
+                {
+                    "id": "report-2",
+                    "attributes": {
+                        "name": "App Sessions Standard",
+                        "category": "METRICS",
+                    },
+                },
             ]
         }
 
@@ -230,12 +262,14 @@ class TestHealthCheck(unittest.TestCase):
 
     def setUp(self):
         """Reset health state before each test"""
-        exporter._health_state.update({
-            "healthy": False,
-            "last_successful_collection": None,
-            "last_error": None,
-            "collections_count": 0
-        })
+        exporter._health_state.update(
+            {
+                "healthy": False,
+                "last_successful_collection": None,
+                "last_error": None,
+                "collections_count": 0,
+            }
+        )
 
     def test_health_check_not_ready(self):
         """Test health check when no collections have run"""
@@ -352,8 +386,8 @@ class TestDataProcessing(unittest.TestCase):
 class TestCollectionLogic(unittest.TestCase):
     """Test metrics collection logic"""
 
-    @patch('exporter._process_app_metrics')
-    @patch('exporter._init_metrics')
+    @patch("exporter._process_app_metrics")
+    @patch("exporter._init_metrics")
     def test_run_metrics_collection_success(self, mock_init_metrics, mock_process):
         """Test successful metrics collection updates health state"""
         # Reset health state
@@ -371,9 +405,11 @@ class TestCollectionLogic(unittest.TestCase):
         self.assertIsNotNone(exporter._health_state["last_successful_collection"])
         self.assertIsNone(exporter._health_state["last_error"])
 
-    @patch('exporter._process_app_metrics')
-    @patch('exporter._init_metrics')
-    def test_run_metrics_collection_partial_failure(self, mock_init_metrics, mock_process):
+    @patch("exporter._process_app_metrics")
+    @patch("exporter._init_metrics")
+    def test_run_metrics_collection_partial_failure(
+        self, mock_init_metrics, mock_process
+    ):
         """Test partial collection failure still marks as healthy"""
         # Save original APPS
         original_apps = exporter.APPS
@@ -382,7 +418,7 @@ class TestCollectionLogic(unittest.TestCase):
             # Setup multiple apps
             exporter.APPS = [
                 {"id": "1", "name": "app1", "bundle_id": "com.app1"},
-                {"id": "2", "name": "app2", "bundle_id": "com.app2"}
+                {"id": "2", "name": "app2", "bundle_id": "com.app2"},
             ]
 
             # Ensure metrics are initialized
@@ -394,33 +430,388 @@ class TestCollectionLogic(unittest.TestCase):
 
             # Should still be healthy with partial success
             self.assertTrue(exporter._health_state["healthy"])
-            self.assertIn("Failed to collect metrics for 1/2 apps", exporter._health_state["last_error"])
+            self.assertIn(
+                "Failed to collect metrics for 1/2 apps",
+                exporter._health_state["last_error"],
+            )
         finally:
             # Restore original APPS
             exporter.APPS = original_apps
 
 
+class TestV2DataCompleteness(unittest.TestCase):
+    """Test v2.0.0 fixes for complete data collection"""
+
+    def setUp(self):
+        """Reset any state before each test"""
+        # Clear the reports cache to ensure clean state
+        exporter._REPORTS_CACHE.clear()
+
+    @patch("exporter._download_report_segments")
+    @patch("exporter._asc_api_call")
+    def test_processes_all_instances_not_just_freshest(self, mock_api, mock_download):
+        """Test that all instances within date range are processed, not just the most recent"""
+        # Setup mock responses for multiple instances
+        today = date.today()
+        day_minus_1 = (today - timedelta(days=1)).isoformat()
+        day_minus_2 = (today - timedelta(days=2)).isoformat()
+        day_minus_3 = (today - timedelta(days=3)).isoformat()
+        day_minus_4 = (today - timedelta(days=4)).isoformat()
+        day_minus_5 = (today - timedelta(days=5)).isoformat()
+
+        # Create a sequence of API responses that matches the new flow
+        api_responses = []
+
+        # Response for finding report request
+        api_responses.append({"data": [{"id": "req-123"}]})
+
+        # Response for finding reports (for cache)
+        api_responses.append(
+            {
+                "data": [
+                    {
+                        "id": "report-123",
+                        "attributes": {
+                            "name": "App Downloads Standard",
+                            "category": "COMMERCE",
+                        },
+                    }
+                ]
+            }
+        )
+
+        # Response for getting instances
+        api_responses.append(
+            {
+                "data": [
+                    {
+                        "id": "inst-day-1",
+                        "attributes": {
+                            "processingDate": day_minus_1,
+                            "granularity": "DAILY",
+                        },
+                    },
+                    {
+                        "id": "inst-day-2",
+                        "attributes": {
+                            "processingDate": day_minus_2,
+                            "granularity": "DAILY",
+                        },
+                    },
+                    {
+                        "id": "inst-day-3",
+                        "attributes": {
+                            "processingDate": day_minus_3,
+                            "granularity": "DAILY",
+                        },
+                    },
+                ]
+            }
+        )
+
+        mock_api.side_effect = api_responses
+
+        # Mock download responses - each instance has different data
+        mock_download.side_effect = [
+            # Data from day-1 instance (covers day-3 and day-2)
+            [
+                {
+                    "Date": day_minus_3,
+                    "Territory": "US",
+                    "Counts": "2",
+                    "Download Type": "First-time download",
+                    "Platform Version": "iOS 18",
+                    "Source Type": "App Store",
+                },
+                {
+                    "Date": day_minus_2,
+                    "Territory": "GB",
+                    "Counts": "1",
+                    "Download Type": "First-time download",
+                    "Platform Version": "iOS 18",
+                    "Source Type": "App Store",
+                },
+            ],
+            # Data from day-2 instance (covers day-4 and day-3, with overlap)
+            [
+                {
+                    "Date": day_minus_4,
+                    "Territory": "DE",
+                    "Counts": "1",
+                    "Download Type": "First-time download",
+                    "Platform Version": "iOS 18",
+                    "Source Type": "App Store",
+                },
+                {
+                    "Date": day_minus_3,
+                    "Territory": "US",
+                    "Counts": "2",  # Duplicate - should be deduplicated
+                    "Download Type": "First-time download",
+                    "Platform Version": "iOS 18",
+                    "Source Type": "App Store",
+                },
+            ],
+            # Data from day-3 instance (covers day-5)
+            [
+                {
+                    "Date": day_minus_5,
+                    "Territory": "FR",
+                    "Counts": "3",
+                    "Download Type": "First-time download",
+                    "Platform Version": "iOS 18",
+                    "Source Type": "App Store",
+                },
+            ],
+        ]
+
+        # Process analytics data
+        app_info = {"id": "123", "name": "TestApp", "bundle_id": "com.test"}
+
+        with patch("exporter._export_metrics") as mock_export:
+            exporter._process_analytics_data(
+                app_info,
+                "App Downloads Standard",
+                "daily_user_installs",
+                ["Counts"],
+                "DAILY",
+                "Territory",
+                {"column": "Download Type", "equals": "First-time download"},
+            )
+
+            # Verify all instances were downloaded
+            self.assertEqual(mock_download.call_count, 3)
+            mock_download.assert_any_call("inst-day-1")
+            mock_download.assert_any_call("inst-day-2")
+            mock_download.assert_any_call("inst-day-3")
+
+            # Verify correct number of unique data points exported (no duplicates)
+            # Should have: day-5 (FR), day-4 (DE), day-3 (US), day-2 (GB) = 4 unique
+            self.assertEqual(mock_export.call_count, 4)
+
+    @patch("exporter._download_report_segments")
+    @patch("exporter._asc_api_call")
+    def test_deduplication_across_instances(self, mock_api, mock_download):
+        """Test that duplicate data across instances is properly deduplicated"""
+        today = date.today()
+        day_minus_1 = (today - timedelta(days=1)).isoformat()
+        day_minus_2 = (today - timedelta(days=2)).isoformat()
+        day_minus_3 = (today - timedelta(days=3)).isoformat()
+
+        # Create proper API response sequence
+        api_responses = []
+
+        # Response for finding report request
+        api_responses.append({"data": [{"id": "req-123"}]})
+
+        # Response for finding reports (for cache)
+        api_responses.append(
+            {
+                "data": [
+                    {
+                        "id": "report-123",
+                        "attributes": {
+                            "name": "App Downloads Standard",
+                            "category": "COMMERCE",
+                        },
+                    }
+                ]
+            }
+        )
+
+        # Response for getting instances
+        api_responses.append(
+            {
+                "data": [
+                    {
+                        "id": "inst-1",
+                        "attributes": {
+                            "processingDate": day_minus_1,
+                            "granularity": "DAILY",
+                        },
+                    },
+                    {
+                        "id": "inst-2",
+                        "attributes": {
+                            "processingDate": day_minus_2,
+                            "granularity": "DAILY",
+                        },
+                    },
+                ]
+            }
+        )
+
+        mock_api.side_effect = api_responses
+
+        # Both instances have the same data
+        duplicate_row = {
+            "Date": day_minus_3,
+            "Territory": "US",
+            "Counts": "5",
+            "Download Type": "First-time download",
+            "App Name": "TestApp",
+            "Device": "iPhone",
+            "Platform Version": "iOS 18",
+            "Source Type": "App Store",
+            "Page Type": "Product",
+        }
+
+        mock_download.side_effect = [
+            [duplicate_row.copy()],  # First instance has this data
+            [duplicate_row.copy()],  # Second instance has the same data
+        ]
+
+        app_info = {"id": "123", "name": "TestApp", "bundle_id": "com.test"}
+
+        with patch("exporter._export_metrics") as mock_export:
+            exporter._process_analytics_data(
+                app_info,
+                "App Downloads Standard",
+                "daily_user_installs",
+                ["Counts"],
+                "DAILY",
+                "Territory",
+                {"column": "Download Type", "equals": "First-time download"},
+            )
+
+            # Should only export once despite appearing in both instances
+            self.assertEqual(mock_export.call_count, 1)
+
+    @patch("exporter._download_report_segments")
+    @patch("exporter._asc_api_call")
+    def test_collects_full_period_not_just_recent(self, mock_api, mock_download):
+        """Test that data for full DAYS_TO_FETCH period is collected, not just last 2 days"""
+        # Save original DAYS_TO_FETCH
+        original_days = exporter.DAYS_TO_FETCH
+        try:
+            exporter.DAYS_TO_FETCH = 14  # Request 14 days of data
+            today = date.today()
+
+            # Generate instances for 14 days
+            instances = []
+            for i in range(14, 0, -1):
+                inst_date = (today - timedelta(days=i)).isoformat()
+                instances.append(
+                    {
+                        "id": f"inst-day-{i}",
+                        "attributes": {
+                            "processingDate": inst_date,
+                            "granularity": "DAILY",
+                        },
+                    }
+                )
+
+            # Create proper API response sequence
+            api_responses = []
+
+            # Response for finding report request
+            api_responses.append({"data": [{"id": "req-123"}]})
+
+            # Response for finding reports (for cache)
+            api_responses.append(
+                {
+                    "data": [
+                        {
+                            "id": "report-123",
+                            "attributes": {
+                                "name": "App Downloads Standard",
+                                "category": "COMMERCE",
+                            },
+                        }
+                    ]
+                }
+            )
+
+            # Response for getting instances
+            api_responses.append({"data": instances})
+
+            mock_api.side_effect = api_responses
+
+            # Each instance returns some data
+            def generate_data(instance_id):
+                day = int(instance_id.split("-")[-1])
+                data_date = (today - timedelta(days=day + 1)).isoformat()
+                return [
+                    {
+                        "Date": data_date,
+                        "Territory": "US",
+                        "Counts": "1",
+                        "Download Type": "First-time download",
+                        "Platform Version": "iOS 18",
+                        "Source Type": "App Store",
+                    }
+                ]
+
+            mock_download.side_effect = [
+                generate_data(inst["id"]) for inst in instances
+            ]
+
+            app_info = {"id": "123", "name": "TestApp", "bundle_id": "com.test"}
+
+            with patch("exporter._export_metrics") as mock_export:
+                exporter._process_analytics_data(
+                    app_info,
+                    "App Downloads Standard",
+                    "daily_user_installs",
+                    ["Counts"],
+                    "DAILY",
+                    "Territory",
+                    {"column": "Download Type", "equals": "First-time download"},
+                )
+
+                # Should have processed all 14 instances
+                self.assertEqual(mock_download.call_count, 14)
+
+                # Should have data for 14 different days
+                self.assertEqual(mock_export.call_count, 14)
+
+                # Verify we got data from all days, not just the most recent
+                exported_dates = set()
+                for call in mock_export.call_args_list:
+                    date_arg = call[0][4]  # 5th argument is the date
+                    exported_dates.add(date_arg)
+
+                # Should have 14 unique dates
+                self.assertEqual(len(exported_dates), 14)
+
+        finally:
+            # Restore original value
+            exporter.DAYS_TO_FETCH = original_days
+
+
 def run_integration_test():
     """Run a simple integration test with mocked API responses"""
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Running Integration Test")
-    print("="*60)
+    print("=" * 60)
 
-    with patch('exporter._asc_api_call') as mock_api:
+    with patch("exporter._asc_api_call") as mock_api:
         # Mock API responses
         mock_api.side_effect = [
             # Response for finding report request
             {"data": [{"id": "req-123"}]},
             # Response for finding report
-            {"data": [
-                {"id": "report-123", "attributes": {"name": "App Downloads Standard"}}
-            ]},
+            {
+                "data": [
+                    {
+                        "id": "report-123",
+                        "attributes": {"name": "App Downloads Standard"},
+                    }
+                ]
+            },
             # Response for finding instances
-            {"data": [
-                {"id": "inst-123", "attributes": {"processingDate": "2024-01-15", "granularity": "DAILY"}}
-            ]},
+            {
+                "data": [
+                    {
+                        "id": "inst-123",
+                        "attributes": {
+                            "processingDate": "2024-01-15",
+                            "granularity": "DAILY",
+                        },
+                    }
+                ]
+            },
             # Response for segments
-            {"data": []}  # Empty segments for simplicity
+            {"data": []},  # Empty segments for simplicity
         ]
 
         # Run collection
@@ -434,19 +825,27 @@ def run_integration_test():
 
         print(f"Collections count: {exporter._health_state['collections_count']}")
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Integration Test Complete")
-    print("="*60)
+    print("=" * 60)
 
 
 def main():
     """Main test runner"""
     import argparse
 
-    parser = argparse.ArgumentParser(description='Test Apple App Store Connect Exporter')
-    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
-    parser.add_argument('--real-api', action='store_true', help='Run against real API (requires credentials)')
-    parser.add_argument('--integration', action='store_true', help='Run integration tests')
+    parser = argparse.ArgumentParser(
+        description="Test Apple App Store Connect Exporter"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        "--real-api",
+        action="store_true",
+        help="Run against real API (requires credentials)",
+    )
+    parser.add_argument(
+        "--integration", action="store_true", help="Run integration tests"
+    )
     args = parser.parse_args()
 
     if args.debug:
@@ -464,7 +863,7 @@ def main():
         print("\nWARNING: This will make real API calls!\n")
 
         response = input("Continue with real API testing? (y/n): ")
-        if response.lower() != 'y':
+        if response.lower() != "y":
             print("Aborted.")
             return
 
@@ -475,12 +874,13 @@ def main():
 
     # Run unit tests
     print("Running Unit Tests...")
-    print("="*60)
+    print("=" * 60)
 
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
 
     # Add all test cases
+    # Add test classes to suite
     suite.addTests(loader.loadTestsFromTestCase(TestExporterConfig))
     suite.addTests(loader.loadTestsFromTestCase(TestJWTGeneration))
     suite.addTests(loader.loadTestsFromTestCase(TestAPIFunctions))
@@ -488,6 +888,7 @@ def main():
     suite.addTests(loader.loadTestsFromTestCase(TestMetricsEndpoint))
     suite.addTests(loader.loadTestsFromTestCase(TestDataProcessing))
     suite.addTests(loader.loadTestsFromTestCase(TestCollectionLogic))
+    suite.addTests(loader.loadTestsFromTestCase(TestV2DataCompleteness))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
@@ -497,13 +898,15 @@ def main():
         run_integration_test()
 
     # Print summary
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Test Summary")
-    print("="*60)
+    print("=" * 60)
     print(f"Tests run: {result.testsRun}")
     print(f"Failures: {len(result.failures)}")
     print(f"Errors: {len(result.errors)}")
-    print(f"Success rate: {((result.testsRun - len(result.failures) - len(result.errors)) / result.testsRun * 100):.1f}%")
+    print(
+        f"Success rate: {((result.testsRun - len(result.failures) - len(result.errors)) / result.testsRun * 100):.1f}%"
+    )
 
     # Cleanup
     try:

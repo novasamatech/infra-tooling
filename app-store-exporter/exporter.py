@@ -17,19 +17,28 @@ import io
 from datetime import date, timedelta
 from urllib.parse import urlparse
 
-from prometheus_client import Counter, CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import (
+    Counter,
+    CollectorRegistry,
+    generate_latest,
+    CONTENT_TYPE_LATEST,
+)
 from wsgiref.simple_server import make_server, WSGIRequestHandler
 
 LOG = logging.getLogger("appstore_exporter")
 
 # Dedicated app logger: do not alter root logger or third‑party loggers.
-_app_log_level = (os.environ.get("APPSTORE_EXPORTER_LOG_LEVEL", "INFO") or "INFO").upper()
+_app_log_level = (
+    os.environ.get("APPSTORE_EXPORTER_LOG_LEVEL", "INFO") or "INFO"
+).upper()
 LOG.setLevel(_app_log_level)
 LOG.propagate = False
 if not LOG.handlers:
     _handler = logging.StreamHandler()
     _handler.setLevel(_app_log_level)
-    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
     LOG.addHandler(_handler)
 
 # ------------ Configuration ------------
@@ -39,8 +48,11 @@ KEY_ID = os.environ.get("APPSTORE_EXPORTER_KEY_ID")
 PRIVATE_KEY_PATH = os.environ.get("APPSTORE_EXPORTER_PRIVATE_KEY") or ""
 
 if not all([ISSUER_ID, KEY_ID, PRIVATE_KEY_PATH]):
-    LOG.error("Missing required environment variables: APPSTORE_EXPORTER_ISSUER_ID, APPSTORE_EXPORTER_KEY_ID, APPSTORE_EXPORTER_PRIVATE_KEY")
+    LOG.error(
+        "Missing required environment variables: APPSTORE_EXPORTER_ISSUER_ID, APPSTORE_EXPORTER_KEY_ID, APPSTORE_EXPORTER_PRIVATE_KEY"
+    )
     sys.exit(2)
+
 
 # App configuration - support both single and multiple apps
 def _parse_app_config():
@@ -50,11 +62,15 @@ def _parse_app_config():
     # Single app configuration
     single_app_id = os.environ.get("APPSTORE_EXPORTER_APP_ID")
     if single_app_id:
-        apps.append({
-            "id": single_app_id,
-            "name": os.environ.get("APPSTORE_EXPORTER_BUNDLE_ID", f"App_{single_app_id}"),
-            "bundle_id": os.environ.get("APPSTORE_EXPORTER_BUNDLE_ID", "unknown")
-        })
+        apps.append(
+            {
+                "id": single_app_id,
+                "name": os.environ.get(
+                    "APPSTORE_EXPORTER_BUNDLE_ID", f"App_{single_app_id}"
+                ),
+                "bundle_id": os.environ.get("APPSTORE_EXPORTER_BUNDLE_ID", "unknown"),
+            }
+        )
         return apps
 
     # Multiple apps configuration
@@ -67,23 +83,28 @@ def _parse_app_config():
             app_id = app_id.strip()
             if not app_id:
                 continue
-            bundle_id = bundle_ids[i].strip() if i < len(bundle_ids) and bundle_ids[i].strip() else f"App_{app_id}"
-            apps.append({
-                "id": app_id,
-                "name": bundle_id,
-                "bundle_id": bundle_id
-            })
+            bundle_id = (
+                bundle_ids[i].strip()
+                if i < len(bundle_ids) and bundle_ids[i].strip()
+                else f"App_{app_id}"
+            )
+            apps.append({"id": app_id, "name": bundle_id, "bundle_id": bundle_id})
 
     return apps
 
+
 APPS = _parse_app_config()
 if not APPS:
-    LOG.error("No apps configured. Set APPSTORE_EXPORTER_APP_ID or APPSTORE_EXPORTER_APP_IDS")
+    LOG.error(
+        "No apps configured. Set APPSTORE_EXPORTER_APP_ID or APPSTORE_EXPORTER_APP_IDS"
+    )
     sys.exit(2)
 
 # Optional settings
 PORT = int(os.environ.get("APPSTORE_EXPORTER_PORT", "8000"))
-COLLECTION_INTERVAL = int(os.environ.get("APPSTORE_EXPORTER_COLLECTION_INTERVAL_SECONDS", "43200"))
+COLLECTION_INTERVAL = int(
+    os.environ.get("APPSTORE_EXPORTER_COLLECTION_INTERVAL_SECONDS", "43200")
+)
 DAYS_TO_FETCH = int(os.environ.get("APPSTORE_EXPORTER_DAYS_TO_FETCH", "14"))
 TEST_MODE = os.environ.get("APPSTORE_EXPORTER_TEST_MODE")
 
@@ -96,7 +117,7 @@ _health_state = {
     "healthy": False,
     "last_successful_collection": None,
     "last_error": None,
-    "collections_count": 0
+    "collections_count": 0,
 }
 _health_state_lock = threading.Lock()
 _registry_lock = threading.Lock()  # Lock for Registry access to prevent race conditions
@@ -110,7 +131,11 @@ METRICS = [
         "key": "daily_user_installs",
         "prom_name": "appstore_daily_user_installs",
         "help": "Daily user installs (App Units) by country",
-        "labels": {"country": "Territory", "platform_version": "Platform Version", "source_type": "Source Type"},
+        "labels": {
+            "country": "Territory",
+            "platform_version": "Platform Version",
+            "source_type": "Source Type",
+        },
         "report_type": "App Downloads Standard",
         "value_patterns": ["Counts"],
         "granularity": "DAILY",
@@ -121,7 +146,12 @@ METRICS = [
         "key": "active_devices",
         "prom_name": "appstore_active_devices",
         "help": "Active devices by country (proxy for active device installs)",
-        "labels": {"country": "Territory", "device": "Device", "platform_version": "Platform Version", "source_type": "Source Type"},
+        "labels": {
+            "country": "Territory",
+            "device": "Device",
+            "platform_version": "Platform Version",
+            "source_type": "Source Type",
+        },
         "report_type": "App Sessions Standard",
         "value_patterns": ["Unique Devices"],
         "granularity": "DAILY",
@@ -131,7 +161,12 @@ METRICS = [
         "key": "uninstalls",
         "prom_name": "appstore_uninstalls",
         "help": "Uninstalls by country (Installation and Deletion). May be WEEKLY depending on availability",
-        "labels": {"country": "Territory", "device": "Device", "platform_version": "Platform Version", "source_type": "Source Type"},
+        "labels": {
+            "country": "Territory",
+            "device": "Device",
+            "platform_version": "Platform Version",
+            "source_type": "Source Type",
+        },
         "report_type": "App Store Installation and Deletion Standard",
         "value_patterns": ["Counts"],
         "granularity": "WEEKLY",
@@ -139,6 +174,7 @@ METRICS = [
         "counter": None,
     },
 ]
+
 
 def _init_metrics():
     """Create Prometheus counters for all configured metrics and bind them to the current registry."""
@@ -155,19 +191,21 @@ def _init_metrics():
 
     # Create internal metrics for monitoring
     parsing_errors_counter = Counter(
-        'appstore_exporter_parsing_errors_total',
-        'Total number of parsing errors per app and report',
-        ['package', 'report_type'],
-        registry=REGISTRY
+        "appstore_exporter_parsing_errors_total",
+        "Total number of parsing errors per app and report",
+        ["package", "report_type"],
+        registry=REGISTRY,
     )
     last_collection_timestamp = Gauge(
-        'appstore_exporter_last_collection_timestamp',
-        'Timestamp of last successful collection',
-        registry=REGISTRY
+        "appstore_exporter_last_collection_timestamp",
+        "Timestamp of last successful collection",
+        registry=REGISTRY,
     )
+
 
 # Initialize counters at import time
 _init_metrics()
+
 
 # ------------ Core Functions ------------
 def _make_token():
@@ -188,7 +226,12 @@ def _make_token():
 
         now = int(time.time())
         return jwt.encode(
-            {"iss": ISSUER_ID, "iat": now, "exp": now + 1200, "aud": "appstoreconnect-v1"},
+            {
+                "iss": ISSUER_ID,
+                "iat": now,
+                "exp": now + 1200,
+                "aud": "appstoreconnect-v1",
+            },
             private_key,
             algorithm="ES256",
             headers={"kid": KEY_ID, "typ": "JWT"},
@@ -196,6 +239,7 @@ def _make_token():
     except Exception as e:
         LOG.error("Failed to generate JWT token: %s", e)
         raise
+
 
 def _asc_api_call(method, path, params=None, payload=None, retries=3):
     """Make API call to App Store Connect with retry logic.
@@ -235,8 +279,12 @@ def _asc_api_call(method, path, params=None, payload=None, retries=3):
             return response.json()
 
         except requests.exceptions.HTTPError as e:
-            if hasattr(e, 'response') and e.response and getattr(e.response, 'status_code', 0) == 429:
-                wait_time = 2 ** attempt
+            if (
+                hasattr(e, "response")
+                and e.response
+                and getattr(e.response, "status_code", 0) == 429
+            ):
+                wait_time = 2**attempt
                 LOG.warning("Rate limited, waiting %s seconds", wait_time)
                 time.sleep(wait_time)
                 continue
@@ -250,6 +298,7 @@ def _asc_api_call(method, path, params=None, payload=None, retries=3):
             time.sleep(1)
 
     raise RuntimeError(f"Failed after {retries} attempts")
+
 
 def _find_existing_report_request(app_id):
     """Find existing analytics report request for an app.
@@ -265,23 +314,34 @@ def _find_existing_report_request(app_id):
     """
     try:
         # First try to find ongoing requests
-        response = _asc_api_call("GET", f"/v1/apps/{app_id}/analyticsReportRequests",
-                               params={"filter[accessType]": "ONGOING", "limit": 5})
+        response = _asc_api_call(
+            "GET",
+            f"/v1/apps/{app_id}/analyticsReportRequests",
+            params={"filter[accessType]": "ONGOING", "limit": 5},
+        )
 
         if response.get("data"):
             return response["data"][0]["id"]
 
         # If no ongoing requests, try to find any report requests
-        LOG.info("No ongoing report requests found for app %s, checking for any report requests...", app_id)
-        response = _asc_api_call("GET", f"/v1/apps/{app_id}/analyticsReportRequests",
-                               params={"limit": 10})
+        LOG.info(
+            "No ongoing report requests found for app %s, checking for any report requests...",
+            app_id,
+        )
+        response = _asc_api_call(
+            "GET", f"/v1/apps/{app_id}/analyticsReportRequests", params={"limit": 10}
+        )
 
         if response.get("data"):
             # Log available report requests for debugging
             for report_request in response["data"]:
                 req_id = report_request["id"]
-                access_type = report_request.get("attributes", {}).get("accessType", "UNKNOWN")
-                LOG.info("Found report request: %s (accessType: %s)", req_id, access_type)
+                access_type = report_request.get("attributes", {}).get(
+                    "accessType", "UNKNOWN"
+                )
+                LOG.info(
+                    "Found report request: %s (accessType: %s)", req_id, access_type
+                )
             return response["data"][0]["id"]
 
         LOG.warning("No report requests found for app %s", app_id)
@@ -290,6 +350,7 @@ def _find_existing_report_request(app_id):
     except Exception as e:
         LOG.error("Failed to find report request for app %s: %s", app_id, e)
         return None
+
 
 def _find_report_id(report_request_id, name_pattern):
     """Find report ID by exact name match, using cache to minimize API calls.
@@ -308,22 +369,35 @@ def _find_report_id(report_request_id, name_pattern):
         # Use cached catalog if available; fetch and cache otherwise
         items = _REPORTS_CACHE.get(report_request_id)
         if items is None:
-            response = _asc_api_call("GET", f"/v1/analyticsReportRequests/{report_request_id}/reports",
-                                     params={"limit": 200})
+            response = _asc_api_call(
+                "GET",
+                f"/v1/analyticsReportRequests/{report_request_id}/reports",
+                params={"limit": 200},
+            )
             data = response.get("data", []) or []
             items = []
             for report in data:
-                attrs = (report.get("attributes") or {})
-                items.append({
-                    "id": report["id"],
-                    "name": attrs.get("name", "") or "",
-                    "category": attrs.get("category", "") or ""
-                })
+                attrs = report.get("attributes") or {}
+                items.append(
+                    {
+                        "id": report["id"],
+                        "name": attrs.get("name", "") or "",
+                        "category": attrs.get("category", "") or "",
+                    }
+                )
             _REPORTS_CACHE[report_request_id] = items
             available_reports = [f"{it['name']} ({it['category']})" for it in items]
-            LOG.debug("Report catalog for request %s: %s", report_request_id, available_reports)
+            LOG.debug(
+                "Report catalog for request %s: %s",
+                report_request_id,
+                available_reports,
+            )
 
-        candidates = [name_pattern.strip()] if isinstance(name_pattern, str) and name_pattern.strip() else []
+        candidates = (
+            [name_pattern.strip()]
+            if isinstance(name_pattern, str) and name_pattern.strip()
+            else []
+        )
         LOG.debug("Trying report name candidates (exact match only): %s", candidates)
         for candidate in candidates:
             lp = candidate.lower()
@@ -331,17 +405,25 @@ def _find_report_id(report_request_id, name_pattern):
             # Exact name match (case-insensitive)
             for it in items:
                 if it["name"].lower() == lp:
-                    LOG.info("Matched report by exact name '%s' (%s)", it["name"], it["category"])
+                    LOG.info(
+                        "Matched report by exact name '%s' (%s)",
+                        it["name"],
+                        it["category"],
+                    )
                     return it["id"]
 
         available_reports = [f"{it['name']} ({it['category']})" for it in items]
-        LOG.warning("Report with pattern '%s' not found. Available reports: %s",
-                    name_pattern, ", ".join(available_reports))
+        LOG.warning(
+            "Report with pattern '%s' not found. Available reports: %s",
+            name_pattern,
+            ", ".join(available_reports),
+        )
         return None
 
     except Exception as e:
         LOG.error("Failed to find report: %s", e)
         return None
+
 
 def _find_freshest_instance(report_id, granularity="DAILY", lookback_days=14):
     """Find the most recent report instance with data.
@@ -364,29 +446,56 @@ def _find_freshest_instance(report_id, granularity="DAILY", lookback_days=14):
             params={"filter[granularity]": granularity, "limit": 200},
         )
     except Exception as e:
-        LOG.debug("Failed to list %s instances for report %s: %s", granularity, report_id, e)
+        LOG.debug(
+            "Failed to list %s instances for report %s: %s", granularity, report_id, e
+        )
         return None, []
 
     instances = (resp or {}).get("data") or []
-    wanted = [inst for inst in instances if ((inst.get("attributes") or {}).get("granularity") == granularity)]
+    wanted = [
+        inst
+        for inst in instances
+        if ((inst.get("attributes") or {}).get("granularity") == granularity)
+    ]
     # Apply lookback window
     cutoff_iso = (date.today() - timedelta(days=lookback_days)).isoformat()
     wanted = [
-        inst for inst in wanted
-        if (((inst.get("attributes") or {}).get("processingDate") or "")[:10] >= cutoff_iso)
+        inst
+        for inst in wanted
+        if (
+            ((inst.get("attributes") or {}).get("processingDate") or "")[:10]
+            >= cutoff_iso
+        )
     ]
-    LOG.debug("Instances fetched for report %s: total=%d %s=%d within %sd window", report_id, len(instances), granularity, len(wanted), lookback_days)
+    LOG.debug(
+        "Instances fetched for report %s: total=%d %s=%d within %sd window",
+        report_id,
+        len(instances),
+        granularity,
+        len(wanted),
+        lookback_days,
+    )
     if not wanted:
-        LOG.debug("Report %s has no %s instances in the last %s days — skipping", report_id, granularity, lookback_days)
+        LOG.debug(
+            "Report %s has no %s instances in the last %s days — skipping",
+            report_id,
+            granularity,
+            lookback_days,
+        )
         return None, []
 
     def _inst_processing_date(inst: dict) -> str:
-        return ((inst.get("attributes") or {}).get("processingDate") or "")
+        return (inst.get("attributes") or {}).get("processingDate") or ""
 
     # Check newest-first
     for inst in sorted(wanted, key=_inst_processing_date, reverse=True):
         inst_id = inst["id"]
-        LOG.debug("Checking instance %s (processingDate=%s, granularity=%s)", inst_id, _inst_processing_date(inst), granularity)
+        LOG.debug(
+            "Checking instance %s (processingDate=%s, granularity=%s)",
+            inst_id,
+            _inst_processing_date(inst),
+            granularity,
+        )
         rows = _download_report_segments(inst_id)
         if rows:
             LOG.info(
@@ -405,12 +514,13 @@ def _find_freshest_instance(report_id, granularity="DAILY", lookback_days=14):
 
     return None, []
 
+
 def _parse_iso_date(date_str):
     """Parse ISO date string to date object."""
     try:
         # Handle ISO format with timezone
-        if 'T' in date_str:
-            dt_obj = dt.datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+        if "T" in date_str:
+            dt_obj = dt.datetime.fromisoformat(date_str.replace("Z", "+00:00"))
             return dt_obj.date()
         else:
             # Try common date formats
@@ -422,6 +532,7 @@ def _parse_iso_date(date_str):
             raise ValueError(f"Unsupported date format: {date_str}")
     except Exception:
         raise ValueError(f"Unable to parse date: {date_str}")
+
 
 def _download_report_segments(instance_id):
     """Download and parse CSV segments from report instance.
@@ -438,18 +549,22 @@ def _download_report_segments(instance_id):
               segment metadata (__segment_id, __segment_start, __segment_end)
     """
     try:
-        response = _asc_api_call("GET", f"/v1/analyticsReportInstances/{instance_id}/segments")
+        response = _asc_api_call(
+            "GET", f"/v1/analyticsReportInstances/{instance_id}/segments"
+        )
         # Process segments incrementally to reduce memory usage
         segments_data = []
         resp = response
         while True:
             segments_data.extend((resp.get("data") or []))
-            next_url = ((resp.get("links") or {}).get("next"))
+            next_url = (resp.get("links") or {}).get("next")
             if not next_url:
                 break
             try:
                 token = _make_token()
-                r = requests.get(next_url, headers={"Authorization": f"Bearer {token}"}, timeout=60)
+                r = requests.get(
+                    next_url, headers={"Authorization": f"Bearer {token}"}, timeout=60
+                )
                 r.raise_for_status()
                 resp = r.json()
             except Exception as e:
@@ -458,13 +573,17 @@ def _download_report_segments(instance_id):
 
         if not segments_data:
             LOG.debug("No segments returned for instance %s", instance_id)
-        LOG.debug("Segments for instance %s: %s", instance_id, [s.get("id") for s in segments_data])
+        LOG.debug(
+            "Segments for instance %s: %s",
+            instance_id,
+            [s.get("id") for s in segments_data],
+        )
 
         # Process segments in chunks to reduce memory usage
         all_rows = []
 
         for segment in segments_data:
-            seg_attrs = (segment.get("attributes", {}) or {})
+            seg_attrs = segment.get("attributes", {}) or {}
             segment_url = (
                 seg_attrs.get("url")
                 or seg_attrs.get("downloadUrl")
@@ -472,7 +591,10 @@ def _download_report_segments(instance_id):
                 or seg_attrs.get("fileUrl")
             )
             if not segment_url:
-                LOG.debug("Segment %s has no downloadable url in attributes", segment.get("id"))
+                LOG.debug(
+                    "Segment %s has no downloadable url in attributes",
+                    segment.get("id"),
+                )
                 continue
 
             # Download segment payload (gzip or plain CSV)
@@ -487,41 +609,79 @@ def _download_report_segments(instance_id):
                 }
                 if host_is_apple:
                     headers["Authorization"] = f"Bearer {token}"
-                download_response = requests.get(segment_url, headers=headers, timeout=120)
+                download_response = requests.get(
+                    segment_url, headers=headers, timeout=120
+                )
                 download_response.raise_for_status()
                 content = download_response.content
                 ctype = (download_response.headers.get("Content-Type") or "").lower()
             except requests.exceptions.HTTPError as he:
-                status = he.response.status_code if getattr(he, "response", None) is not None else None
-                if (not host_is_apple and status and 400 <= status < 500) or (host_is_apple and status in (401, 403)):
+                status = (
+                    he.response.status_code
+                    if getattr(he, "response", None) is not None
+                    else None
+                )
+                if (not host_is_apple and status and 400 <= status < 500) or (
+                    host_is_apple and status in (401, 403)
+                ):
                     try:
                         headers_no_auth = {
                             "User-Agent": "appstore-exporter/1.0",
                             "Accept": "*/*",
                         }
-                        download_response = requests.get(segment_url, headers=headers_no_auth, timeout=120)
+                        download_response = requests.get(
+                            segment_url, headers=headers_no_auth, timeout=120
+                        )
                         download_response.raise_for_status()
                         content = download_response.content
-                        ctype = (download_response.headers.get("Content-Type") or "").lower()
+                        ctype = (
+                            download_response.headers.get("Content-Type") or ""
+                        ).lower()
                     except Exception as e2:
-                        LOG.warning("Retry without Authorization failed for segment %s: %s", segment.get("id"), e2)
+                        LOG.warning(
+                            "Retry without Authorization failed for segment %s: %s",
+                            segment.get("id"),
+                            e2,
+                        )
                         continue
                 else:
-                    LOG.warning("Failed HTTP GET for segment %s: %s", segment.get("id"), he)
+                    LOG.warning(
+                        "Failed HTTP GET for segment %s: %s", segment.get("id"), he
+                    )
                     continue
             except Exception as e:
                 LOG.warning("Failed HTTP GET for segment %s: %s", segment.get("id"), e)
                 continue
 
             # Determine compression from segment attributes if available; fallback to magic header and Content-Type
-            compression = (seg_attrs.get("compression") or seg_attrs.get("compressionAlgorithm") or seg_attrs.get("fileCompression") or "").strip().lower()
+            compression = (
+                (
+                    seg_attrs.get("compression")
+                    or seg_attrs.get("compressionAlgorithm")
+                    or seg_attrs.get("fileCompression")
+                    or ""
+                )
+                .strip()
+                .lower()
+            )
             try:
                 path_only = urlparse(segment_url).path
                 ext = os.path.splitext(path_only)[1].lower()
             except Exception:
                 ext = ""
-            LOG.debug("Segment %s download: ctype=%s, compression_attr=%s, url_ext=%s", segment.get("id"), ctype, compression, ext)
-            LOG.debug("Segment %s url host=%s size=%dB", segment.get("id"), urlparse(segment_url).netloc, len(content))
+            LOG.debug(
+                "Segment %s download: ctype=%s, compression_attr=%s, url_ext=%s",
+                segment.get("id"),
+                ctype,
+                compression,
+                ext,
+            )
+            LOG.debug(
+                "Segment %s url host=%s size=%dB",
+                segment.get("id"),
+                urlparse(segment_url).netloc,
+                len(content),
+            )
 
             def _parse_csv_bytes(data: bytes) -> list:
                 """Parse CSV/TSV text bytes; return list of parsed rows."""
@@ -534,27 +694,43 @@ def _download_report_segments(instance_id):
                     except Exception:
                         continue
                 if text is None:
-                    raise UnicodeDecodeError("unknown", b"", 0, 0, "Could not decode CSV text")
+                    raise UnicodeDecodeError(
+                        "unknown", b"", 0, 0, "Could not decode CSV text"
+                    )
                 buf = io.StringIO(text)
                 sample = buf.read(8192)
                 buf.seek(0)
                 try:
-                    dialect = csv.Sniffer().sniff(sample, delimiters='\t,;')
+                    dialect = csv.Sniffer().sniff(sample, delimiters="\t,;")
                     reader = csv.DictReader(buf, dialect=dialect)
                 except Exception:
-                    delimiter = '\t' if '\t' in sample else (';' if ';' in sample else ',')
+                    delimiter = (
+                        "\t" if "\t" in sample else (";" if ";" in sample else ",")
+                    )
                     reader = csv.DictReader(buf, delimiter=delimiter)
                 rows_parsed_local = []
                 for row in reader:
                     # Skip completely empty rows
-                    if not row or all((v is None or (isinstance(v, str) and not v.strip())) for v in row.values()):
+                    if not row or all(
+                        (v is None or (isinstance(v, str) and not v.strip()))
+                        for v in row.values()
+                    ):
                         continue
-                    row_dict = { (k.strip() if isinstance(k, str) else k): (v.strip() if isinstance(v, str) else v) for k, v in row.items() }
+                    row_dict = {
+                        (k.strip() if isinstance(k, str) else k): (
+                            v.strip() if isinstance(v, str) else v
+                        )
+                        for k, v in row.items()
+                    }
                     row_dict["__segment_id"] = segment["id"]
                     row_dict["__segment_start"] = seg_attrs.get("startDate", "")
                     row_dict["__segment_end"] = seg_attrs.get("endDate", "")
                     rows_parsed_local.append(row_dict)
-                LOG.debug("Parsed %d rows from segment %s", len(rows_parsed_local), segment.get("id"))
+                LOG.debug(
+                    "Parsed %d rows from segment %s",
+                    len(rows_parsed_local),
+                    segment.get("id"),
+                )
                 return rows_parsed_local
 
             try:
@@ -568,10 +744,14 @@ def _download_report_segments(instance_id):
                     or (len(data_bytes) >= 2 and data_bytes[:2] == b"\x1f\x8b")
                 ):
                     import gzip
+
                     try:
                         with gzip.GzipFile(fileobj=io.BytesIO(data_bytes)) as gz:
                             data_bytes = gz.read()
-                        LOG.debug("Decompressed gzip payload for segment %s", segment.get("id"))
+                        LOG.debug(
+                            "Decompressed gzip payload for segment %s",
+                            segment.get("id"),
+                        )
                     except OSError:
                         # Already decompressed or not a valid gzip; continue with data_bytes as-is
                         pass
@@ -579,14 +759,36 @@ def _download_report_segments(instance_id):
                 # Parse and add rows
                 parsed_rows = _parse_csv_bytes(data_bytes)
                 all_rows.extend(parsed_rows)
-                LOG.debug("Parsed %d rows from segment %s (csv/plain)", len(parsed_rows), segment.get("id"))
+                LOG.debug(
+                    "Parsed %d rows from segment %s (csv/plain)",
+                    len(parsed_rows),
+                    segment.get("id"),
+                )
 
             except UnicodeDecodeError as e:
-                LOG.warning("Failed to decode segment %s content as text: %s (ctype=%s, len=%s)", segment.get("id"), e, ctype, len(content))
+                LOG.warning(
+                    "Failed to decode segment %s content as text: %s (ctype=%s, len=%s)",
+                    segment.get("id"),
+                    e,
+                    ctype,
+                    len(content),
+                )
             except csv.Error as e:
-                LOG.warning("Failed to parse segment %s as CSV: %s (ctype=%s, len=%s)", segment.get("id"), e, ctype, len(content))
+                LOG.warning(
+                    "Failed to parse segment %s as CSV: %s (ctype=%s, len=%s)",
+                    segment.get("id"),
+                    e,
+                    ctype,
+                    len(content),
+                )
             except Exception as e:
-                LOG.warning("Unexpected error parsing segment %s: %s (ctype=%s, len=%s)", segment.get("id"), e, ctype, len(content))
+                LOG.warning(
+                    "Unexpected error parsing segment %s: %s (ctype=%s, len=%s)",
+                    segment.get("id"),
+                    e,
+                    ctype,
+                    len(content),
+                )
 
         LOG.debug("Total rows parsed for instance %s: %d", instance_id, len(all_rows))
         return all_rows
@@ -598,6 +800,7 @@ def _download_report_segments(instance_id):
         LOG.error("Unexpected error downloading segments: %s", e)
         return []
 
+
 def _extract_number(value):
     """Extract numeric value from string."""
     if not value:
@@ -607,15 +810,20 @@ def _extract_number(value):
     except ValueError:
         return 0.0
 
+
 def _export_metrics(app_info, row, metric_name, value, row_date):
     """Export metrics to Prometheus."""
     try:
         report_date = _parse_iso_date(row_date)
-        timestamp_ms = int(dt.datetime.combine(report_date, dt.time.min).timestamp() * 1000)
+        timestamp_ms = int(
+            dt.datetime.combine(report_date, dt.time.min).timestamp() * 1000
+        )
     except Exception:
         # Fallback to current date if parsing fails
         report_date = date.today()
-        timestamp_ms = int(dt.datetime.combine(report_date, dt.time.min).timestamp() * 1000)
+        timestamp_ms = int(
+            dt.datetime.combine(report_date, dt.time.min).timestamp() * 1000
+        )
 
     if metric_name in counters:
         metric = counters[metric_name]
@@ -626,13 +834,22 @@ def _export_metrics(app_info, row, metric_name, value, row_date):
             for label_name, field_name in metric_config["labels"].items():
                 labels[label_name] = row.get(field_name, "")
 
-        if hasattr(metric.labels(**labels), '_value'):
+        if hasattr(metric.labels(**labels), "_value"):
             metric.labels(**labels)._value.set(value, timestamp=timestamp_ms)
 
         if LOG.isEnabledFor(logging.DEBUG) and value > 0:
             LOG.debug("Exported %s=%s with labels %s", metric_name, value, labels)
 
-def _process_analytics_data(app_info, report_type, metric_name, value_patterns, granularity, country_column, row_filter=None):
+
+def _process_analytics_data(
+    app_info,
+    report_type,
+    metric_name,
+    value_patterns,
+    granularity,
+    country_column,
+    row_filter=None,
+):
     """Process analytics data for a specific report type and export to Prometheus.
 
     Main processing pipeline:
@@ -680,17 +897,98 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
                 LOG.warning("No %s report found for %s", candidate, app_name)
                 continue
 
-            # Find the freshest instance for the configured granularity
-            instance, rows = _find_freshest_instance(report_id, granularity, DAYS_TO_FETCH)
-            if not instance or not rows:
-                LOG.debug("No non-empty %s instance found for %s report in last %s days (will try other candidates if any)", granularity, candidate, DAYS_TO_FETCH)
+            # Get ALL instances within the date range and process them all
+            try:
+                resp = _asc_api_call(
+                    "GET",
+                    f"/v1/analyticsReports/{report_id}/instances",
+                    params={"filter[granularity]": granularity, "limit": 200},
+                )
+            except Exception as e:
+                LOG.warning("Failed to get instances for report %s: %s", report_id, e)
                 continue
 
-            instance_id = instance["id"]
-            processing_date = (instance.get("attributes") or {}).get("processingDate", "")
-            LOG.info("Using freshest %s instance %s (processingDate=%s) for %s", granularity, instance_id, processing_date, candidate)
-            headers = (list(rows[0].keys()) if rows else [])
-            LOG.debug("Processing %d rows from instance %s; fields: %s", len(rows), instance_id, headers)
+            all_instances = (resp or {}).get("data") or []
+
+            # Filter instances within the lookback window
+            cutoff_iso = (date.today() - timedelta(days=DAYS_TO_FETCH)).isoformat()
+            wanted_instances = [
+                inst
+                for inst in all_instances
+                if ((inst.get("attributes") or {}).get("processingDate") or "")[:10]
+                >= cutoff_iso
+            ]
+
+            if not wanted_instances:
+                LOG.debug(
+                    "No instances found for %s report in last %s days",
+                    candidate,
+                    DAYS_TO_FETCH,
+                )
+                continue
+
+            LOG.info(
+                "Found %d instances for %s report in last %s days",
+                len(wanted_instances),
+                candidate,
+                DAYS_TO_FETCH,
+            )
+
+            # Aggregate data from all instances with deduplication
+            all_rows = []
+            global_seen_keys = set()  # Track unique data points across ALL instances
+
+            for instance in sorted(
+                wanted_instances,
+                key=lambda x: x.get("attributes", {}).get("processingDate", ""),
+            ):
+                instance_id = instance["id"]
+                processing_date = (instance.get("attributes") or {}).get(
+                    "processingDate", ""
+                )
+                LOG.debug(
+                    "Processing instance %s (processingDate=%s)",
+                    instance_id,
+                    processing_date,
+                )
+
+                instance_rows = _download_report_segments(instance_id)
+                if instance_rows:
+                    # Deduplicate across instances
+                    unique_rows = []
+                    for row in instance_rows:
+                        # Create unique key based on all dimensions
+                        dimension_keys = []
+                        for k, v in sorted(row.items()):
+                            if not k.startswith("__"):
+                                dimension_keys.append(f"{k}={v}")
+                        unique_key = "|".join(dimension_keys)
+
+                        if unique_key not in global_seen_keys:
+                            global_seen_keys.add(unique_key)
+                            unique_rows.append(row)
+
+                    all_rows.extend(unique_rows)
+                    LOG.debug(
+                        "Added %d unique rows from instance %s",
+                        len(unique_rows),
+                        instance_id,
+                    )
+
+            if not all_rows:
+                LOG.debug("No data found in any instance for %s report", candidate)
+                continue
+
+            rows = all_rows
+            processing_date = ""  # Aggregated from multiple instances
+            LOG.info(
+                "Processing %d total unique rows from %d instances for %s",
+                len(rows),
+                len(wanted_instances),
+                candidate,
+            )
+            headers = list(rows[0].keys()) if rows else []
+            LOG.debug("Processing %d rows; fields: %s", len(rows), headers)
             country_col = country_column or "Territory"
             value_col = value_patterns[0] if value_patterns else None
             # Log distinct values for row_filter column (to confirm exact wording)
@@ -698,7 +996,12 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
                 try:
                     rf_col = row_filter.get("column")
                     rf_vals = sorted({(r.get(rf_col) or "") for r in rows})
-                    LOG.debug("Row filter values for column '%s' in '%s': %s", rf_col, candidate, rf_vals)
+                    LOG.debug(
+                        "Row filter values for column '%s' in '%s': %s",
+                        rf_col,
+                        candidate,
+                        rf_vals,
+                    )
                 except Exception as _e_rf:
                     LOG.debug("Failed to collect row filter values: %s", _e_rf)
             # One-time warnings if configured columns are not present in the CSV headers
@@ -707,12 +1010,22 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
                 if country_col and country_col not in headers:
                     key = f"{candidate}|country|{country_col}"
                     if key not in _warned_missing_cols:
-                        LOG.warning("Configured country column '%s' not found in report '%s'; available headers: %s", country_col, candidate, headers)
+                        LOG.warning(
+                            "Configured country column '%s' not found in report '%s'; available headers: %s",
+                            country_col,
+                            candidate,
+                            headers,
+                        )
                         _warned_missing_cols.add(key)
                 if value_col and value_col not in headers:
                     key = f"{candidate}|value|{value_col}"
                     if key not in _warned_missing_cols:
-                        LOG.warning("Configured value column '%s' not found in report '%s'; available headers: %s", value_col, candidate, headers)
+                        LOG.warning(
+                            "Configured value column '%s' not found in report '%s'; available headers: %s",
+                            value_col,
+                            candidate,
+                            headers,
+                        )
                         _warned_missing_cols.add(key)
 
             # Select the single best segment (aggregate if exists, else the segment with fewest populated dimension columns),
@@ -728,7 +1041,9 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
                 # Do not filter by date to avoid dropping valid rows
                 # Check that all label fields are present in the row
                 missing_labels = []
-                metric_config = next((m for m in METRICS if m["key"] == metric_name), None)
+                metric_config = next(
+                    (m for m in METRICS if m["key"] == metric_name), None
+                )
                 if metric_config and "labels" in metric_config:
                     for field_name in metric_config["labels"].values():
                         if not row.get(field_name):
@@ -736,7 +1051,10 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
 
                 if missing_labels:
                     if LOG.isEnabledFor(logging.DEBUG):
-                        LOG.debug("Skipping row missing required label fields: %s", missing_labels)
+                        LOG.debug(
+                            "Skipping row missing required label fields: %s",
+                            missing_labels,
+                        )
                     continue
                 if row_filter:
                     rf_col = row_filter.get("column")
@@ -747,19 +1065,30 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
                 filtered_rows.append((seg_id, row))
 
             # Group rows by schema (set of non-metadata columns) to handle different data slices separately
-            LOG.debug("Built filtered_rows=%d for candidate '%s', instance %s", len(filtered_rows), candidate, instance_id)
+            LOG.debug(
+                "Built filtered_rows=%d for candidate '%s', instance %s",
+                len(filtered_rows),
+                candidate,
+                instance_id,
+            )
 
             # Group rows by their schema signature (excluding internal metadata columns)
             for seg_id, row in filtered_rows:
                 # Get schema signature (all non-metadata columns)
-                schema_cols = tuple(sorted(k for k in row.keys() if not k.startswith('__')))
+                schema_cols = tuple(
+                    sorted(k for k in row.keys() if not k.startswith("__"))
+                )
                 if schema_cols not in rows_by_schema:
                     rows_by_schema[schema_cols] = []
                 rows_by_schema[schema_cols].append((seg_id, row))
 
             # Process each schema group separately
             for schema_cols, schema_rows in rows_by_schema.items():
-                LOG.debug("Processing schema group with %d rows, columns: %s", len(schema_rows), schema_cols)
+                LOG.debug(
+                    "Processing schema group with %d rows, columns: %s",
+                    len(schema_rows),
+                    schema_cols,
+                )
 
                 schema_seen_keys = set()
                 schema_duplicates = 0
@@ -770,13 +1099,19 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
                         continue
 
                     # Create comprehensive unique key including all dimensions
-                    date_val = (row.get("Date") or row.get("Processing Date") or row.get("__segment_start") or processing_date or "").strip()[:10]
+                    date_val = (
+                        row.get("Date")
+                        or row.get("Processing Date")
+                        or row.get("__segment_start")
+                        or processing_date
+                        or ""
+                    ).strip()[:10]
 
                     # Build key from all dimension columns except value column (no metadata)
                     dimension_keys = []
                     for col in schema_cols:
-                        if col != value_col and not col.startswith('__'):
-                            dim_value = str(row.get(col, '')).strip()
+                        if col != value_col and not col.startswith("__"):
+                            dim_value = str(row.get(col, "")).strip()
                             dimension_keys.append(f"{col}={dim_value}")
 
                     unique_key = f"{date_val}_" + "_".join(sorted(dimension_keys))
@@ -784,7 +1119,10 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
                     # Check for duplicates within this schema group
                     if unique_key in schema_seen_keys:
                         if LOG.isEnabledFor(logging.DEBUG):
-                            LOG.debug("Duplicate detected for key %s - skipping to avoid double-counting", unique_key)
+                            LOG.debug(
+                                "Duplicate detected for key %s - skipping to avoid double-counting",
+                                unique_key,
+                            )
                         schema_duplicates += 1
                         continue
 
@@ -799,36 +1137,70 @@ def _process_analytics_data(app_info, report_type, metric_name, value_patterns, 
                     exported_count += 1
 
                     if LOG.isEnabledFor(logging.DEBUG):
-                        LOG.debug("Exported %s=%s from segment %s (key: %s)",
-                                 value_col, value, seg_id, unique_key)
+                        LOG.debug(
+                            "Exported %s=%s from segment %s (key: %s)",
+                            value_col,
+                            value,
+                            seg_id,
+                            unique_key,
+                        )
 
                 total_duplicates += schema_duplicates
                 if schema_duplicates > 0:
-                    LOG.info("Found %d duplicates in schema group with columns %s", schema_duplicates, schema_cols)
+                    LOG.info(
+                        "Found %d duplicates in schema group with columns %s",
+                        schema_duplicates,
+                        schema_cols,
+                    )
 
-            # Use instance processing date as fallback for reporting
-            report_date = processing_date or ""
+            # Use current date as fallback for reporting since we're aggregating multiple instances
+            report_date = date.today().isoformat()
 
             segments_used = len({seg_id for seg_id, _ in filtered_rows})
             schema_groups = len(rows_by_schema)
-            LOG.debug("Exported %d data points for metric %s (report=%s, processing_date=%s, segments_used=%d, schema_groups=%d, duplicates_found=%d)",
-                     exported_count, metric_name, candidate, processing_date or "unknown", segments_used, schema_groups, total_duplicates)
+            LOG.debug(
+                "Exported %d data points for metric %s (report=%s, segments_used=%d, schema_groups=%d, duplicates_found=%d)",
+                exported_count,
+                metric_name,
+                candidate,
+                segments_used,
+                schema_groups,
+                total_duplicates,
+            )
 
             if exported_count > 0:
-                LOG.info("Exported %d %s data points for candidate '%s' on %s", exported_count, metric_name, candidate, report_date)
+                LOG.info(
+                    "Exported %d %s data points for candidate '%s' on %s",
+                    exported_count,
+                    metric_name,
+                    candidate,
+                    report_date,
+                )
                 return
             else:
-                LOG.debug("Candidate '%s' had %s instances but produced no rows after filtering/export; trying next candidate", candidate, granularity)
+                LOG.debug(
+                    "Candidate '%s' had %s instances but produced no rows after filtering/export; trying next candidate",
+                    candidate,
+                    granularity,
+                )
                 continue
 
-        LOG.warning("No non-empty %s instance found for %s report in last %s days", granularity, report_type, DAYS_TO_FETCH)
+        LOG.warning(
+            "No non-empty %s instance found for %s report in last %s days",
+            granularity,
+            report_type,
+            DAYS_TO_FETCH,
+        )
         return
 
     except Exception as e:
         LOG.error("Failed to process %s for %s: %s", report_type, app_name, e)
         # Increment error counter for this app and report type
-        if 'parsing_errors_counter' in globals():
-            parsing_errors_counter.labels(package=app_name, report_type=report_type).inc()
+        if "parsing_errors_counter" in globals():
+            parsing_errors_counter.labels(
+                package=app_name, report_type=report_type
+            ).inc()
+
 
 def _process_app_metrics(app_info):
     """Process all configured metrics for a single app.
@@ -852,6 +1224,7 @@ def _process_app_metrics(app_info):
             m.get("country_column", "Territory"),
             m.get("row_filter"),
         )
+
 
 def _run_metrics_collection():
     """Run metrics collection for all configured apps with health state tracking."""
@@ -884,16 +1257,22 @@ def _run_metrics_collection():
             if len(collection_errors) < len(APPS):
                 _health_state["healthy"] = True
                 _health_state["last_successful_collection"] = dt.datetime.now()
-            _health_state["last_error"] = f"Failed to collect metrics for {len(collection_errors)}/{len(APPS)} apps"
-            LOG.info("Metrics collection completed with %d errors", len(collection_errors))
+            _health_state["last_error"] = (
+                f"Failed to collect metrics for {len(collection_errors)}/{len(APPS)} apps"
+            )
+            LOG.info(
+                "Metrics collection completed with %d errors", len(collection_errors)
+            )
 
         # Update last collection timestamp
-        if _health_state["healthy"] and 'last_collection_timestamp' in globals():
+        if _health_state["healthy"] and "last_collection_timestamp" in globals():
             last_collection_timestamp.set(time.time())
+
 
 # ------------ Background Collection ------------
 _collection_thread = None
 _stop_event = threading.Event()
+
 
 def _background_collection():
     """Background collection thread main loop.
@@ -941,6 +1320,7 @@ def _background_collection():
 
         _stop_event.wait(COLLECTION_INTERVAL)
 
+
 def start_background_collection():
     """Start background collection."""
     global _collection_thread
@@ -952,12 +1332,14 @@ def start_background_collection():
     _collection_thread.start()
     LOG.info("Background collection started")
 
+
 def stop_background_collection():
     """Stop background collection."""
     _stop_event.set()
     if _collection_thread:
         _collection_thread.join(timeout=10)
         LOG.info("Background collection stopped")
+
 
 # ------------ HTTP Server ------------
 def app(environ, start_response):
@@ -971,17 +1353,19 @@ def app(environ, start_response):
     if path == "/healthz":
         # Check actual health state (thread-safe read)
         with _health_state_lock:
-            is_healthy = _health_state["healthy"] and _health_state["collections_count"] > 0
+            is_healthy = (
+                _health_state["healthy"] and _health_state["collections_count"] > 0
+            )
             collections_count = _health_state["collections_count"]
-            last_collection = _health_state.get('last_successful_collection', 'never')
-            last_error = _health_state.get('last_error', 'unknown error')
+            last_collection = _health_state.get("last_successful_collection", "never")
+            last_error = _health_state.get("last_error", "unknown error")
 
         if is_healthy:
             start_response("200 OK", [("Content-Type", "text/plain; charset=utf-8")])
             response = "ok\n"
             if LOG.isEnabledFor(logging.DEBUG):
                 response = f"ok - last successful collection: {last_collection}\n"
-            return [response.encode('utf-8')]
+            return [response.encode("utf-8")]
         else:
             # Not healthy yet - either no collections or last collection failed
             status = "503 Service Unavailable"
@@ -990,7 +1374,7 @@ def app(environ, start_response):
                 response = "not ready - no collections completed yet\n"
             else:
                 response = f"unhealthy - {last_error}\n"
-            return [response.encode('utf-8')]
+            return [response.encode("utf-8")]
 
     if path != "/metrics":
         start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
@@ -1006,10 +1390,13 @@ def app(environ, start_response):
     start_response("200 OK", [("Content-Type", CONTENT_TYPE_LATEST)])
     return [output]
 
+
 def main():
     """Main entry point."""
     LOG.info("Starting Apple App Store Connect Exporter")
-    LOG.info("Port: %s | Interval: %ss | Days: %s", PORT, COLLECTION_INTERVAL, DAYS_TO_FETCH)
+    LOG.info(
+        "Port: %s | Interval: %ss | Days: %s", PORT, COLLECTION_INTERVAL, DAYS_TO_FETCH
+    )
     LOG.info("Configured apps: %s", [app["name"] for app in APPS])
 
     start_background_collection()
@@ -1040,6 +1427,7 @@ def main():
         LOG.info("Shutting down")
     finally:
         stop_background_collection()
+
 
 if __name__ == "__main__":
     main()

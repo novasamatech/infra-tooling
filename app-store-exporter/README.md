@@ -2,7 +2,6 @@
 
 Prometheus exporter for Apple App Store Connect analytics metrics. This exporter fetches daily metrics from the App Store Connect API and exposes them as Prometheus counters with built-in observability metrics.
 
-
 ## Dependencies
 
 * prometheus_client
@@ -281,6 +280,14 @@ For issues and feature requests, please create an issue in the project repositor
 5. Submit a pull request
 
 ## Changelog
+
+### v2.0.0
+- **Critical Fix**: Fixed incomplete data collection issue where exporter was only processing the most recent instance
+  - Now processes ALL instances within the configured date range (`DAYS_TO_FETCH`)
+  - Properly deduplicates data across multiple instances
+  - Ensures complete historical data collection instead of just last 2 days
+- **Important Note**: This fix significantly improves data accuracy. Previous versions may have been missing data for dates older than 2 days
+- **Performance**: Processing multiple instances may increase collection time but ensures data completeness
 
 ### v1.2.0
 - **Breaking Change**: The metric label `app` was renamed to `package` for consistency with other exporters.
