@@ -359,12 +359,12 @@ class TestPrometheusFormat(unittest.TestCase):
             output = exporter._format_prometheus_output()
 
             # Should contain HELP and TYPE for each metric
-            self.assertIn("# HELP appstore_daily_user_installs", output)
-            self.assertIn("# TYPE appstore_daily_user_installs gauge", output)
-            self.assertIn("# HELP appstore_active_devices", output)
-            self.assertIn("# TYPE appstore_active_devices gauge", output)
-            self.assertIn("# HELP appstore_uninstalls", output)
-            self.assertIn("# TYPE appstore_uninstalls gauge", output)
+            self.assertIn("# HELP appstore_daily_user_installs_v2", output)
+            self.assertIn("# TYPE appstore_daily_user_installs_v2 gauge", output)
+            self.assertIn("# HELP appstore_active_devices_v2", output)
+            self.assertIn("# TYPE appstore_active_devices_v2 gauge", output)
+            self.assertIn("# HELP appstore_uninstalls_v2", output)
+            self.assertIn("# TYPE appstore_uninstalls_v2 gauge", output)
 
             # Should contain internal metrics
             self.assertIn("# HELP appstore_exporter_parsing_errors_total", output)
@@ -379,27 +379,30 @@ class TestPrometheusFormat(unittest.TestCase):
         test_timestamp_ms = 1704067200000  # 2024-01-01 00:00:00 UTC
         test_metrics = {
             (
-                "appstore_daily_user_installs",
+                "appstore_daily_user_installs_v2",
                 "com.test.app",
                 "US",
                 "iOS 17",
                 "App Store",
+                "2024-01-01",
             ): (100, test_timestamp_ms),
             (
-                "appstore_active_devices",
+                "appstore_active_devices_v2",
                 "com.test.app",
                 "DE",
                 "iPhone",
                 "iOS 16",
                 "Web",
+                "2024-01-01",
             ): (50, test_timestamp_ms),
             (
-                "appstore_uninstalls",
+                "appstore_uninstalls_v2",
                 "com.test.app",
                 "JP",
                 "iPad",
                 "iOS 15",
                 "App Store",
+                "2024-01-01",
             ): (25, test_timestamp_ms),
             (
                 "appstore_exporter_parsing_errors_total",
@@ -417,15 +420,15 @@ class TestPrometheusFormat(unittest.TestCase):
 
             # Verify metric format: metric_name{labels} value timestamp
             self.assertIn(
-                'appstore_daily_user_installs{package="com.test.app",country="US",platform_version="iOS 17",source_type="App Store"} 100 1704067200000',
+                'appstore_daily_user_installs_v2{package="com.test.app",country="US",platform_version="iOS 17",source_type="App Store"} 100 1704067200000',
                 output,
             )
             self.assertIn(
-                'appstore_active_devices{package="com.test.app",country="DE",device="iPhone",platform_version="iOS 16",source_type="Web"} 50 1704067200000',
+                'appstore_active_devices_v2{package="com.test.app",country="DE",device="iPhone",platform_version="iOS 16",source_type="Web"} 50 1704067200000',
                 output,
             )
             self.assertIn(
-                'appstore_uninstalls{package="com.test.app",country="JP",device="iPad",platform_version="iOS 15",source_type="App Store"} 25 1704067200000',
+                'appstore_uninstalls_v2{package="com.test.app",country="JP",device="iPad",platform_version="iOS 15",source_type="App Store"} 25 1704067200000',
                 output,
             )
 
@@ -444,19 +447,21 @@ class TestPrometheusFormat(unittest.TestCase):
         test_timestamp_ms = 1704067200000
         test_metrics = {
             (
-                "appstore_daily_user_installs",
+                "appstore_daily_user_installs_v2",
                 "com.test.app",
                 "US",
                 "iOS 17",
                 "App Store",
+                "2024-01-01",
             ): (0, test_timestamp_ms),
             (
-                "appstore_active_devices",
+                "appstore_active_devices_v2",
                 "com.test.app",
                 "DE",
                 "iPhone",
                 "iOS 16",
                 "Web",
+                "2024-01-01",
             ): (50, test_timestamp_ms),
         }
 
@@ -465,22 +470,23 @@ class TestPrometheusFormat(unittest.TestCase):
 
             # Zero value should not appear
             self.assertNotIn(
-                'appstore_daily_user_installs{package="com.test.app"', output
+                'appstore_daily_user_installs_v2{package="com.test.app"', output
             )
 
             # Non-zero value should appear
-            self.assertIn('appstore_active_devices{package="com.test.app"', output)
+            self.assertIn('appstore_active_devices_v2{package="com.test.app"', output)
 
     def test_metrics_endpoint_returns_prometheus_format(self):
         """Test that /metrics endpoint returns properly formatted output"""
         test_timestamp_ms = int(time.time() * 1000)
         test_metrics = {
             (
-                "appstore_daily_user_installs",
+                "appstore_daily_user_installs_v2",
                 "com.test.app",
                 "US",
                 "iOS 17",
                 "App Store",
+                "2024-01-01",
             ): (100, test_timestamp_ms),
         }
 
@@ -494,13 +500,60 @@ class TestPrometheusFormat(unittest.TestCase):
             output = response[0].decode("utf-8")
 
             # Verify format
-            self.assertIn("# HELP appstore_daily_user_installs", output)
-            self.assertIn("# TYPE appstore_daily_user_installs gauge", output)
+            self.assertIn("# HELP appstore_daily_user_installs_v2", output)
+            self.assertIn("# TYPE appstore_daily_user_installs_v2 gauge", output)
             self.assertIn(
-                'appstore_daily_user_installs{package="com.test.app",country="US"',
+                'appstore_daily_user_installs_v2{package="com.test.app",country="US"',
                 output,
             )
             self.assertIn(f" 100 {test_timestamp_ms}", output)
+
+    def test_multiple_dates_preserved_separately(self):
+        """Test that metrics for different dates are preserved as separate entries"""
+        test_metrics = {
+            # Same metric, same labels, but different dates
+            (
+                "appstore_daily_user_installs_v2",
+                "com.test.app",
+                "US",
+                "iOS 17",
+                "App Store",
+                "2024-01-01",
+            ): (100, 1704067200000),  # Jan 1, 2024
+            (
+                "appstore_daily_user_installs_v2",
+                "com.test.app",
+                "US",
+                "iOS 17",
+                "App Store",
+                "2024-01-02",
+            ): (150, 1704153600000),  # Jan 2, 2024
+            (
+                "appstore_daily_user_installs_v2",
+                "com.test.app",
+                "US",
+                "iOS 17",
+                "App Store",
+                "2024-01-03",
+            ): (200, 1704240000000),  # Jan 3, 2024
+        }
+
+        with patch.dict(exporter._metrics_data, test_metrics, clear=True):
+            output = exporter._format_prometheus_output()
+
+            # All three entries should be present with different timestamps
+            self.assertIn(
+                'appstore_daily_user_installs{package="com.test.app",country="US",platform_version="iOS 17",source_type="App Store"} 100 1704067200000',
+                output,
+            )
+            self.assertIn(
+                'appstore_daily_user_installs{package="com.test.app",country="US",platform_version="iOS 17",source_type="App Store"} 150 1704153600000',
+                output,
+            )
+            self.assertIn(
+                'appstore_daily_user_installs{package="com.test.app",country="US",platform_version="iOS 17",source_type="App Store"} 200 1704240000000',
+                output,
+            )
 
 
 class TestDataProcessing(unittest.TestCase):

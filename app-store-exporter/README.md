@@ -96,9 +96,24 @@ python analytics-requests-manager.py \
   --p8 "/path/to/AuthKey.p8" \
   --bundles "com.your.app.bundleid" \
   --delete
+
+# Diagnose API access issues and check permissions
+python analytics-requests-manager.py \
+  --issuer "your_issuer_id" \
+  --key-id "your_key_id" \
+  --p8 "/path/to/AuthKey.p8" \
+  --bundles "com.your.app.bundleid" \
+  --diagnose
 ```
 
-**Note**: The `analytics-requests-manager.py` utility requires an API key with **Admin** or **Account Holder** privileges. API keys with only "Reports" access cannot create or delete report requests programmatically.
+The `--diagnose` flag runs comprehensive API diagnostics to help troubleshoot access issues:
+- **Token Validation**: Checks JWT token structure and expiration
+- **Permission Analysis**: Determines API key role (Admin, Developer, Finance, etc.)
+- **Access Testing**: Verifies access to apps and analytics endpoints
+- **Error Details**: Shows specific error codes and messages for 403 Forbidden errors
+- **Recommendations**: Provides actionable steps to resolve identified issues
+
+**Note**: The `analytics-requests-manager.py` utility requires an API key with **Admin** or **Account Holder** privileges for creating or deleting report requests. API keys with only "Reports" access cannot create or delete report requests programmatically, but can use `--list` and `--diagnose` flags.
 
 ### Required Report Types for Exporter
 
@@ -279,6 +294,17 @@ For issues and feature requests, please create an issue in the project repositor
 5. Submit a pull request
 
 ## Changelog
+
+### v2.1.0
+- **New Feature**: Added `--diagnose` flag to analytics-requests-manager.py for comprehensive API diagnostics
+  - Analyzes JWT token structure and expiration status
+  - Tests API endpoints to determine actual permission levels
+  - Identifies API key role (Admin, Developer, Finance, etc.)
+  - Provides detailed error information for 403 Forbidden responses
+  - Verifies access to specified bundle IDs
+  - Offers specific recommendations to resolve identified issues
+- **Critical Fix**: Fixed missed metrics
+- **Breaking Change**: Added the `v2` prefix to metrics' names
 
 ### v2.0.0
 - **Breaking Change**: Migrated from prometheus_client library to native Prometheus format implementation
