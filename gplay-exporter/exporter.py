@@ -71,31 +71,31 @@ _metrics_data = {}  # Format: {metric_name: {(package, country): (value, timesta
 
 # Metric definitions with aggregation strategy
 METRIC_DEFINITIONS = {
-    "gplay_device_installs": {
+    "gplay_device_installs_v2": {
         "help": "Device installs by country from Google Play Console",
         "type": "counter",
         "csv_column": "Daily Device Installs",
         "aggregation": "sum",  # Sum all days in the month
     },
-    "gplay_device_uninstalls": {
+    "gplay_device_uninstalls_v2": {
         "help": "Device uninstalls by country from Google Play Console",
         "type": "counter",
         "csv_column": "Daily Device Uninstalls",
         "aggregation": "sum",  # Sum all days in the month
     },
-    "gplay_active_device_installs": {
+    "gplay_active_device_installs_v2": {
         "help": "Active device installs by country from Google Play Console",
         "type": "counter",
         "csv_column": "Active Device Installs",
         "aggregation": "last",  # Take last value (absolute/cumulative metric)
     },
-    "gplay_user_installs": {
+    "gplay_user_installs_v2": {
         "help": "User installs by country from Google Play Console",
         "type": "counter",
         "csv_column": "Daily User Installs",
         "aggregation": "sum",  # Sum all days in the month
     },
-    "gplay_user_uninstalls": {
+    "gplay_user_uninstalls_v2": {
         "help": "User uninstalls by country from Google Play Console",
         "type": "counter",
         "csv_column": "Daily User Uninstalls",

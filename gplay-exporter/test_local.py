@@ -57,7 +57,7 @@ class TestPrometheusFormatting(unittest.TestCase):
 
         with exporter._metrics_lock:
             exporter._metrics_data = {
-                "gplay_device_installs": {
+                "gplay_device_installs_v2": {
                     ("com.test.app", "US"): (1234.0, test_timestamp),
                     ("com.test.app", "GB"): (567.0, test_timestamp),
                 }
@@ -67,11 +67,11 @@ class TestPrometheusFormatting(unittest.TestCase):
 
         # Check that metrics contain timestamps
         self.assertIn(
-            'gplay_device_installs{package="com.test.app",country="US"} 1234.0 1737734400000',
+            'gplay_device_installs_v2{package="com.test.app",country="US"} 1234.0 1737734400000',
             output,
         )
         self.assertIn(
-            'gplay_device_installs{package="com.test.app",country="GB"} 567.0 1737734400000',
+            'gplay_device_installs_v2{package="com.test.app",country="GB"} 567.0 1737734400000',
             output,
         )
 
@@ -81,7 +81,7 @@ class TestPrometheusFormatting(unittest.TestCase):
 
         with exporter._metrics_lock:
             exporter._metrics_data = {
-                "gplay_device_installs": {
+                "gplay_device_installs_v2": {
                     ("com.test.app", "US"): (100.0, test_timestamp),
                     ("com.test.app", "GB"): (0.0, test_timestamp),  # Zero value
                     ("com.test.app", "FR"): (-5.0, test_timestamp),  # Negative value
@@ -92,7 +92,7 @@ class TestPrometheusFormatting(unittest.TestCase):
 
         # Should include positive value
         self.assertIn(
-            'gplay_device_installs{package="com.test.app",country="US"} 100.0',
+            'gplay_device_installs_v2{package="com.test.app",country="US"} 100.0',
             output,
         )
         # Should not include zero or negative values
@@ -105,13 +105,13 @@ class TestPrometheusFormatting(unittest.TestCase):
 
         with exporter._metrics_lock:
             exporter._metrics_data = {
-                "gplay_device_installs": {
+                "gplay_device_installs_v2": {
                     ("com.app1", "US"): (100.0, test_timestamp),
                 },
-                "gplay_device_uninstalls": {
+                "gplay_device_uninstalls_v2": {
                     ("com.app1", "US"): (10.0, test_timestamp),
                 },
-                "gplay_active_device_installs": {
+                "gplay_active_device_installs_v2": {
                     ("com.app2", "GB"): (5000.0, test_timestamp),
                 },
             }
@@ -120,15 +120,15 @@ class TestPrometheusFormatting(unittest.TestCase):
 
         # Check all metrics are present
         self.assertIn(
-            'gplay_device_installs{package="com.app1",country="US"} 100.0',
+            'gplay_device_installs_v2{package="com.app1",country="US"} 100.0',
             output,
         )
         self.assertIn(
-            'gplay_device_uninstalls{package="com.app1",country="US"} 10.0',
+            'gplay_device_uninstalls_v2{package="com.app1",country="US"} 10.0',
             output,
         )
         self.assertIn(
-            'gplay_active_device_installs{package="com.app2",country="GB"} 5000.0',
+            'gplay_active_device_installs_v2{package="com.app2",country="GB"} 5000.0',
             output,
         )
 
@@ -298,28 +298,28 @@ class TestProcessPackageCSV(unittest.TestCase):
         with exporter._metrics_lock:
             # Daily device installs: 100 + 150 + 200 = 450
             self.assertEqual(
-                exporter._metrics_data["gplay_device_installs"][
+                exporter._metrics_data["gplay_device_installs_v2"][
                     ("com.test.app", "US")
                 ][0],
                 450.0,
             )
             # Daily device uninstalls: 10 + 15 + 20 = 45
             self.assertEqual(
-                exporter._metrics_data["gplay_device_uninstalls"][
+                exporter._metrics_data["gplay_device_uninstalls_v2"][
                     ("com.test.app", "US")
                 ][0],
                 45.0,
             )
             # Active device installs: Should use ONLY the last value (1200)
             self.assertEqual(
-                exporter._metrics_data["gplay_active_device_installs"][
+                exporter._metrics_data["gplay_active_device_installs_v2"][
                     ("com.test.app", "US")
                 ][0],
                 1200.0,  # NOT summed, just the last value
             )
             # User installs: 90 + 140 + 180 = 410
             self.assertEqual(
-                exporter._metrics_data["gplay_user_installs"][
+                exporter._metrics_data["gplay_user_installs_v2"][
                     ("com.test.app", "US")
                 ][0],
                 410.0,
@@ -373,14 +373,14 @@ class TestProcessPackageCSV(unittest.TestCase):
         with exporter._metrics_lock:
             # Active device installs should be 5000 (from 2025-01-10)
             self.assertEqual(
-                exporter._metrics_data["gplay_active_device_installs"][
+                exporter._metrics_data["gplay_active_device_installs_v2"][
                     ("com.test.app", "US")
                 ][0],
                 5000.0,
             )
             # Daily installs should be summed: 100 + 200 + 300 = 600
             self.assertEqual(
-                exporter._metrics_data["gplay_device_installs"][
+                exporter._metrics_data["gplay_device_installs_v2"][
                     ("com.test.app", "US")
                 ][0],
                 600.0,
@@ -428,7 +428,7 @@ class TestProcessPackageCSV(unittest.TestCase):
         # Check that timestamp corresponds to 2025-01-10
         with exporter._metrics_lock:
             # Get the timestamp
-            _, timestamp_ms = exporter._metrics_data["gplay_device_installs"][
+            _, timestamp_ms = exporter._metrics_data["gplay_device_installs_v2"][
                 ("com.test.app", "US")
             ]
 
@@ -475,7 +475,7 @@ class TestWSGIApp(unittest.TestCase):
         # Add some test metrics
         with exporter._metrics_lock:
             exporter._metrics_data = {
-                "gplay_device_installs": {
+                "gplay_device_installs_v2": {
                     ("com.test.app", "US"): (1000.0, 1737734400000),
                 }
             }
@@ -489,7 +489,7 @@ class TestWSGIApp(unittest.TestCase):
 
         # Check response contains metrics
         response_text = b"".join(response).decode("utf-8")
-        self.assertIn("gplay_device_installs", response_text)
+        self.assertIn("gplay_device_installs_v2", response_text)
         self.assertIn('package="com.test.app"', response_text)
         self.assertIn('country="US"', response_text)
         self.assertIn("1000.0", response_text)
@@ -526,7 +526,7 @@ class TestMetricDefinitions(unittest.TestCase):
     def test_active_installs_uses_last_aggregation(self):
         """Test that active_device_installs uses 'last' aggregation"""
         self.assertEqual(
-            exporter.METRIC_DEFINITIONS["gplay_active_device_installs"][
+            exporter.METRIC_DEFINITIONS["gplay_active_device_installs_v2"][
                 "aggregation"
             ],
             "last",
@@ -536,10 +536,10 @@ class TestMetricDefinitions(unittest.TestCase):
     def test_daily_metrics_use_sum_aggregation(self):
         """Test that daily metrics use 'sum' aggregation"""
         daily_metrics = [
-            "gplay_device_installs",
-            "gplay_device_uninstalls",
-            "gplay_user_installs",
-            "gplay_user_uninstalls",
+            "gplay_device_installs_v2",
+            "gplay_device_uninstalls_v2",
+            "gplay_user_installs_v2",
+            "gplay_user_uninstalls_v2",
         ]
         for metric_name in daily_metrics:
             self.assertEqual(

@@ -7,27 +7,27 @@ as Prometheus counters. It automatically discovers packages, processes CSV files
 
 All metrics are exported as Prometheus counters with proper timestamps:
 
-1. **gplay_device_installs{package,country}**
+1. **gplay_device_installs_v2{package,country}**
    - Sum of device installs for the month
    - Aggregation: SUM of all days
    - Type: Counter with timestamp
 
-2. **gplay_device_uninstalls{package,country}**
+2. **gplay_device_uninstalls_v2{package,country}**
    - Sum of device uninstalls for the month
    - Aggregation: SUM of all days
    - Type: Counter with timestamp
 
-3. **gplay_active_device_installs{package,country}**
+3. **gplay_active_device_installs_v2{package,country}**
    - Current active device installs (absolute value)
    - Aggregation: LAST value from the latest date
    - Type: Counter with timestamp
 
-4. **gplay_user_installs{package,country}**
+4. **gplay_user_installs_v2{package,country}**
    - Sum of user installs for the month
    - Aggregation: SUM of all days
    - Type: Counter with timestamp
 
-5. **gplay_user_uninstalls{package,country}**
+5. **gplay_user_uninstalls_v2{package,country}**
    - Sum of user uninstalls for the month
    - Aggregation: SUM of all days
    - Type: Counter with timestamp
@@ -56,14 +56,14 @@ All metrics are exported as Prometheus counters with proper timestamps:
 ### Example Output
 
 ```prometheus
-# HELP gplay_device_installs Device installs by country from Google Play Console
-# TYPE gplay_device_installs counter
-gplay_device_installs{package="com.example.app",country="US"} 12450.0 1737734400000
-gplay_device_installs{package="com.example.app",country="GB"} 5678.0 1737734400000
+# HELP gplay_device_installs_v2 Device installs by country from Google Play Console
+# TYPE gplay_device_installs_v2 counter
+gplay_device_installs_v2{package="com.example.app",country="US"} 12450.0 1737734400000
+gplay_device_installs_v2{package="com.example.app",country="GB"} 5678.0 1737734400000
 
-# HELP gplay_active_device_installs Active device installs by country from Google Play Console
-# TYPE gplay_active_device_installs counter
-gplay_active_device_installs{package="com.example.app",country="US"} 850000.0 1737734400000
+# HELP gplay_active_device_installs_v2 Active device installs by country from Google Play Console
+# TYPE gplay_active_device_installs_v2 counter
+gplay_active_device_installs_v2{package="com.example.app",country="US"} 850000.0 1737734400000
 ```
 
 ## Dependencies
@@ -132,14 +132,14 @@ The exporter uses different aggregation strategies based on the metric type:
 
 ### Sum Aggregation
 Used for flow metrics that represent events over time:
-- `gplay_device_installs` - each day adds to the monthly total
-- `gplay_device_uninstalls` - each day adds to the monthly total  
-- `gplay_user_installs` - each day adds to the monthly total
-- `gplay_user_uninstalls` - each day adds to the monthly total
+- `gplay_device_installs_v2` - each day adds to the monthly total
+- `gplay_device_uninstalls_v2` - each day adds to the monthly total  
+- `gplay_user_installs_v2` - each day adds to the monthly total
+- `gplay_user_uninstalls_v2` - each day adds to the monthly total
 
 ### Last Value Aggregation
 Used for stock metrics that represent current state:
-- `gplay_active_device_installs` - represents the current number of active installations
+- `gplay_active_device_installs_v2` - represents the current number of active installations
 
 This approach ensures that:
 - Daily statistics are properly accumulated for the entire month
@@ -167,23 +167,23 @@ The test suite validates:
 
 ```promql
 # Total installs for the current month
-gplay_device_installs
+gplay_device_installs_v2
 
 # Current active installations
-gplay_active_device_installs
+gplay_active_device_installs_v2
 
 # Uninstall rate by country
-gplay_device_uninstalls / gplay_device_installs
+gplay_device_uninstalls_v2 / gplay_device_installs_v2
 
 # Growth in active installs over time
-increase(gplay_active_device_installs[30d])
+increase(gplay_active_device_installs_v2[30d])
 ```
 
 ### Data Freshness Monitoring
 Since metrics include explicit timestamps, you can monitor data freshness:
 ```promql
 # Alert if data is older than 48 hours
-time() - timestamp(gplay_device_installs) > 172800
+time() - timestamp(gplay_device_installs_v2) > 172800
 ```
 
 ## Troubleshooting
@@ -234,6 +234,17 @@ The prometheus_client Python library has a limitation where it cannot set timest
 
 ## Changelog
 
+### Version 2.1.0 (2025-01-24)
+
+#### Changes
+- **Added _v2 suffix to all metric names** to clearly distinguish from v1 metrics:
+  - `gplay_device_installs_v2`
+  - `gplay_device_uninstalls_v2`
+  - `gplay_active_device_installs_v2`
+  - `gplay_user_installs_v2`
+  - `gplay_user_uninstalls_v2`
+- This allows running v1 and v2 exporters in parallel during migration
+
 ### Version 2.0.0 (2025-01-24)
 
 #### Major Changes
@@ -243,9 +254,8 @@ The prometheus_client Python library has a limitation where it cannot set timest
   - Absolute metrics (active_device_installs) use only the latest value
   - Fixes data loss issue when multiple days are added to reports at once
 - **Improved Metric Names**:
-  - Removed redundant "daily" prefix: `gplay_daily_device_installs_total` → `gplay_device_installs`
+  - Removed redundant "daily" prefix from v1 names
   - Removed unnecessary "total" suffix except for semantically appropriate metrics
-  - `gplay_active_device_installs_total` → `gplay_active_device_installs`
 - **No prometheus_client dependency**: Generates Prometheus format manually
 
 #### Important Notes
