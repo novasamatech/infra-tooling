@@ -82,21 +82,21 @@ class TestIntegrationScenarios(unittest.TestCase):
             # Check US metrics
             # Device installs should be summed: 1000+1100+1200+1300+1400 = 6000
             self.assertEqual(
-                exporter._metrics_data["gplay_device_installs"][
+                exporter._metrics_data["gplay_device_installs_v2"][
                     ("com.example.app", "US")
                 ][0],
                 6000.0,
             )
             # Device uninstalls should be summed: 50+55+60+65+70 = 300
             self.assertEqual(
-                exporter._metrics_data["gplay_device_uninstalls"][
+                exporter._metrics_data["gplay_device_uninstalls_v2"][
                     ("com.example.app", "US")
                 ][0],
                 300.0,
             )
             # Active device installs should be last value: 104000
             self.assertEqual(
-                exporter._metrics_data["gplay_active_device_installs"][
+                exporter._metrics_data["gplay_active_device_installs_v2"][
                     ("com.example.app", "US")
                 ][0],
                 104000.0,
@@ -105,14 +105,14 @@ class TestIntegrationScenarios(unittest.TestCase):
             # Check GB metrics
             # Device installs should be summed: 500+550+600+650+700 = 3000
             self.assertEqual(
-                exporter._metrics_data["gplay_device_installs"][
+                exporter._metrics_data["gplay_device_installs_v2"][
                     ("com.example.app", "GB")
                 ][0],
                 3000.0,
             )
             # Active device installs should be last value: 54000
             self.assertEqual(
-                exporter._metrics_data["gplay_active_device_installs"][
+                exporter._metrics_data["gplay_active_device_installs_v2"][
                     ("com.example.app", "GB")
                 ][0],
                 54000.0,
@@ -121,7 +121,7 @@ class TestIntegrationScenarios(unittest.TestCase):
             # Check timestamp (should be from 2025-01-05)
             expected_timestamp = int(dt.datetime(2025, 1, 5).timestamp() * 1000)
             self.assertEqual(
-                exporter._metrics_data["gplay_device_installs"][
+                exporter._metrics_data["gplay_device_installs_v2"][
                     ("com.example.app", "US")
                 ][1],
                 expected_timestamp,
@@ -164,14 +164,14 @@ class TestIntegrationScenarios(unittest.TestCase):
             # v1 would only capture 150 (last day)
             # v2 should capture 100+110+120+130+140+150 = 750
             self.assertEqual(
-                exporter._metrics_data["gplay_device_installs"][
+                exporter._metrics_data["gplay_device_installs_v2"][
                     ("com.retroactive.app", "US")
                 ][0],
                 750.0,
             )
             # Active installs should be only the last value: 95000
             self.assertEqual(
-                exporter._metrics_data["gplay_active_device_installs"][
+                exporter._metrics_data["gplay_active_device_installs_v2"][
                     ("com.retroactive.app", "US")
                 ][0],
                 95000.0,
@@ -185,28 +185,28 @@ class TestIntegrationScenarios(unittest.TestCase):
 
         with exporter._metrics_lock:
             exporter._metrics_data = {
-                "gplay_device_installs": {
+                "gplay_device_installs_v2": {
                     ("com.app1", "US"): (5000.0, test_timestamp),
                     ("com.app1", "GB"): (2000.0, test_timestamp),
                     ("com.app2", "US"): (3000.0, test_timestamp),
                 },
-                "gplay_device_uninstalls": {
+                "gplay_device_uninstalls_v2": {
                     ("com.app1", "US"): (250.0, test_timestamp),
                     ("com.app1", "GB"): (100.0, test_timestamp),
                 },
-                "gplay_active_device_installs": {
+                "gplay_active_device_installs_v2": {
                     ("com.app1", "US"): (95000.0, test_timestamp),
                     ("com.app1", "GB"): (45000.0, test_timestamp),
                     ("com.app2", "US"): (120000.0, test_timestamp),
                 },
-                "gplay_user_installs": {
+                "gplay_user_installs_v2": {
                     ("com.app1", "US"): (4500.0, test_timestamp),
                     ("com.app1", "GB"): (
                         0.0,
                         test_timestamp,
                     ),  # Zero value should be filtered
                 },
-                "gplay_user_uninstalls": {
+                "gplay_user_uninstalls_v2": {
                     ("com.app1", "US"): (200.0, test_timestamp),
                     ("com.app1", "GB"): (80.0, test_timestamp),
                 },
@@ -218,27 +218,29 @@ class TestIntegrationScenarios(unittest.TestCase):
         lines = output.split("\n")
 
         # Verify HELP and TYPE lines exist
-        self.assertIn("# HELP gplay_device_installs", output)
-        self.assertIn("# TYPE gplay_device_installs counter", output)
-        self.assertIn("# HELP gplay_active_device_installs", output)
-        self.assertIn("# TYPE gplay_active_device_installs counter", output)
+        self.assertIn("# HELP gplay_device_installs_v2", output)
+        self.assertIn("# TYPE gplay_device_installs_v2 counter", output)
+        self.assertIn("# HELP gplay_active_device_installs_v2", output)
+        self.assertIn("# TYPE gplay_active_device_installs_v2 counter", output)
 
         # Verify metric lines with timestamps
         self.assertIn(
-            f'gplay_device_installs{{package="com.app1",country="US"}} 5000.0 {test_timestamp}',
+            f'gplay_device_installs_v2{{package="com.app1",country="US"}} 5000.0 {test_timestamp}',
             output,
         )
         self.assertIn(
-            f'gplay_device_installs{{package="com.app1",country="GB"}} 2000.0 {test_timestamp}',
+            f'gplay_device_installs_v2{{package="com.app1",country="GB"}} 2000.0 {test_timestamp}',
             output,
         )
         self.assertIn(
-            f'gplay_active_device_installs{{package="com.app1",country="US"}} 95000.0 {test_timestamp}',
+            f'gplay_active_device_installs_v2{{package="com.app1",country="US"}} 95000.0 {test_timestamp}',
             output,
         )
 
         # Verify zero values are filtered
-        self.assertNotIn('gplay_user_installs{package="com.app1",country="GB"}', output)
+        self.assertNotIn(
+            'gplay_user_installs_v2{package="com.app1",country="GB"}', output
+        )
 
         # Verify all metrics have timestamps
         for line in lines:
@@ -306,41 +308,41 @@ class TestIntegrationScenarios(unittest.TestCase):
         with exporter._metrics_lock:
             # Check app1 metrics exist
             self.assertIn(
-                ("com.app1", "US"), exporter._metrics_data["gplay_device_installs"]
+                ("com.app1", "US"), exporter._metrics_data["gplay_device_installs_v2"]
             )
             self.assertIn(
-                ("com.app1", "GB"), exporter._metrics_data["gplay_device_installs"]
+                ("com.app1", "GB"), exporter._metrics_data["gplay_device_installs_v2"]
             )
 
             # Check app2 metrics exist
             self.assertIn(
-                ("com.app2", "US"), exporter._metrics_data["gplay_device_installs"]
+                ("com.app2", "US"), exporter._metrics_data["gplay_device_installs_v2"]
             )
             self.assertIn(
-                ("com.app2", "FR"), exporter._metrics_data["gplay_device_installs"]
+                ("com.app2", "FR"), exporter._metrics_data["gplay_device_installs_v2"]
             )
 
             # Verify values
             self.assertEqual(
-                exporter._metrics_data["gplay_device_installs"][("com.app1", "US")][
+                exporter._metrics_data["gplay_device_installs_v2"][("com.app1", "US")][
                     0
                 ],
                 1000.0,
             )
             self.assertEqual(
-                exporter._metrics_data["gplay_device_installs"][("com.app2", "US")][
+                exporter._metrics_data["gplay_device_installs_v2"][("com.app2", "US")][
                     0
                 ],
                 2000.0,
             )
             self.assertEqual(
-                exporter._metrics_data["gplay_active_device_installs"][
+                exporter._metrics_data["gplay_active_device_installs_v2"][
                     ("com.app1", "US")
                 ][0],
                 100000.0,
             )
             self.assertEqual(
-                exporter._metrics_data["gplay_active_device_installs"][
+                exporter._metrics_data["gplay_active_device_installs_v2"][
                     ("com.app2", "US")
                 ][0],
                 200000.0,
