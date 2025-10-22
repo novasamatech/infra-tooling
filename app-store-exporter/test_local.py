@@ -543,15 +543,15 @@ class TestPrometheusFormat(unittest.TestCase):
 
             # All three entries should be present with different timestamps
             self.assertIn(
-                'appstore_daily_user_installs{package="com.test.app",country="US",platform_version="iOS 17",source_type="App Store"} 100 1704067200000',
+                'appstore_daily_user_installs_v2{package="com.test.app",country="US",platform_version="iOS 17",source_type="App Store"} 100 1704067200000',
                 output,
             )
             self.assertIn(
-                'appstore_daily_user_installs{package="com.test.app",country="US",platform_version="iOS 17",source_type="App Store"} 150 1704153600000',
+                'appstore_daily_user_installs_v2{package="com.test.app",country="US",platform_version="iOS 17",source_type="App Store"} 150 1704153600000',
                 output,
             )
             self.assertIn(
-                'appstore_daily_user_installs{package="com.test.app",country="US",platform_version="iOS 17",source_type="App Store"} 200 1704240000000',
+                'appstore_daily_user_installs_v2{package="com.test.app",country="US",platform_version="iOS 17",source_type="App Store"} 200 1704240000000',
                 output,
             )
 
