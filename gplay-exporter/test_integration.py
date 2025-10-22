@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-Integration test for Google Play Console Metrics Exporter
+Integration test for Google Play Console Metrics Exporter v3.0.0
 
 This test simulates real-world scenarios with mock GCS data to ensure
-the exporter correctly handles different aggregation strategies and
-generates proper Prometheus format with timestamps.
+the exporter correctly handles gauge metrics with date-specific keys
+and generates proper Prometheus format with timestamps.
 """
 
 import os
@@ -20,6 +20,7 @@ from unittest.mock import patch, MagicMock, Mock
 os.environ["GPLAY_EXPORTER_GOOGLE_APPLICATION_CREDENTIALS"] = "/tmp/test-creds.json"
 os.environ["GPLAY_EXPORTER_BUCKET_ID"] = "test-bucket"
 os.environ["GPLAY_EXPORTER_LOG_LEVEL"] = "WARNING"
+os.environ["GPLAY_EXPORTER_MONTHS_LOOKBACK"] = "2"  # Test with 2 months
 
 # Add the parent directory to sys.path to import the exporter
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -35,318 +36,628 @@ class TestIntegrationScenarios(unittest.TestCase):
         with exporter._metrics_lock:
             exporter._metrics_data = {}
 
-    @patch("exporter._storage_client")
-    @patch("exporter._load_credentials")
-    def test_complete_monthly_report_processing(self, mock_creds, mock_storage_client):
-        """Test processing a complete monthly report with multiple packages and countries"""
+    @patch("exporter._get_months_to_process")
+    @patch("exporter._download_csv")
+    @patch("exporter.storage.Client")
+    def test_complete_monthly_report_processing(
+        self, mock_client_class, mock_download_csv, mock_get_months
+    ):
+        """Test processing a complete monthly report with multiple dates and countries"""
 
-        # Setup mock credentials
-        mock_creds.return_value = MagicMock()
+        # Setup months to process
+        mock_get_months.return_value = ["202501"]
 
         # Setup mock storage client
         mock_client = MagicMock()
-        mock_storage_client.return_value = mock_client
+        mock_client_class.return_value = mock_client
 
-        # Mock bucket and blobs
+        # Setup bucket and blob
         mock_bucket = MagicMock()
         mock_client.bucket.return_value = mock_bucket
-
-        # Create mock CSV data for multiple days
-        csv_data = """Date,Country,Daily Device Installs,Daily Device Uninstalls,Active Device Installs,Daily User Installs,Daily User Uninstalls
-2025-01-01,US,1000,50,100000,900,45
-2025-01-01,GB,500,25,50000,450,20
-2025-01-02,US,1100,55,101000,1000,50
-2025-01-02,GB,550,30,51000,500,25
-2025-01-03,US,1200,60,102000,1100,55
-2025-01-03,GB,600,35,52000,550,30
-2025-01-04,US,1300,65,103000,1200,60
-2025-01-04,GB,650,40,53000,600,35
-2025-01-05,US,1400,70,104000,1300,65
-2025-01-05,GB,700,45,54000,650,40"""
-
-        # Setup blob mock
         mock_blob = MagicMock()
-        mock_blob.download_as_bytes.return_value = csv_data.encode("utf-8")
+        mock_blob.exists.return_value = True
         mock_bucket.blob.return_value = mock_blob
 
-        # Setup blob listing
-        blob1 = MagicMock()
-        blob1.name = "stats/installs/installs_com.example.app_202501_country.csv"
-        mock_client.list_blobs.return_value = [blob1]
+        # Create mock CSV data for multiple days
+        csv_data = [
+            {
+                "Date": "2025-01-01",
+                "Country": "US",
+                "Daily Device Installs": "1000",
+                "Daily Device Uninstalls": "50",
+                "Active Device Installs": "100000",
+                "Daily User Installs": "900",
+                "Daily User Uninstalls": "45",
+            },
+            {
+                "Date": "2025-01-01",
+                "Country": "GB",
+                "Daily Device Installs": "500",
+                "Daily Device Uninstalls": "25",
+                "Active Device Installs": "50000",
+                "Daily User Installs": "450",
+                "Daily User Uninstalls": "20",
+            },
+            {
+                "Date": "2025-01-02",
+                "Country": "US",
+                "Daily Device Installs": "1100",
+                "Daily Device Uninstalls": "55",
+                "Active Device Installs": "101000",
+                "Daily User Installs": "1000",
+                "Daily User Uninstalls": "50",
+            },
+            {
+                "Date": "2025-01-02",
+                "Country": "GB",
+                "Daily Device Installs": "550",
+                "Daily Device Uninstalls": "30",
+                "Active Device Installs": "51000",
+                "Daily User Installs": "500",
+                "Daily User Uninstalls": "25",
+            },
+            {
+                "Date": "2025-01-03",
+                "Country": "US",
+                "Daily Device Installs": "1200",
+                "Daily Device Uninstalls": "60",
+                "Active Device Installs": "102000",
+                "Daily User Installs": "1100",
+                "Daily User Uninstalls": "55",
+            },
+        ]
+
+        mock_download_csv.return_value = csv_data
 
         # Process the package
         exporter._process_package_csv(mock_client, "com.example.app")
 
-        # Verify results
+        # Verify results - each date should have its own entry
         with exporter._metrics_lock:
-            # Check US metrics
-            # Device installs should be summed: 1000+1100+1200+1300+1400 = 6000
-            self.assertEqual(
-                exporter._metrics_data["gplay_device_installs_v2"][
-                    ("com.example.app", "US")
-                ][0],
-                6000.0,
+            device_installs = exporter._metrics_data.get("gplay_device_installs_v3", {})
+            device_uninstalls = exporter._metrics_data.get(
+                "gplay_device_uninstalls_v3", {}
             )
-            # Device uninstalls should be summed: 50+55+60+65+70 = 300
-            self.assertEqual(
-                exporter._metrics_data["gplay_device_uninstalls_v2"][
-                    ("com.example.app", "US")
-                ][0],
-                300.0,
-            )
-            # Active device installs should be last value: 104000
-            self.assertEqual(
-                exporter._metrics_data["gplay_active_device_installs_v2"][
-                    ("com.example.app", "US")
-                ][0],
-                104000.0,
+            active_installs = exporter._metrics_data.get(
+                "gplay_active_device_installs_v3", {}
             )
 
-            # Check GB metrics
-            # Device installs should be summed: 500+550+600+650+700 = 3000
-            self.assertEqual(
-                exporter._metrics_data["gplay_device_installs_v2"][
-                    ("com.example.app", "GB")
-                ][0],
-                3000.0,
-            )
-            # Active device installs should be last value: 54000
-            self.assertEqual(
-                exporter._metrics_data["gplay_active_device_installs_v2"][
-                    ("com.example.app", "GB")
-                ][0],
-                54000.0,
-            )
+            # Check that we have entries for each date
+            # US entries
+            self.assertIn(("com.example.app", "US", "2025-01-01"), device_installs)
+            self.assertIn(("com.example.app", "US", "2025-01-02"), device_installs)
+            self.assertIn(("com.example.app", "US", "2025-01-03"), device_installs)
 
-            # Check timestamp (should be from 2025-01-05)
-            expected_timestamp = int(dt.datetime(2025, 1, 5).timestamp() * 1000)
+            # GB entries
+            self.assertIn(("com.example.app", "GB", "2025-01-01"), device_installs)
+            self.assertIn(("com.example.app", "GB", "2025-01-02"), device_installs)
+
+            # Check values are individual (not summed)
             self.assertEqual(
-                exporter._metrics_data["gplay_device_installs_v2"][
-                    ("com.example.app", "US")
-                ][1],
-                expected_timestamp,
+                device_installs[("com.example.app", "US", "2025-01-01")][0], 1000.0
+            )
+            self.assertEqual(
+                device_installs[("com.example.app", "US", "2025-01-02")][0], 1100.0
+            )
+            self.assertEqual(
+                device_installs[("com.example.app", "US", "2025-01-03")][0], 1200.0
             )
 
-    @patch("exporter._storage_client")
-    @patch("exporter._load_credentials")
-    def test_retroactive_data_addition(self, mock_creds, mock_storage_client):
-        """Test scenario where data is added retroactively for multiple days"""
+            # Check active installs (no longer using last value, each date has its own)
+            self.assertEqual(
+                active_installs[("com.example.app", "US", "2025-01-01")][0], 100000.0
+            )
+            self.assertEqual(
+                active_installs[("com.example.app", "US", "2025-01-02")][0], 101000.0
+            )
+            self.assertEqual(
+                active_installs[("com.example.app", "US", "2025-01-03")][0], 102000.0
+            )
 
-        # This simulates the problem v1 had where it would only capture the last day
-        # v2 should capture all days correctly
+            # Check timestamps are date-specific
+            timestamp_jan1 = int(dt.datetime(2025, 1, 1).timestamp() * 1000)
+            timestamp_jan2 = int(dt.datetime(2025, 1, 2).timestamp() * 1000)
+            timestamp_jan3 = int(dt.datetime(2025, 1, 3).timestamp() * 1000)
 
-        mock_creds.return_value = MagicMock()
+            self.assertEqual(
+                device_installs[("com.example.app", "US", "2025-01-01")][1],
+                timestamp_jan1,
+            )
+            self.assertEqual(
+                device_installs[("com.example.app", "US", "2025-01-02")][1],
+                timestamp_jan2,
+            )
+            self.assertEqual(
+                device_installs[("com.example.app", "US", "2025-01-03")][1],
+                timestamp_jan3,
+            )
+
+    @patch("exporter._get_months_to_process")
+    @patch("exporter._download_csv")
+    @patch("exporter.storage.Client")
+    def test_multiple_months_lookback(
+        self, mock_client_class, mock_download_csv, mock_get_months
+    ):
+        """Test processing multiple months with MONTHS_LOOKBACK"""
+
+        # Setup months to process (2 months)
+        mock_get_months.return_value = ["202501", "202412"]
+
+        # Setup mock storage client
         mock_client = MagicMock()
-        mock_storage_client.return_value = mock_client
+        mock_client_class.return_value = mock_client
         mock_bucket = MagicMock()
         mock_client.bucket.return_value = mock_bucket
 
-        # Simulate a report where days 10-15 were just added all at once
-        csv_data = """Date,Country,Daily Device Installs,Daily Device Uninstalls,Active Device Installs,Daily User Installs,Daily User Uninstalls
-2025-01-10,US,100,10,90000,90,9
-2025-01-11,US,110,11,91000,100,10
-2025-01-12,US,120,12,92000,110,11
-2025-01-13,US,130,13,93000,120,12
-2025-01-14,US,140,14,94000,130,13
-2025-01-15,US,150,15,95000,140,14"""
+        # Setup blob mocks for two different months
+        mock_blob_jan = MagicMock()
+        mock_blob_jan.exists.return_value = True
+        mock_blob_dec = MagicMock()
+        mock_blob_dec.exists.return_value = True
 
-        mock_blob = MagicMock()
-        mock_blob.download_as_bytes.return_value = csv_data.encode("utf-8")
-        mock_bucket.blob.return_value = mock_blob
+        # Return different blob objects based on the requested month
+        def get_blob(name):
+            if "202501" in name:
+                return mock_blob_jan
+            elif "202412" in name:
+                return mock_blob_dec
+            return MagicMock()
 
-        blob1 = MagicMock()
-        blob1.name = "stats/installs/installs_com.retroactive.app_202501_country.csv"
-        mock_client.list_blobs.return_value = [blob1]
+        mock_bucket.blob.side_effect = get_blob
 
-        exporter._process_package_csv(mock_client, "com.retroactive.app")
+        # Mock CSV data for different months
+        csv_data_jan = [
+            {
+                "Date": "2025-01-15",
+                "Country": "US",
+                "Daily Device Installs": "2000",
+                "Daily Device Uninstalls": "100",
+                "Active Device Installs": "150000",
+                "Daily User Installs": "1800",
+                "Daily User Uninstalls": "90",
+            }
+        ]
 
+        csv_data_dec = [
+            {
+                "Date": "2024-12-15",
+                "Country": "US",
+                "Daily Device Installs": "1500",
+                "Daily Device Uninstalls": "75",
+                "Active Device Installs": "140000",
+                "Daily User Installs": "1350",
+                "Daily User Uninstalls": "70",
+            }
+        ]
+
+        # Return different CSV data based on call order
+        mock_download_csv.side_effect = [csv_data_jan, csv_data_dec]
+
+        # Process the package
+        exporter._process_package_csv(mock_client, "com.multimonth.app")
+
+        # Verify both months' data are present
         with exporter._metrics_lock:
-            # v1 would only capture 150 (last day)
-            # v2 should capture 100+110+120+130+140+150 = 750
+            device_installs = exporter._metrics_data.get("gplay_device_installs_v3", {})
+
+            # Check January data
+            self.assertIn(("com.multimonth.app", "US", "2025-01-15"), device_installs)
             self.assertEqual(
-                exporter._metrics_data["gplay_device_installs_v2"][
-                    ("com.retroactive.app", "US")
-                ][0],
-                750.0,
-            )
-            # Active installs should be only the last value: 95000
-            self.assertEqual(
-                exporter._metrics_data["gplay_active_device_installs_v2"][
-                    ("com.retroactive.app", "US")
-                ][0],
-                95000.0,
+                device_installs[("com.multimonth.app", "US", "2025-01-15")][0], 2000.0
             )
 
-    def test_prometheus_format_with_real_data(self):
-        """Test that Prometheus format is correctly generated with timestamps"""
+            # Check December data
+            self.assertIn(("com.multimonth.app", "US", "2024-12-15"), device_installs)
+            self.assertEqual(
+                device_installs[("com.multimonth.app", "US", "2024-12-15")][0], 1500.0
+            )
 
-        # Simulate real metric data
-        test_timestamp = int(dt.datetime(2025, 1, 15).timestamp() * 1000)
+    def test_prometheus_format_with_date_keys(self):
+        """Test that Prometheus format is correctly generated with date-based entries"""
+
+        # Simulate metric data with different dates
+        timestamp_jan1 = int(dt.datetime(2025, 1, 1).timestamp() * 1000)
+        timestamp_jan2 = int(dt.datetime(2025, 1, 2).timestamp() * 1000)
+        timestamp_jan3 = int(dt.datetime(2025, 1, 3).timestamp() * 1000)
 
         with exporter._metrics_lock:
             exporter._metrics_data = {
-                "gplay_device_installs_v2": {
-                    ("com.app1", "US"): (5000.0, test_timestamp),
-                    ("com.app1", "GB"): (2000.0, test_timestamp),
-                    ("com.app2", "US"): (3000.0, test_timestamp),
+                "gplay_device_installs_v3": {
+                    ("com.app1", "US", "2025-01-01"): (1000.0, timestamp_jan1),
+                    ("com.app1", "US", "2025-01-02"): (1100.0, timestamp_jan2),
+                    ("com.app1", "US", "2025-01-03"): (1200.0, timestamp_jan3),
+                    ("com.app1", "GB", "2025-01-01"): (500.0, timestamp_jan1),
                 },
-                "gplay_device_uninstalls_v2": {
-                    ("com.app1", "US"): (250.0, test_timestamp),
-                    ("com.app1", "GB"): (100.0, test_timestamp),
+                "gplay_device_uninstalls_v3": {
+                    ("com.app1", "US", "2025-01-01"): (50.0, timestamp_jan1),
+                    ("com.app1", "US", "2025-01-02"): (55.0, timestamp_jan2),
                 },
-                "gplay_active_device_installs_v2": {
-                    ("com.app1", "US"): (95000.0, test_timestamp),
-                    ("com.app1", "GB"): (45000.0, test_timestamp),
-                    ("com.app2", "US"): (120000.0, test_timestamp),
+                "gplay_active_device_installs_v3": {
+                    ("com.app1", "US", "2025-01-01"): (100000.0, timestamp_jan1),
+                    ("com.app1", "US", "2025-01-02"): (101000.0, timestamp_jan2),
+                    ("com.app1", "US", "2025-01-03"): (102000.0, timestamp_jan3),
                 },
-                "gplay_user_installs_v2": {
-                    ("com.app1", "US"): (4500.0, test_timestamp),
-                    ("com.app1", "GB"): (
+                "gplay_user_installs_v3": {
+                    ("com.app1", "US", "2025-01-01"): (900.0, timestamp_jan1),
+                    ("com.app1", "US", "2025-01-02"): (
                         0.0,
-                        test_timestamp,
+                        timestamp_jan2,
                     ),  # Zero value should be filtered
                 },
-                "gplay_user_uninstalls_v2": {
-                    ("com.app1", "US"): (200.0, test_timestamp),
-                    ("com.app1", "GB"): (80.0, test_timestamp),
+                "gplay_user_uninstalls_v3": {
+                    ("com.app1", "US", "2025-01-01"): (45.0, timestamp_jan1),
                 },
             }
 
         output = exporter._format_prometheus_output()
 
-        # Check format includes timestamps
-        lines = output.split("\n")
+        # Check format includes gauge type (not counter)
+        self.assertIn("# TYPE gplay_device_installs_v3 gauge", output)
+        self.assertIn("# TYPE gplay_active_device_installs_v3 gauge", output)
 
-        # Verify HELP and TYPE lines exist
-        self.assertIn("# HELP gplay_device_installs_v2", output)
-        self.assertIn("# TYPE gplay_device_installs_v2 counter", output)
-        self.assertIn("# HELP gplay_active_device_installs_v2", output)
-        self.assertIn("# TYPE gplay_active_device_installs_v2 counter", output)
-
-        # Verify metric lines with timestamps
+        # Verify metric lines with proper timestamps for each date
         self.assertIn(
-            f'gplay_device_installs_v2{{package="com.app1",country="US"}} 5000.0 {test_timestamp}',
+            f'gplay_device_installs_v3{{package="com.app1",country="US"}} 1000.0 {timestamp_jan1}',
             output,
         )
         self.assertIn(
-            f'gplay_device_installs_v2{{package="com.app1",country="GB"}} 2000.0 {test_timestamp}',
+            f'gplay_device_installs_v3{{package="com.app1",country="US"}} 1100.0 {timestamp_jan2}',
             output,
         )
         self.assertIn(
-            f'gplay_active_device_installs_v2{{package="com.app1",country="US"}} 95000.0 {test_timestamp}',
+            f'gplay_device_installs_v3{{package="com.app1",country="US"}} 1200.0 {timestamp_jan3}',
+            output,
+        )
+
+        # Verify active installs have individual entries per date
+        self.assertIn(
+            f'gplay_active_device_installs_v3{{package="com.app1",country="US"}} 100000.0 {timestamp_jan1}',
+            output,
+        )
+        self.assertIn(
+            f'gplay_active_device_installs_v3{{package="com.app1",country="US"}} 101000.0 {timestamp_jan2}',
+            output,
+        )
+        self.assertIn(
+            f'gplay_active_device_installs_v3{{package="com.app1",country="US"}} 102000.0 {timestamp_jan3}',
             output,
         )
 
         # Verify zero values are filtered
-        self.assertNotIn(
-            'gplay_user_installs_v2{package="com.app1",country="GB"}', output
-        )
+        self.assertNotIn("900.0 " + str(timestamp_jan2), output)
 
-        # Verify all metrics have timestamps
-        for line in lines:
-            if line and not line.startswith("#") and line.strip():
-                # Each metric line should end with a timestamp
-                self.assertTrue(
-                    line.strip().endswith(str(test_timestamp)),
-                    f"Line missing timestamp: {line}",
-                )
+        # Count total metric lines (excluding comments and empty lines)
+        metric_lines = [
+            line.strip()
+            for line in output.split("\n")
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
+        # Should have 11 metric lines (12 total - 1 zero value filtered)
+        self.assertEqual(len(metric_lines), 11)
 
     @patch("exporter._storage_client")
-    @patch("exporter._load_credentials")
-    def test_multiple_packages_processing(self, mock_creds, mock_storage_client):
-        """Test processing multiple packages in a single collection cycle"""
+    def test_metrics_cleared_on_collection(self, mock_storage_client):
+        """Test that metrics are completely cleared on each collection cycle"""
 
-        mock_creds.return_value = MagicMock()
+        # Setup initial metrics (old data)
+        with exporter._metrics_lock:
+            exporter._metrics_data = {
+                "gplay_device_installs_v3": {
+                    ("com.old.app", "US", "2025-01-10"): (5000.0, 1736553600000),
+                    ("com.old.app", "GB", "2025-01-10"): (2000.0, 1736553600000),
+                },
+                "gplay_active_device_installs_v3": {
+                    ("com.old.app", "US", "2025-01-10"): (100000.0, 1736553600000),
+                },
+            }
+
+        # Verify old metrics exist
+        with exporter._metrics_lock:
+            self.assertEqual(len(exporter._metrics_data), 2)
+            self.assertIn("gplay_device_installs_v3", exporter._metrics_data)
+
+        # Mock storage client for collection
         mock_client = MagicMock()
-        mock_storage_client.return_value = mock_client
+        mock_client.list_blobs.return_value = []  # No packages found
+
+        with patch("exporter._discover_packages_from_gcs") as mock_discover:
+            mock_discover.return_value = set()  # No packages
+
+            # Run collection
+            exporter._run_metrics_collection()
+
+        # Verify all metrics were cleared
+        with exporter._metrics_lock:
+            self.assertEqual(len(exporter._metrics_data), 0)
+
+    @patch("exporter._get_months_to_process")
+    @patch("exporter._download_csv")
+    @patch("exporter.storage.Client")
+    def test_multiple_packages_with_dates(
+        self, mock_client_class, mock_download_csv, mock_get_months
+    ):
+        """Test processing multiple packages where each has date-specific metrics"""
+
+        mock_get_months.return_value = ["202501"]
+
+        mock_client = MagicMock()
+        mock_client_class.return_value = mock_client
 
         # Mock discovery of multiple packages
         blob1 = Mock()
         blob1.name = "stats/installs/installs_com.app1_202501_country.csv"
         blob2 = Mock()
         blob2.name = "stats/installs/installs_com.app2_202501_country.csv"
-        blob3 = Mock()
-        blob3.name = (
-            "stats/installs/installs_com.app3_202501_overview.csv"  # Should be ignored
-        )
-        discovery_blobs = [blob1, blob2, blob3]
 
-        mock_client.list_blobs.side_effect = [
-            discovery_blobs,  # For package discovery
-            [discovery_blobs[0]],  # For app1 processing
-            [discovery_blobs[1]],  # For app2 processing
+        mock_client.list_blobs.return_value = [blob1, blob2]
+
+        # Mock bucket and blob
+        mock_bucket = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        mock_blob = MagicMock()
+        mock_blob.exists.return_value = True
+        mock_bucket.blob.return_value = mock_blob
+
+        # Mock CSV data for each package
+        csv_app1 = [
+            {
+                "Date": "2025-01-20",
+                "Country": "US",
+                "Daily Device Installs": "1000",
+                "Daily Device Uninstalls": "50",
+                "Active Device Installs": "100000",
+                "Daily User Installs": "900",
+                "Daily User Uninstalls": "45",
+            },
+            {
+                "Date": "2025-01-21",
+                "Country": "US",
+                "Daily Device Installs": "1100",
+                "Daily Device Uninstalls": "55",
+                "Active Device Installs": "101000",
+                "Daily User Installs": "990",
+                "Daily User Uninstalls": "50",
+            },
         ]
+
+        csv_app2 = [
+            {
+                "Date": "2025-01-20",
+                "Country": "FR",
+                "Daily Device Installs": "800",
+                "Daily Device Uninstalls": "40",
+                "Active Device Installs": "80000",
+                "Daily User Installs": "720",
+                "Daily User Uninstalls": "36",
+            }
+        ]
+
+        mock_download_csv.side_effect = [csv_app1, csv_app2]
 
         # Discover packages
         packages = exporter._discover_packages_from_gcs(mock_client)
-        self.assertEqual(packages, {"com.app1", "com.app2", "com.app3"})
+        self.assertEqual(packages, {"com.app1", "com.app2"})
 
-        # Mock CSV data for each package
-        csv_app1 = """Date,Country,Daily Device Installs,Daily Device Uninstalls,Active Device Installs,Daily User Installs,Daily User Uninstalls
-2025-01-20,US,1000,50,100000,900,45
-2025-01-20,GB,500,25,50000,450,20"""
-
-        csv_app2 = """Date,Country,Daily Device Installs,Daily Device Uninstalls,Active Device Installs,Daily User Installs,Daily User Uninstalls
-2025-01-20,US,2000,100,200000,1800,90
-2025-01-20,FR,800,40,80000,720,36"""
-
-        mock_bucket = MagicMock()
-        mock_client.bucket.return_value = mock_bucket
-
-        mock_blob = MagicMock()
-        mock_blob.download_as_bytes.side_effect = [
-            csv_app1.encode("utf-8"),
-            csv_app2.encode("utf-8"),
-        ]
-        mock_bucket.blob.return_value = mock_blob
-
-        # Process only packages with country CSV files (app1 and app2)
-        for package in ["com.app1", "com.app2"]:
+        # Process packages
+        for package in sorted(packages):
             exporter._process_package_csv(mock_client, package)
 
-        # Verify both packages have metrics
+        # Verify metrics for both packages with date-specific entries
         with exporter._metrics_lock:
-            # Check app1 metrics exist
-            self.assertIn(
-                ("com.app1", "US"), exporter._metrics_data["gplay_device_installs_v2"]
+            device_installs = exporter._metrics_data.get("gplay_device_installs_v3", {})
+
+            # Check app1 metrics (2 dates)
+            self.assertIn(("com.app1", "US", "2025-01-20"), device_installs)
+            self.assertIn(("com.app1", "US", "2025-01-21"), device_installs)
+            self.assertEqual(
+                device_installs[("com.app1", "US", "2025-01-20")][0], 1000.0
             )
-            self.assertIn(
-                ("com.app1", "GB"), exporter._metrics_data["gplay_device_installs_v2"]
+            self.assertEqual(
+                device_installs[("com.app1", "US", "2025-01-21")][0], 1100.0
             )
 
-            # Check app2 metrics exist
-            self.assertIn(
-                ("com.app2", "US"), exporter._metrics_data["gplay_device_installs_v2"]
-            )
-            self.assertIn(
-                ("com.app2", "FR"), exporter._metrics_data["gplay_device_installs_v2"]
+            # Check app2 metrics
+            self.assertIn(("com.app2", "FR", "2025-01-20"), device_installs)
+            self.assertEqual(
+                device_installs[("com.app2", "FR", "2025-01-20")][0], 800.0
             )
 
-            # Verify values
-            self.assertEqual(
-                exporter._metrics_data["gplay_device_installs_v2"][("com.app1", "US")][
-                    0
-                ],
-                1000.0,
+            # Check active installs are also date-specific
+            active_installs = exporter._metrics_data.get(
+                "gplay_active_device_installs_v3", {}
             )
             self.assertEqual(
-                exporter._metrics_data["gplay_device_installs_v2"][("com.app2", "US")][
-                    0
-                ],
-                2000.0,
+                active_installs[("com.app1", "US", "2025-01-20")][0], 100000.0
             )
             self.assertEqual(
-                exporter._metrics_data["gplay_active_device_installs_v2"][
-                    ("com.app1", "US")
-                ][0],
-                100000.0,
+                active_installs[("com.app1", "US", "2025-01-21")][0], 101000.0
             )
             self.assertEqual(
-                exporter._metrics_data["gplay_active_device_installs_v2"][
-                    ("com.app2", "US")
-                ][0],
-                200000.0,
+                active_installs[("com.app2", "FR", "2025-01-20")][0], 80000.0
             )
+
+    def test_v3_no_aggregation_each_date_separate(self):
+        """Test that v3 does NOT aggregate data - each date is a separate metric"""
+
+        with exporter._metrics_lock:
+            exporter._metrics_data = {}
+
+        # Create test data with multiple dates for same country
+        test_csv_data = [
+            {
+                "Date": "2025-01-20",
+                "Country": "US",
+                "Daily Device Installs": "100",
+                "Active Device Installs": "50000",
+            },
+            {
+                "Date": "2025-01-21",
+                "Country": "US",
+                "Daily Device Installs": "200",
+                "Active Device Installs": "50100",
+            },
+            {
+                "Date": "2025-01-22",
+                "Country": "US",
+                "Daily Device Installs": "300",
+                "Active Device Installs": "50300",
+            },
+        ]
+
+        with patch("exporter._download_csv") as mock_download:
+            mock_download.return_value = test_csv_data
+
+            with patch("exporter._get_months_to_process") as mock_months:
+                mock_months.return_value = ["202501"]
+
+                mock_client = Mock()
+                mock_bucket = Mock()
+                mock_blob = Mock()
+                mock_blob.exists.return_value = True
+                mock_bucket.blob.return_value = mock_blob
+                mock_client.bucket.return_value = mock_bucket
+
+                exporter._process_package_csv(mock_client, "com.test.app")
+
+                with exporter._metrics_lock:
+                    installs = exporter._metrics_data.get(
+                        "gplay_device_installs_v3", {}
+                    )
+                    active = exporter._metrics_data.get(
+                        "gplay_active_device_installs_v3", {}
+                    )
+
+                    # Each date should have its own entry - NO aggregation
+                    self.assertEqual(len(installs), 3)  # 3 separate dates
+                    self.assertEqual(
+                        installs[("com.test.app", "US", "2025-01-20")][0], 100.0
+                    )
+                    self.assertEqual(
+                        installs[("com.test.app", "US", "2025-01-21")][0], 200.0
+                    )
+                    self.assertEqual(
+                        installs[("com.test.app", "US", "2025-01-22")][0], 300.0
+                    )
+
+                    # Active installs also separate for each date
+                    self.assertEqual(len(active), 3)
+                    self.assertEqual(
+                        active[("com.test.app", "US", "2025-01-20")][0], 50000.0
+                    )
+                    self.assertEqual(
+                        active[("com.test.app", "US", "2025-01-21")][0], 50100.0
+                    )
+                    self.assertEqual(
+                        active[("com.test.app", "US", "2025-01-22")][0], 50300.0
+                    )
+
+    def test_v3_all_metrics_are_gauges_not_counters(self):
+        """Test that all v3 metrics are declared as gauge type, not counter"""
+        output = exporter._format_prometheus_output()
+
+        # Check all metric definitions
+        for metric_name in exporter.METRIC_DEFINITIONS.keys():
+            # All should be gauge
+            self.assertIn(f"# TYPE {metric_name} gauge", output)
+            # None should be counter
+            self.assertNotIn(f"# TYPE {metric_name} counter", output)
+            # All should have v3 suffix
+            self.assertTrue(
+                metric_name.endswith("_v3"),
+                f"Metric {metric_name} should have _v3 suffix",
+            )
+
+    def test_v3_months_lookback_environment_variable(self):
+        """Test that MONTHS_LOOKBACK environment variable works correctly"""
+
+        # Save original value
+        original = exporter.MONTHS_LOOKBACK
+
+        try:
+            # Test different values
+            for lookback in [1, 3, 6, 12]:
+                exporter.MONTHS_LOOKBACK = lookback
+                months = exporter._get_months_to_process()
+
+                self.assertEqual(
+                    len(months), lookback, f"Should return {lookback} months"
+                )
+
+                # Verify format YYYYMM
+                for month in months:
+                    self.assertEqual(len(month), 6)
+                    self.assertTrue(month.isdigit())
+                    year = int(month[:4])
+                    month_num = int(month[4:])
+                    self.assertGreaterEqual(year, 2020)
+                    self.assertLessEqual(year, 2030)
+                    self.assertGreaterEqual(month_num, 1)
+                    self.assertLessEqual(month_num, 12)
+        finally:
+            exporter.MONTHS_LOOKBACK = original
+
+    def test_v3_complete_storage_refresh_on_collection(self):
+        """Test that v3 completely clears and refreshes storage on each collection"""
+
+        # Setup old metrics from previous collection
+        with exporter._metrics_lock:
+            exporter._metrics_data = {
+                "gplay_device_installs_v3": {
+                    ("com.old.app", "US", "2025-01-01"): (1000.0, 1735689600000),
+                    ("com.old.app", "GB", "2025-01-01"): (500.0, 1735689600000),
+                },
+                "gplay_active_device_installs_v3": {
+                    ("com.old.app", "US", "2025-01-01"): (100000.0, 1735689600000),
+                },
+            }
+            # Verify we have old data
+            self.assertEqual(len(exporter._metrics_data), 2)
+            total_old_metrics = sum(len(v) for v in exporter._metrics_data.values())
+            self.assertEqual(total_old_metrics, 3)
+
+        # Setup mock for new collection with different data
+        new_csv_data = [
+            {"Date": "2025-01-15", "Country": "FR", "Daily Device Installs": "2000"},
+        ]
+
+        with patch("exporter._storage_client") as mock_client_func:
+            with patch("exporter._download_csv") as mock_download:
+                with patch("exporter._get_months_to_process") as mock_months:
+                    mock_months.return_value = ["202501"]
+                    mock_download.return_value = new_csv_data
+
+                    mock_client = Mock()
+                    mock_bucket = Mock()
+                    mock_blob = Mock()
+                    mock_blob.exists.return_value = True
+                    mock_bucket.blob.return_value = mock_blob
+                    mock_client.bucket.return_value = mock_bucket
+
+                    # Mock package discovery
+                    blob1 = Mock()
+                    blob1.name = (
+                        "stats/installs/installs_com.new.app_202501_country.csv"
+                    )
+                    mock_client.list_blobs.return_value = [blob1]
+
+                    mock_client_func.return_value = mock_client
+
+                    # Run complete collection cycle
+                    exporter._run_metrics_collection()
+
+                    with exporter._metrics_lock:
+                        # Old metrics should be completely gone
+                        installs = exporter._metrics_data.get(
+                            "gplay_device_installs_v3", {}
+                        )
+
+                        # Should not have any old.app metrics
+                        for key in installs.keys():
+                            self.assertNotIn("com.old.app", key[0])
+
+                        # Should only have new.app metrics
+                        self.assertIn(("com.new.app", "FR", "2025-01-15"), installs)
 
 
 if __name__ == "__main__":

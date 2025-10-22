@@ -1,5 +1,4 @@
 ---
-
 # Copyright © 2025 Novasama Technologies GmbH
 # SPDX-License-Identifier: Apache-2.0
 
@@ -19,39 +18,90 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set_matrix.outputs.matrix }}
+      has_changes: ${{ steps.set_matrix.outputs.has_changes }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 2 # Need at least 2 commits to compare
 
-      - name: Get directories with Dockerfile
-        id: get_dirs
+      - name: Get folders with .version changes
+        id: get_changed_dirs
         run: |
-          # Find all top-level directories containing Dockerfile
-          DIRS=$(find . -mindepth 1 -maxdepth 1 -type d ! -path . | sed 's|^\./||' | grep -v '^\.' | while read d; do
-            if [ -f "$d/Dockerfile" ]; then
-              echo "$d"
-            fi
-          done)
+          # Get list of changed files in this commit
+          echo "Checking for changed files in commit ${{ github.sha }}"
 
-          # Convert output into JSON array
-          JSON=$(echo "$DIRS" | jq -R -s -c 'split("\n")[:-1]')
+          # For push events, compare with the previous commit
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # Get changed files between HEAD~1 and HEAD
+            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git diff-tree --no-commit-id --name-only -r ${{ github.sha }})
+          else
+            # Fallback for other events
+            CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r ${{ github.sha }})
+          fi
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          # Filter for .version files and extract folder names
+          CHANGED_DIRS=$(echo "$CHANGED_FILES" | grep '\.version$' | while read file; do
+            # Extract the folder name (first part of the path)
+            folder=$(echo "$file" | cut -d'/' -f1)
+            # Check if it's a top-level folder with both Dockerfile and .version
+            if [ -f "$folder/Dockerfile" ] && [ -f "$folder/.version" ]; then
+              echo "$folder"
+            fi
+          done | sort -u)
+
+          echo "Folders with .version changes:"
+          echo "$CHANGED_DIRS"
+
+          # Convert to JSON array
+          if [ -z "$CHANGED_DIRS" ]; then
+            JSON="[]"
+          else
+            JSON=$(echo "$CHANGED_DIRS" | jq -R -s -c 'split("\n")[:-1]')
+          fi
+
           echo "dirs=$JSON" >> $GITHUB_OUTPUT
 
-      - name: Debug directories JSON
-        run: echo "DIRS_OUTPUT = ${{ steps.get_dirs.outputs.dirs }}"
+      - name: Debug changed directories
+        run: |
+          echo "Changed directories with .version: ${{ steps.get_changed_dirs.outputs.dirs }}"
 
       - name: Set matrix
         id: set_matrix
         run: |
-          # Wrap it into {"folders": [...]} format
-          MATRIX_JSON=$(jq -c -n --argjson arr '${{ steps.get_dirs.outputs.dirs }}' '{folders: $arr}')
-          echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+          DIRS='${{ steps.get_changed_dirs.outputs.dirs }}'
 
-      - name: Debug matrix
-        run: echo "MATRIX_OUTPUT = ${{ steps.set_matrix.outputs.matrix }}"
+          # Check if we have any directories to build
+          if [ "$DIRS" = "[]" ] || [ -z "$DIRS" ]; then
+            echo "No folders with .version changes found"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "matrix={\"folders\":[]}" >> $GITHUB_OUTPUT
+          else
+            echo "Found folders with .version changes"
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            # Wrap it into {"folders": [...]} format
+            MATRIX_JSON=$(jq -c -n --argjson arr "$DIRS" '{folders: $arr}')
+            echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.set_matrix.outputs.has_changes }}" = "true" ]; then
+            echo "### 🐳 Docker images to build" >> $GITHUB_STEP_SUMMARY
+            echo "${{ steps.get_changed_dirs.outputs.dirs }}" | jq -r '.[]' | while read dir; do
+              echo "- $dir" >> $GITHUB_STEP_SUMMARY
+            done
+          else
+            echo "### ℹ️ No .version files changed" >> $GITHUB_STEP_SUMMARY
+            echo "No Docker images will be built in this run." >> $GITHUB_STEP_SUMMARY
+          fi
 
   build_and_push:
     needs: prepare
+    if: needs.prepare.outputs.has_changes == 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -79,6 +129,7 @@ jobs:
           # Read the first non-empty line from .version, remove leading/trailing whitespace
           VERSION=$(sed '/^[[:space:]]*$/d' "${{ matrix.folder }}/.version" | head -n 1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building ${{ matrix.folder }} version $VERSION"
 
       - name: Extract metadata (tags, labels)
         id: meta

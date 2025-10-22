@@ -8,8 +8,8 @@
 Google Play Console Metrics Exporter
 
 This exporter fetches monthly statistics from Google Play Console CSV reports
-stored in Google Cloud Storage and exposes them as Prometheus counter metrics
-with proper timestamp support.
+stored in Google Cloud Storage and exposes them as Prometheus gauge metrics
+with proper timestamp support for each individual date.
 """
 
 import os
@@ -53,6 +53,9 @@ COLLECTION_INTERVAL = int(
 )  # default 12h
 GCS_PROJECT = os.environ.get("GPLAY_EXPORTER_GCS_PROJECT")
 TEST_MODE = os.environ.get("GPLAY_EXPORTER_TEST_MODE")
+MONTHS_LOOKBACK = int(
+    os.environ.get("GPLAY_EXPORTER_MONTHS_LOOKBACK", "1")
+)  # default 1 month
 
 # ------------ Health check state ------------
 # Simple health tracking - service is healthy after first successful collection
@@ -66,162 +69,164 @@ _health_status = {
 
 # ------------ Metrics storage ------------
 # Store metrics data with timestamps
+# Key format: {metric_name: {(package, country, date_str): (value, timestamp_ms)}}
 _metrics_lock = threading.Lock()
-_metrics_data = {}  # Format: {metric_name: {(package, country): (value, timestamp_ms)}}
+_metrics_data = {}
 
-# Metric definitions with aggregation strategy
+# Metric definitions - all metrics are now gauges
 METRIC_DEFINITIONS = {
-    "gplay_device_installs_v2": {
-        "help": "Device installs by country from Google Play Console",
-        "type": "counter",
+    "gplay_device_installs_v3": {
+        "help": "Device installs by country and date from Google Play Console",
+        "type": "gauge",
         "csv_column": "Daily Device Installs",
-        "aggregation": "sum",  # Sum all days in the month
     },
-    "gplay_device_uninstalls_v2": {
-        "help": "Device uninstalls by country from Google Play Console",
-        "type": "counter",
+    "gplay_device_uninstalls_v3": {
+        "help": "Device uninstalls by country and date from Google Play Console",
+        "type": "gauge",
         "csv_column": "Daily Device Uninstalls",
-        "aggregation": "sum",  # Sum all days in the month
     },
-    "gplay_active_device_installs_v2": {
-        "help": "Active device installs by country from Google Play Console",
-        "type": "counter",
+    "gplay_active_device_installs_v3": {
+        "help": "Active device installs by country and date from Google Play Console",
+        "type": "gauge",
         "csv_column": "Active Device Installs",
-        "aggregation": "last",  # Take last value (absolute/cumulative metric)
     },
-    "gplay_user_installs_v2": {
-        "help": "User installs by country from Google Play Console",
-        "type": "counter",
+    "gplay_user_installs_v3": {
+        "help": "User installs by country and date from Google Play Console",
+        "type": "gauge",
         "csv_column": "Daily User Installs",
-        "aggregation": "sum",  # Sum all days in the month
     },
-    "gplay_user_uninstalls_v2": {
-        "help": "User uninstalls by country from Google Play Console",
-        "type": "counter",
+    "gplay_user_uninstalls_v3": {
+        "help": "User uninstalls by country and date from Google Play Console",
+        "type": "gauge",
         "csv_column": "Daily User Uninstalls",
-        "aggregation": "sum",  # Sum all days in the month
     },
 }
 
 
 # ------------ Health check functions ------------
-def _update_health_status(success: bool, error: Optional[str] = None):
+
+
+def _update_health_status(
+    error: Optional[Exception] = None, collection_done: bool = False
+):
     """
-    Update the health status of the service.
+    Update the health status of the exporter.
 
     Args:
-        success: Whether the last collection was successful
-        error: Optional error message if collection failed
+        error: Exception if collection failed, None if successful
+        collection_done: True if collection cycle completed (success or failure)
     """
     with _health_lock:
-        _health_status["last_collection_time"] = dt.datetime.now()
+        if collection_done:
+            _health_status["last_collection_time"] = dt.datetime.utcnow().isoformat()
 
-        if success:
-            # Once healthy, always healthy (cached metrics can still be served)
-            _health_status["healthy"] = True
-            _health_status["first_collection_done"] = True
-            _health_status["last_error"] = None
-            LOG.debug("Health status updated: healthy")
-        else:
-            _health_status["last_error"] = error
-            # Only mark as unhealthy if no successful collection has been done yet
-            if not _health_status["first_collection_done"]:
-                _health_status["healthy"] = False
-                LOG.debug(
-                    "Health status updated: not healthy (no successful collections yet)"
-                )
+            if error is None:
+                # Successful collection
+                _health_status["healthy"] = True
+                _health_status["first_collection_done"] = True
+                _health_status["last_error"] = None
+                LOG.debug("Health status: healthy after successful collection")
             else:
-                LOG.debug(
-                    "Health status: remaining healthy despite error (serving cached metrics)"
-                )
+                # Failed collection
+                _health_status["last_error"] = str(error)
+                # Stay healthy if we've had at least one successful collection
+                if _health_status["first_collection_done"]:
+                    LOG.debug("Health status: staying healthy despite error: %s", error)
+                else:
+                    _health_status["healthy"] = False
+                    LOG.debug(
+                        "Health status: not healthy, first collection failed: %s",
+                        error,
+                    )
 
 
 def _is_healthy() -> bool:
-    """Check if the service is healthy."""
+    """Check if the exporter is healthy."""
     with _health_lock:
-        return _health_status["healthy"]
+        return _health_status.get("healthy", False)
 
 
-# ------------ Metric formatting functions ------------
+# ------------ Prometheus format generation ------------
 def _format_prometheus_output() -> str:
     """
-    Format metrics data as Prometheus text format with timestamps.
+    Manually generate Prometheus text exposition format with timestamps.
 
     Returns:
-        String in Prometheus text exposition format
+        String in Prometheus text format with inline timestamps (milliseconds)
     """
-    lines = []
+    output_lines = []
 
     with _metrics_lock:
-        # Group metrics by name for proper formatting
+        # Generate output for each metric type
         for metric_name, metric_info in METRIC_DEFINITIONS.items():
             # Add HELP and TYPE lines
-            lines.append(f"# HELP {metric_name} {metric_info['help']}")
-            lines.append(f"# TYPE {metric_name} {metric_info['type']}")
+            output_lines.append(f"# HELP {metric_name} {metric_info['help']}")
+            output_lines.append(f"# TYPE {metric_name} {metric_info['type']}")
 
-            # Add metric values if they exist
+            # Add metric values if present
             if metric_name in _metrics_data:
-                for (package, country), (value, timestamp_ms) in _metrics_data[
-                    metric_name
-                ].items():
-                    # Skip zero values to avoid empty series
+                for (package, country, date_str), (value, timestamp_ms) in sorted(
+                    _metrics_data[metric_name].items()
+                ):
+                    # Skip zero and negative values
                     if value <= 0:
                         continue
 
                     # Format: metric_name{label1="value1",label2="value2"} value timestamp
-                    labels = f'package="{package}",country="{country}"'
-                    lines.append(f"{metric_name}{{{labels}}} {value} {timestamp_ms}")
+                    output_lines.append(
+                        f'{metric_name}{{package="{package}",country="{country}"}} {value} {timestamp_ms}'
+                    )
 
-    # Add empty line at the end
-    lines.append("")
-    return "\n".join(lines)
+    # Join with newlines and add final newline
+    return "\n".join(output_lines) + "\n"
 
 
 # ------------ Google Cloud Storage functions ------------
-def _load_credentials():
+
+
+def _load_credentials() -> service_account.Credentials:
     """
-    Load Google Cloud credentials from service account file.
+    Load Google Cloud credentials from the JSON file.
 
     Returns:
-        Service account credentials object
-    """
-    if not os.path.exists(GOOGLE_CREDS):
-        raise FileNotFoundError(f"Credentials file not found: {GOOGLE_CREDS}")
+        Google service account credentials
 
+    Raises:
+        Exception if credentials cannot be loaded
+    """
     try:
-        creds = service_account.Credentials.from_service_account_file(
-            GOOGLE_CREDS, scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        credentials = service_account.Credentials.from_service_account_file(
+            GOOGLE_CREDS
         )
-        return creds
+        LOG.debug("Loaded credentials from %s", GOOGLE_CREDS)
+        return credentials
     except Exception as e:
-        LOG.error("Failed to load credentials: %s", e)
+        LOG.error("Failed to load credentials from %s: %s", GOOGLE_CREDS, e)
         raise
 
 
 def _storage_client() -> storage.Client:
     """
-    Create and return a Google Cloud Storage client.
+    Create a Google Cloud Storage client with credentials.
 
     Returns:
-        Configured GCS client
+        Configured storage client
     """
-    creds = _load_credentials()
-    client = storage.Client(credentials=creds, project=GCS_PROJECT)
-    return client
+    credentials = _load_credentials()
+    return storage.Client(credentials=credentials, project=GCS_PROJECT)
 
 
-# Regex patterns for parsing GCS blob names
-_pkg_regex = re.compile(
-    r"^stats/installs/installs_(?P<pkg>[^_]+)_(?P<yyyymm>\d{6})_(country|overview)\.csv$"
-)
+# ------------ CSV discovery and parsing ------------
+# Precompile regex for package discovery from file names
+# Format: installs_<package>_<YYYYMM>_country.csv
 _country_regex = re.compile(
-    r"^stats/installs/installs_(?P<pkg>[^_]+)_(?P<yyyymm>\d{6})_country\.csv$"
+    r"^stats/installs/installs_(?P<pkg>[\w\.]+)_(?P<date>\d{6})_country\.csv$"
 )
 
 
-def _discover_packages_from_gcs(client) -> Set[str]:
+def _discover_packages_from_gcs(client: storage.Client) -> Set[str]:
     """
-    Discover all unique package names from GCS bucket.
+    Discover all Android packages from Google Cloud Storage bucket.
 
     Args:
         client: Google Cloud Storage client
@@ -229,245 +234,216 @@ def _discover_packages_from_gcs(client) -> Set[str]:
     Returns:
         Set of discovered package names
     """
-    prefix = "stats/installs/"
-    blobs = client.list_blobs(BUCKET_ID, prefix=prefix)
-
     packages = set()
-    for blob in blobs:
-        m = _pkg_regex.match(blob.name)
+    prefix = "stats/installs/"
+
+    for blob in client.list_blobs(BUCKET_ID, prefix=prefix):
+        m = _country_regex.match(blob.name)
         if m:
             packages.add(m.group("pkg"))
 
     LOG.info("Discovered %d packages in GCS", len(packages))
+    if packages:
+        LOG.debug("Packages: %s", sorted(packages))
+
     return packages
 
 
 def _discover_packages() -> Set[str]:
     """
-    Main package discovery function.
+    Discover packages with error handling.
 
     Returns:
-        Set of package names to process
+        Set of package names, empty set on error
     """
     try:
         client = _storage_client()
-        packages = _discover_packages_from_gcs(client)
-
-        if not packages:
-            LOG.warning("No packages discovered from GCS")
-            return set()
-
-        return packages
-
+        return _discover_packages_from_gcs(client)
     except Exception as e:
-        LOG.exception("Package discovery failed: %s", e)
+        LOG.error("Failed to discover packages: %s", e)
         return set()
 
 
 def _parse_date(date_str: str) -> Optional[dt.date]:
     """
-    Parse various date formats found in CSV files.
+    Parse date string from CSV to date object.
 
     Args:
-        date_str: Date string to parse
+        date_str: Date string in format "yyyy-MM-dd"
 
     Returns:
-        Parsed date object or None if parsing fails
+        Date object or None if parsing fails
     """
     if not date_str or not date_str.strip():
         return None
 
-    # Try different date formats
-    for fmt in ["%Y-%m-%d", "%d-%b-%Y", "%m/%d/%Y"]:
+    date_str = date_str.strip()
+
+    # Try common date formats
+    for fmt in ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"]:
         try:
-            return dt.datetime.strptime(date_str.strip(), fmt).date()
+            return dt.datetime.strptime(date_str, fmt).date()
         except ValueError:
             continue
 
-    LOG.debug("Could not parse date: %s", date_str)
+    # If no format matches, log and return None
+    LOG.debug("Unable to parse date: '%s'", date_str)
     return None
 
 
-def _extract_number(s: str) -> float:
+def _extract_number(value: str) -> float:
     """
-    Extract numeric value from string, handling commas and decimals.
+    Extract numeric value from string, handling various formats.
 
     Args:
-        s: String containing a number
+        value: String potentially containing a number
 
     Returns:
-        Extracted float value or 0.0 if extraction fails
+        Float value or 0.0 if extraction fails
     """
-    if not s or not s.strip():
+    if not value:
         return 0.0
+
+    # Remove thousand separators and normalize decimal separator
+    value = value.replace(",", "").replace(" ", "").strip()
+
+    # Handle negative numbers in parentheses
+    if value.startswith("(") and value.endswith(")"):
+        value = "-" + value[1:-1]
 
     try:
-        # Remove commas and convert to float
-        cleaned = s.replace(",", "").strip()
-        return float(cleaned)
-    except (ValueError, AttributeError):
-        LOG.debug("Could not extract number from: %s", s)
+        return float(value)
+    except (ValueError, TypeError):
+        LOG.debug("Unable to extract number from: '%s'", value)
         return 0.0
 
 
-def _download_csv(client: storage.Client, blob_name: str) -> List[dict]:
+def _download_csv(client: storage.Client, blob_name: str) -> List[Dict]:
     """
-    Download and parse CSV file from GCS with automatic encoding detection.
+    Download and parse a CSV file from Google Cloud Storage.
 
     Args:
         client: Google Cloud Storage client
-        blob_name: Name of the blob to download
+        blob_name: Full path to the blob in the bucket
 
     Returns:
-        List of dicts representing CSV rows
+        List of dictionaries representing CSV rows
     """
-    # Download blob content
-    data = client.bucket(BUCKET_ID).blob(blob_name).download_as_bytes()
+    bucket = client.bucket(BUCKET_ID)
+    blob = bucket.blob(blob_name)
 
-    # Try different encodings (Play Console uses UTF-16)
-    text = None
-    for enc in ("utf-16", "utf-16le", "utf-8-sig", "utf-8"):
+    # Try different encodings
+    encodings = ["utf-16", "utf-8", "latin-1", "cp1252"]
+    content = blob.download_as_bytes()
+
+    for encoding in encodings:
         try:
-            text = data.decode(enc)
-            break
-        except UnicodeDecodeError:
+            text = content.decode(encoding)
+
+            # Use csv.DictReader to parse
+            reader = csv.DictReader(io.StringIO(text))
+            rows = list(reader)
+
+            LOG.debug(
+                "Successfully decoded %s with %s encoding (%d rows)",
+                blob_name,
+                encoding,
+                len(rows),
+            )
+            return rows
+
+        except (UnicodeDecodeError, csv.Error) as e:
+            LOG.debug("Failed to decode %s with %s: %s", blob_name, encoding, e)
             continue
 
-    if text is None:
-        raise UnicodeDecodeError("unknown", b"", 0, 0, "Could not decode CSV")
+    # If all encodings fail, return empty list
+    LOG.error("Failed to decode CSV %s with any encoding", blob_name)
+    return []
 
-    # Normalize line endings
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    # Parse CSV
-    reader = csv.DictReader(io.StringIO(text))
-    # Strip whitespace from keys and values
-    rows = [
-        {(k or "").strip(): (v or "").strip() for k, v in r.items()} for r in reader
-    ]
+def _get_months_to_process() -> List[str]:
+    """
+    Get list of YYYYMM strings for the months to process based on MONTHS_LOOKBACK.
 
-    # Log available columns for debugging
-    if rows and LOG.isEnabledFor(logging.DEBUG):
-        LOG.debug("Available columns in %s: %s", blob_name, list(rows[0].keys()))
+    Returns:
+        List of YYYYMM strings to process
+    """
+    months = []
+    now = dt.datetime.utcnow()
 
-    return rows
+    for i in range(MONTHS_LOOKBACK):
+        # Calculate the target month (current month minus i)
+        month_offset = now.month - i
+        year_offset = 0
+
+        while month_offset <= 0:
+            month_offset += 12
+            year_offset += 1
+
+        target_date = dt.date(now.year - year_offset, month_offset, 1)
+        months.append(target_date.strftime("%Y%m"))
+
+    LOG.debug("Will process months: %s", months)
+    return months
 
 
 def _process_package_csv(client: storage.Client, package: str):
     """
-    Collect and process metrics from latest CSV for a specific package.
-    Uses different aggregation strategies based on metric type.
+    Collect and process metrics from CSV files for a specific package.
+    Each date's data becomes a separate gauge metric with appropriate timestamp.
 
     Args:
         client: Google Cloud Storage client
         package: Android package name to process
     """
-    # Build prefix for this package's files
-    prefix = f"stats/installs/installs_{package}_"
-    blobs = list(client.list_blobs(BUCKET_ID, prefix=prefix))
+    months_to_process = _get_months_to_process()
 
-    if not blobs:
-        LOG.debug("No installs CSVs for %s", package)
-        return
+    # Process each month
+    for month_str in months_to_process:
+        # Build the exact filename for this package and month
+        blob_name = f"stats/installs/installs_{package}_{month_str}_country.csv"
 
-    # Filter for country CSV files (not overview files)
-    country_blobs = [b for b in blobs if "_country.csv" in b.name]
-    if not country_blobs:
-        LOG.debug("No country CSVs for %s", package)
-        return
+        # Check if blob exists
+        bucket = client.bucket(BUCKET_ID)
+        blob = bucket.blob(blob_name)
 
-    # Sort by name (which includes date YYYYMM) and take only the latest file
-    latest_blob = sorted(country_blobs, key=lambda b: b.name, reverse=True)[0]
-
-    # Validate blob name matches expected pattern
-    m = _country_regex.match(latest_blob.name)
-    if not m or m.group("pkg") != package:
-        LOG.debug("Latest blob %s doesn't match package %s", latest_blob.name, package)
-        return
-
-    LOG.info("Processing CSV for %s: %s", package, latest_blob.name)
-
-    # Download and parse CSV
-    rows = _download_csv(client, latest_blob.name)
-
-    # Extract all unique dates from the CSV
-    date_strings = [r.get("Date", "") for r in rows]
-    unique_dates = {
-        _parse_date(date_str) for date_str in date_strings if date_str.strip()
-    }
-    unique_dates.discard(None)  # Remove None values from failed parsing
-
-    if not unique_dates:
-        LOG.info("No valid dates found in %s", latest_blob.name)
-        return
-
-    # Find the most recent date in the file for timestamp
-    max_date = max(unique_dates)
-    # Convert date to milliseconds timestamp (Unix timestamp * 1000)
-    timestamp_ms = int(dt.datetime.combine(max_date, dt.time.min).timestamp() * 1000)
-
-    LOG.info("Processing data from %s, latest date: %s", latest_blob.name, max_date)
-
-    # Process metrics based on aggregation strategy
-    country_metrics: Dict[str, Dict[str, float]] = {}
-
-    # For metrics that need summing
-    sum_metrics = {
-        name: info
-        for name, info in METRIC_DEFINITIONS.items()
-        if info["aggregation"] == "sum"
-    }
-
-    # For metrics that need last value
-    last_metrics = {
-        name: info
-        for name, info in METRIC_DEFINITIONS.items()
-        if info["aggregation"] == "last"
-    }
-
-    # Process all rows for sum aggregation
-    for r in rows:
-        # Parse date to ensure it's valid
-        date_str = r.get("Date", "")
-        date = _parse_date(date_str)
-        if not date:
+        if not blob.exists():
+            LOG.debug("No CSV found for %s in month %s", package, month_str)
             continue
 
-        # Extract country code
-        country = (r.get("Country") or "").upper()
-        if not country:
+        LOG.info("Processing CSV for %s: %s", package, blob_name)
+
+        # Download and parse CSV
+        rows = _download_csv(client, blob_name)
+
+        if not rows:
+            LOG.warning("No rows found in %s", blob_name)
             continue
 
-        # Initialize country metrics if needed
-        if country not in country_metrics:
-            country_metrics[country] = {}
-            for metric_name in METRIC_DEFINITIONS:
-                country_metrics[country][metric_name] = 0.0
+        # Process each row independently - each date gets its own metric entry
+        rows_processed = 0
+        for row in rows:
+            # Parse date to ensure it's valid
+            date_str = row.get("Date", "")
+            date = _parse_date(date_str)
+            if not date:
+                continue
 
-        # Sum metrics that need aggregation
-        for metric_name, metric_info in sum_metrics.items():
-            csv_column = metric_info["csv_column"]
-            value = _extract_number(r.get(csv_column) or "0")
-            country_metrics[country][metric_name] += value
+            # Extract country code
+            country = (row.get("Country") or "").upper()
+            if not country:
+                continue
 
-        # For last-value metrics, only use data from the max date
-        if date == max_date:
-            for metric_name, metric_info in last_metrics.items():
+            # Convert date to milliseconds timestamp for this specific date
+            timestamp_ms = int(
+                dt.datetime.combine(date, dt.time.min).timestamp() * 1000
+            )
+
+            # Process each metric for this row
+            for metric_name, metric_info in METRIC_DEFINITIONS.items():
                 csv_column = metric_info["csv_column"]
-                value = _extract_number(r.get(csv_column) or "0")
-                # For last value metrics, replace rather than sum
-                country_metrics[country][metric_name] = value
+                value = _extract_number(row.get(csv_column) or "0")
 
-    LOG.info(
-        "Processed %d countries from %s",
-        len(country_metrics),
-        latest_blob.name,
-    )
-
-    # Store metrics with timestamp
-    with _metrics_lock:
-        for country, metrics in country_metrics.items():
-            for metric_name, value in metrics.items():
                 # Skip zero values
                 if value <= 0:
                     continue
@@ -476,129 +452,139 @@ def _process_package_csv(client: storage.Client, package: str):
                 if metric_name not in _metrics_data:
                     _metrics_data[metric_name] = {}
 
-                # Store value with timestamp
-                _metrics_data[metric_name][(package, country)] = (value, timestamp_ms)
+                # Store value with date-specific key and timestamp
+                # Using date.isoformat() to make date part of the key
+                key = (package, country, date.isoformat())
+                _metrics_data[metric_name][key] = (value, timestamp_ms)
 
                 if LOG.isEnabledFor(logging.DEBUG):
                     LOG.debug(
-                        "Stored metric: %s=%s for %s/%s with timestamp %s",
+                        "Stored metric: %s=%s for %s/%s/%s with timestamp %s",
                         metric_name,
                         value,
                         package,
                         country,
+                        date.isoformat(),
                         timestamp_ms,
                     )
 
+            rows_processed += 1
 
-# ------------ Background thread ------------
-collection_thread = None
-stop_event = threading.Event()
+        LOG.info(
+            "Processed %d rows from %s",
+            rows_processed,
+            blob_name,
+        )
+
+
+# ------------ Main collection logic ------------
+# Background thread for periodic collection
+_collection_thread = None
+_stop_collection = threading.Event()
 
 
 def _run_metrics_collection():
     """
-    Initialize fresh metrics and collect data for all packages.
-
-    Returns:
-        bool: True if collection was successful, False otherwise
+    Run a single metrics collection cycle.
+    Clears all existing metrics and repopulates from current CSV files.
     """
-    global _metrics_data
-
-    success = False
-    packages_processed = 0
+    start_time = time.time()
+    LOG.info("Starting metrics collection cycle")
 
     try:
-        # Clear existing metrics
+        # Clear all existing metrics - complete refresh
         with _metrics_lock:
-            _metrics_data = {}
+            _metrics_data.clear()
+            LOG.debug("Cleared all existing metrics for fresh collection")
 
-        # Create GCS client
+        # Create storage client
         client = _storage_client()
 
-        # Discover all packages
-        packages = _discover_packages()
+        # Discover packages
+        packages = _discover_packages_from_gcs(client)
 
         if not packages:
-            LOG.warning("No packages found to process")
-            _update_health_status(False, "No packages discovered")
-            return False
+            LOG.warning("No packages discovered, skipping collection")
+            _update_health_status(collection_done=True)
+            return
 
-        # Process each package
-        for pkg in packages:
+        # Collect metrics for each package
+        for i, package in enumerate(sorted(packages), 1):
+            LOG.info("Processing package %d/%d: %s", i, len(packages), package)
             try:
-                _process_package_csv(client, pkg)
-                packages_processed += 1
+                _process_package_csv(client, package)
             except Exception as e:
-                LOG.exception("Metrics collection failed for %s: %s", pkg, e)
+                LOG.error("Failed to process package %s: %s", package, e)
+                # Continue with other packages
 
-        # Collection is successful if at least one package was processed
-        success = packages_processed > 0
+        # Update health status - successful collection
+        _update_health_status(collection_done=True)
+
+        elapsed = time.time() - start_time
+
+        # Count total metrics
+        total_metrics = 0
+        with _metrics_lock:
+            for metric_data in _metrics_data.values():
+                total_metrics += len(metric_data)
+
+        LOG.info(
+            "Metrics collection completed in %.2f seconds. Total metrics: %d",
+            elapsed,
+            total_metrics,
+        )
 
     except Exception as e:
-        LOG.exception("Metrics collection cycle failed: %s", e)
-        success = False
-
-    # Update health status
-    if success:
-        _update_health_status(True)
-        LOG.info("Collection successful, processed %d packages", packages_processed)
-    else:
-        _update_health_status(False, "No packages processed")
-        LOG.warning("Collection failed or incomplete")
-
-    return success
+        LOG.error("Metrics collection failed: %s", e)
+        _update_health_status(error=e, collection_done=True)
 
 
 def _background_collection():
     """
-    Background thread function that runs periodic collections.
+    Background thread function for periodic metrics collection.
     """
-    LOG.info("Background collection thread started")
+    LOG.info(
+        "Starting background collection thread (interval: %d seconds, months lookback: %d)",
+        COLLECTION_INTERVAL,
+        MONTHS_LOOKBACK,
+    )
 
-    while not stop_event.is_set():
+    while not _stop_collection.is_set():
         try:
-            LOG.info("Starting metrics collection cycle")
-            start_time = time.time()
-
-            # Run the collection
+            # Run collection
             _run_metrics_collection()
 
-            elapsed = time.time() - start_time
-            LOG.info("Collection cycle completed in %.2f seconds", elapsed)
+            # Wait for next collection or stop signal
+            _stop_collection.wait(COLLECTION_INTERVAL)
 
         except Exception as e:
-            LOG.exception("Unexpected error in collection thread: %s", e)
-            _update_health_status(False, str(e))
-
-        # Wait for next collection interval (or until stop event)
-        if not stop_event.wait(COLLECTION_INTERVAL):
-            LOG.debug(
-                "Starting next collection cycle after %d seconds", COLLECTION_INTERVAL
-            )
+            LOG.error("Unexpected error in collection thread: %s", e)
+            # Wait a bit before retrying
+            _stop_collection.wait(60)
 
     LOG.info("Background collection thread stopped")
 
 
 def start_background_collection():
     """Start the background metrics collection thread."""
-    global collection_thread
+    global _collection_thread
 
-    if collection_thread and collection_thread.is_alive():
+    if _collection_thread and _collection_thread.is_alive():
         LOG.warning("Collection thread already running")
         return
 
-    stop_event.clear()
-    collection_thread = threading.Thread(target=_background_collection, daemon=True)
-    collection_thread.start()
-    LOG.info("Started background collection thread")
+    _stop_collection.clear()
+    _collection_thread = threading.Thread(
+        target=_background_collection, daemon=True, name="metrics-collector"
+    )
+    _collection_thread.start()
 
 
 def stop_background_collection():
-    """Stop the background metrics collection thread."""
-    LOG.info("Stopping background collection thread")
-    stop_event.set()
-    if collection_thread:
-        collection_thread.join(timeout=5)
+    """Stop the background collection thread."""
+    if _collection_thread:
+        LOG.info("Stopping collection thread...")
+        _stop_collection.set()
 
 
 # ------------ HTTP Server ------------
@@ -606,86 +592,90 @@ class QuietWSGIRequestHandler(WSGIRequestHandler):
     """Custom request handler that only logs in DEBUG mode."""
 
     def log_message(self, format, *args):
-        """Override to only log requests in DEBUG mode."""
+        """Override to only log HTTP requests in DEBUG mode."""
         if LOG.isEnabledFor(logging.DEBUG):
-            LOG.debug(f"HTTP: {format}", *args)
+            LOG.debug("HTTP: " + format, *args)
 
 
 def app(environ, start_response):
     """
-    WSGI application handler for metrics and health check endpoints.
+    WSGI application for serving metrics and health check.
 
-    Args:
-        environ: WSGI environment dictionary
-        start_response: WSGI response callback
-
-    Returns:
-        Response body as list of bytes
+    Endpoints:
+        /metrics - Prometheus metrics endpoint
+        /healthz - Health check endpoint (returns 200/503)
+        / - Redirect to /metrics
     """
     path = environ.get("PATH_INFO", "/")
 
-    # Log requests only in DEBUG mode
-    if LOG.isEnabledFor(logging.DEBUG):
-        LOG.debug("Request: %s %s", environ.get("REQUEST_METHOD", "GET"), path)
-
-    # Health check endpoint - simple OK/NOT OK response
-    if path == "/healthz":
-        if _is_healthy():
-            start_response("200 OK", [("Content-Type", "text/plain; charset=utf-8")])
-            return [b"ok\n"]
-        else:
-            start_response(
-                "503 Service Unavailable",
-                [("Content-Type", "text/plain; charset=utf-8")],
-            )
-            return [b"not ok\n"]
-
-    # Metrics endpoint
     if path == "/metrics":
-        # Generate metrics output with timestamps
+        # Generate Prometheus format output
         output = _format_prometheus_output()
-        start_response("200 OK", [("Content-Type", "text/plain; version=0.0.4")])
+
+        start_response(
+            "200 OK",
+            [
+                ("Content-Type", "text/plain; version=0.0.4"),
+                ("Content-Length", str(len(output))),
+            ],
+        )
         return [output.encode("utf-8")]
 
-    # Unknown endpoint
-    start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
-    return [b"not found\n"]
+    elif path == "/healthz":
+        # Simple health check - just return status
+        if _is_healthy():
+            start_response("200 OK", [("Content-Type", "text/plain")])
+            return [b"ok"]
+        else:
+            start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
+            return [b"not ok"]
+
+    elif path == "/":
+        # Redirect root to /metrics
+        start_response("302 Found", [("Location", "/metrics")])
+        return [b""]
+
+    else:
+        # 404 for unknown paths
+        start_response("404 Not Found", [("Content-Type", "text/plain")])
+        return [b"Not Found"]
 
 
 def main():
-    """Main entry point."""
-    LOG.info("Google Play Console Metrics Exporter starting...")
-    LOG.info("Port: %d", PORT)
-    LOG.info("Collection interval: %d seconds", COLLECTION_INTERVAL)
-    LOG.info("GCS bucket: %s", BUCKET_ID)
+    """Main entry point for the exporter."""
+    LOG.info("Starting Google Play Console Metrics Exporter v3.0.0")
+    LOG.info("Configuration:")
+    LOG.info("  Port: %d", PORT)
+    LOG.info("  Collection interval: %d seconds", COLLECTION_INTERVAL)
+    LOG.info("  Months lookback: %d", MONTHS_LOOKBACK)
+    LOG.info("  Bucket: %s", BUCKET_ID)
+    LOG.info("  Credentials: %s", GOOGLE_CREDS)
 
-    # Test mode: run one collection and exit
-    if TEST_MODE:
-        LOG.info("TEST MODE: Running single collection cycle")
-        success = _run_metrics_collection()
-
-        # Display collected metrics in test mode
-        if LOG.isEnabledFor(logging.DEBUG):
-            output = _format_prometheus_output()
-            LOG.debug("Collected metrics:\n%s", output)
-
-        sys.exit(0 if success else 1)
-
-    # Start background collection thread
+    # Start background collection
     start_background_collection()
 
-    # Create and start WSGI server
-    try:
-        with make_server("", PORT, app, handler_class=QuietWSGIRequestHandler) as httpd:
-            LOG.info("HTTP server listening on port %d", PORT)
+    # Test mode - run once and exit
+    if TEST_MODE:
+        LOG.info("TEST MODE: Running single collection and exiting")
+        time.sleep(2)  # Give collection thread time to start
+        # Wait for first collection to complete (max 5 minutes)
+        for _ in range(300):
+            if _health_status.get("first_collection_done"):
+                break
+            time.sleep(1)
+        # Print metrics and exit
+        print(_format_prometheus_output())
+        stop_background_collection()
+        return
+
+    # Start HTTP server
+    LOG.info("Starting HTTP server on port %d", PORT)
+    with make_server("", PORT, app, handler_class=QuietWSGIRequestHandler) as httpd:
+        try:
             httpd.serve_forever()
-    except KeyboardInterrupt:
-        LOG.info("Shutting down...")
-        stop_background_collection()
-    except Exception as e:
-        LOG.exception("Server error: %s", e)
-        stop_background_collection()
-        sys.exit(1)
+        except KeyboardInterrupt:
+            LOG.info("Shutting down...")
+            stop_background_collection()
 
 
 if __name__ == "__main__":
