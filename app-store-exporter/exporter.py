@@ -136,7 +136,20 @@ METRICS = [
         "value_patterns": ["Counts"],
         "granularity": "DAILY",
         "row_filter": {"column": "Download Type", "equals": "First-time download"},
-        "counter": None,
+    },
+    {
+        "key": "daily_user_non_first_time_installs",
+        "prom_name": "appstore_daily_user_non_first_time_installs_v2",
+        "help": "Daily user non first-time installs (App Units) by country",
+        "labels": {
+            "country": "Territory",
+            "platform_version": "Platform Version",
+            "source_type": "Source Type",
+        },
+        "report_type": "App Downloads Standard",
+        "value_patterns": ["Counts"],
+        "granularity": "DAILY",
+        "row_filter": {"column": "Download Type", "equals": "Redownload"},
     },
     {
         "key": "active_devices",
@@ -151,7 +164,6 @@ METRICS = [
         "report_type": "App Sessions Standard",
         "value_patterns": ["Unique Devices"],
         "granularity": "DAILY",
-        "counter": None,
     },
     {
         "key": "uninstalls",
@@ -167,7 +179,6 @@ METRICS = [
         "value_patterns": ["Counts"],
         "granularity": "WEEKLY",
         "row_filter": {"column": "Event", "equals": "Delete"},
-        "counter": None,
     },
 ]
 

@@ -35,9 +35,10 @@ Prometheus exporter for Apple App Store Connect analytics metrics. This exporter
 
 | Metric Name | Description | Labels |
 |-------------|-------------|---------|
-| `appstore_daily_user_installs` | Daily user installs (App Units) by country | `package`, `country`, `platform_version`, `source_type` |
-| `appstore_active_devices` | Active devices by country (proxy for active device installs) | `package`, `country`, `device`, `platform_version`, `source_type` |
-| `appstore_uninstalls` | Uninstalls by country (Installation and Deletion) | `package`, `country`, `device`, `platform_version`, `source_type` |
+| `appstore_daily_user_installs_v2` | Daily user installs (App Units) by country | `package`, `country`, `platform_version`, `source_type` |
+| `appstore_daily_user_non_first_time_installs_v2` | Daily user non first-time installs (App Units) by country | `package`, `country`, `platform_version`, `source_type` |
+| `appstore_active_devices_v2` | Active devices by country (proxy for active device installs) | `package`, `country`, `device`, `platform_version`, `source_type` |
+| `appstore_uninstalls_v2` | Uninstalls by country (Installation and Deletion) | `package`, `country`, `device`, `platform_version`, `source_type` |
 | **Exporter Metrics** | | |
 | `appstore_exporter_parsing_errors_total` | Total parsing errors encountered | `package`, `report_type` |
 | `appstore_exporter_last_collection_timestamp` | Unix timestamp of last successful collection | - |
@@ -294,6 +295,10 @@ For issues and feature requests, please create an issue in the project repositor
 5. Submit a pull request
 
 ## Changelog
+
+### v2.2.0
+- **New Feature**:
+  - add the new `appstore_daily_user_non_first_time_installs_v2` metric
 
 ### v2.1.0
 - **New Feature**: Added `--diagnose` flag to analytics-requests-manager.py for comprehensive API diagnostics

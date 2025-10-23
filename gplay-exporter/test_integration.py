@@ -154,10 +154,16 @@ class TestIntegrationScenarios(unittest.TestCase):
                 active_installs[("com.example.app", "US", "2025-01-03")][0], 102000.0
             )
 
-            # Check timestamps are date-specific
-            timestamp_jan1 = int(dt.datetime(2025, 1, 1).timestamp() * 1000)
-            timestamp_jan2 = int(dt.datetime(2025, 1, 2).timestamp() * 1000)
-            timestamp_jan3 = int(dt.datetime(2025, 1, 3).timestamp() * 1000)
+            # Check timestamps are date-specific (using UTC explicitly)
+            timestamp_jan1 = int(
+                dt.datetime(2025, 1, 1, tzinfo=dt.timezone.utc).timestamp() * 1000
+            )
+            timestamp_jan2 = int(
+                dt.datetime(2025, 1, 2, tzinfo=dt.timezone.utc).timestamp() * 1000
+            )
+            timestamp_jan3 = int(
+                dt.datetime(2025, 1, 3, tzinfo=dt.timezone.utc).timestamp() * 1000
+            )
 
             self.assertEqual(
                 device_installs[("com.example.app", "US", "2025-01-01")][1],
@@ -255,10 +261,16 @@ class TestIntegrationScenarios(unittest.TestCase):
     def test_prometheus_format_with_date_keys(self):
         """Test that Prometheus format is correctly generated with date-based entries"""
 
-        # Simulate metric data with different dates
-        timestamp_jan1 = int(dt.datetime(2025, 1, 1).timestamp() * 1000)
-        timestamp_jan2 = int(dt.datetime(2025, 1, 2).timestamp() * 1000)
-        timestamp_jan3 = int(dt.datetime(2025, 1, 3).timestamp() * 1000)
+        # Simulate metric data with different dates (using UTC explicitly)
+        timestamp_jan1 = int(
+            dt.datetime(2025, 1, 1, tzinfo=dt.timezone.utc).timestamp() * 1000
+        )
+        timestamp_jan2 = int(
+            dt.datetime(2025, 1, 2, tzinfo=dt.timezone.utc).timestamp() * 1000
+        )
+        timestamp_jan3 = int(
+            dt.datetime(2025, 1, 3, tzinfo=dt.timezone.utc).timestamp() * 1000
+        )
 
         with exporter._metrics_lock:
             exporter._metrics_data = {
@@ -658,6 +670,162 @@ class TestIntegrationScenarios(unittest.TestCase):
 
                         # Should only have new.app metrics
                         self.assertIn(("com.new.app", "FR", "2025-01-15"), installs)
+
+    def test_v3_consistent_timestamps_for_same_date(self):
+        """Test that all metrics for the same date have identical timestamps at midnight UTC"""
+
+        # Setup test data with multiple metrics for the same dates
+        test_csv_data = [
+            {
+                "Date": "2025-01-20",
+                "Country": "US",
+                "Daily Device Installs": "100",
+                "Daily Device Uninstalls": "10",
+                "Active Device Installs": "50000",
+                "Daily User Installs": "90",
+                "Daily User Uninstalls": "9",
+            },
+            {
+                "Date": "2025-01-20",  # Same date, different country
+                "Country": "GB",
+                "Daily Device Installs": "50",
+                "Daily Device Uninstalls": "5",
+                "Active Device Installs": "25000",
+                "Daily User Installs": "45",
+                "Daily User Uninstalls": "4",
+            },
+            {
+                "Date": "2025-01-21",  # Different date
+                "Country": "US",
+                "Daily Device Installs": "110",
+                "Daily Device Uninstalls": "11",
+                "Active Device Installs": "50100",
+                "Daily User Installs": "99",
+                "Daily User Uninstalls": "10",
+            },
+        ]
+
+        with patch("exporter._download_csv") as mock_download:
+            mock_download.return_value = test_csv_data
+
+            with patch("exporter._get_months_to_process") as mock_months:
+                mock_months.return_value = ["202501"]
+
+                mock_client = Mock()
+                mock_bucket = Mock()
+                mock_blob = Mock()
+                mock_blob.exists.return_value = True
+                mock_bucket.blob.return_value = mock_blob
+                mock_client.bucket.return_value = mock_bucket
+
+                # Clear existing metrics
+                with exporter._metrics_lock:
+                    exporter._metrics_data = {}
+
+                exporter._process_package_csv(mock_client, "com.test.app")
+
+                # Verify timestamps
+                with exporter._metrics_lock:
+                    # Collect all timestamps for each date
+                    timestamps_by_date = {}
+
+                    for metric_name, metric_data in exporter._metrics_data.items():
+                        for (package, country, date_str), (
+                            value,
+                            timestamp_ms,
+                        ) in metric_data.items():
+                            if date_str not in timestamps_by_date:
+                                timestamps_by_date[date_str] = set()
+                            timestamps_by_date[date_str].add(timestamp_ms)
+
+                    # Each date should have exactly one unique timestamp
+                    for date_str, timestamps in timestamps_by_date.items():
+                        self.assertEqual(
+                            len(timestamps),
+                            1,
+                            f"Date {date_str} has multiple different timestamps: {timestamps}",
+                        )
+
+                        # Verify it's midnight UTC
+                        timestamp_ms = next(iter(timestamps))
+                        dt_from_ts = dt.datetime.fromtimestamp(
+                            timestamp_ms / 1000, tz=dt.timezone.utc
+                        )
+                        self.assertEqual(
+                            dt_from_ts.hour,
+                            0,
+                            f"Timestamp for {date_str} is not at midnight",
+                        )
+                        self.assertEqual(dt_from_ts.minute, 0)
+                        self.assertEqual(dt_from_ts.second, 0)
+                        self.assertEqual(dt_from_ts.microsecond, 0)
+
+                    # Verify different dates have different timestamps
+                    self.assertEqual(
+                        len(timestamps_by_date), 2
+                    )  # We have 2 unique dates
+                    all_timestamps = set()
+                    for ts_set in timestamps_by_date.values():
+                        all_timestamps.update(ts_set)
+                    self.assertEqual(
+                        len(all_timestamps),
+                        2,
+                        "Different dates should have different timestamps",
+                    )
+
+    def test_v3_timestamp_format_in_output(self):
+        """Test that timestamps in Prometheus output are consistent for same date"""
+
+        # Setup metrics with same date but different metrics/countries
+        date_str = "2025-01-24"
+        expected_timestamp = int(
+            dt.datetime(2025, 1, 24, 0, 0, 0, tzinfo=dt.timezone.utc).timestamp() * 1000
+        )
+
+        with exporter._metrics_lock:
+            exporter._metrics_data = {
+                "gplay_device_installs_v3": {
+                    ("com.app", "US", date_str): (100.0, expected_timestamp),
+                    ("com.app", "GB", date_str): (50.0, expected_timestamp),
+                },
+                "gplay_device_uninstalls_v3": {
+                    ("com.app", "US", date_str): (10.0, expected_timestamp),
+                    ("com.app", "GB", date_str): (5.0, expected_timestamp),
+                },
+                "gplay_active_device_installs_v3": {
+                    ("com.app", "US", date_str): (10000.0, expected_timestamp),
+                    ("com.app", "GB", date_str): (5000.0, expected_timestamp),
+                },
+            }
+
+        output = exporter._format_prometheus_output()
+
+        # Extract all timestamps from output
+        timestamps_in_output = set()
+        for line in output.split("\n"):
+            if line and not line.startswith("#"):
+                # Parse timestamp from line (it's the last number after space)
+                parts = line.split()
+                if len(parts) >= 3:
+                    try:
+                        timestamp = int(parts[-1])
+                        timestamps_in_output.add(timestamp)
+                    except ValueError:
+                        pass
+
+        # All timestamps should be the same since all metrics are for the same date
+        self.assertEqual(
+            len(timestamps_in_output),
+            1,
+            f"Expected one unique timestamp, found: {timestamps_in_output}",
+        )
+
+        # And it should be the expected timestamp
+        self.assertEqual(
+            next(iter(timestamps_in_output)),
+            expected_timestamp,
+            f"Timestamp doesn't match expected midnight UTC timestamp",
+        )
 
 
 if __name__ == "__main__":

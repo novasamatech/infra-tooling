@@ -119,12 +119,23 @@ scrape_configs:
   - job_name: 'gplay-exporter'
     static_configs:
       - targets: ['exporter-host:8000']
-    # Honor timestamps from the exporter
+    # CRITICAL: Must be true for correct timestamp handling
     honor_timestamps: true
 ```
 
-### Important: Honor Timestamps
-Make sure your Prometheus configuration includes `honor_timestamps: true` to use the timestamps provided by the exporter. This ensures metrics are stored with the correct time from the Play Console reports, not the scrape time.
+### ⚠️ CRITICAL: Honor Timestamps Configuration
+**Your Prometheus configuration MUST include `honor_timestamps: true`!** 
+
+Without this setting:
+- Metrics will use the scrape time instead of the actual data date
+- Graphs will show incorrect fluctuations throughout the day
+- Daily metrics will appear to change every scrape interval
+- Historical data points will be incorrectly positioned in time
+
+With `honor_timestamps: true`:
+- Each metric uses its exact date timestamp (midnight UTC)
+- Daily data appears as single points per day
+- Historical trends are accurately represented
 
 ## Data Model
 
@@ -233,6 +244,11 @@ The complete refresh approach ensures:
 
 ## Changelog
 
+### Version 3.0.1 (2025-01-25)
+
+#### Fixes
+- Use UTC for timestamps' generation
+
 ### Version 3.0.0 (2025-01-24)
 
 #### Major Changes
@@ -248,11 +264,6 @@ The complete refresh approach ensures:
 - Aggregation logic removed (no more summing or last-value selection)
 - Metric storage no longer accumulates indefinitely
 - Different data model requiring query adjustments
-
-#### Migration Notes
-- v3 can run alongside v2 during migration (different metric names)
-- Prometheus queries will need adjustment for the new gauge metrics
-- Consider historical data requirements when setting MONTHS_LOOKBACK
 
 ### Version 2.1.0 (2025-01-24)
 
