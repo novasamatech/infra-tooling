@@ -173,9 +173,8 @@ def _format_prometheus_output() -> str:
                         continue
 
                     # Format: metric_name{label1="value1",label2="value2"} value timestamp
-                    output_lines.append(
-                        f'{metric_name}{{package="{package}",country="{country}"}} {value} {timestamp_ms}'
-                    )
+                    line = f'{metric_name}{{package="{package}",country="{country}"}} {value} {timestamp_ms}'
+                    output_lines.append(line)
 
     # Join with newlines and add final newline
     return "\n".join(output_lines) + "\n"
@@ -435,8 +434,12 @@ def _process_package_csv(client: storage.Client, package: str):
                 continue
 
             # Convert date to milliseconds timestamp for this specific date
+            # Use UTC timezone explicitly to ensure consistent timestamps
             timestamp_ms = int(
-                dt.datetime.combine(date, dt.time.min).timestamp() * 1000
+                dt.datetime.combine(
+                    date, dt.time.min, tzinfo=dt.timezone.utc
+                ).timestamp()
+                * 1000
             )
 
             # Process each metric for this row
