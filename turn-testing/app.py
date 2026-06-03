@@ -1,31 +1,34 @@
 #!/usr/bin/env python3
 
-# Copyright © 2025 Novasama Technologies GmbH
+# Copyright © 2026 Novasama Technologies GmbH
 # SPDX-License-Identifier: Apache-2.0
 
 """
 CoTURN server connectivity test script.
 
-Tests STUN binding, TURN allocation, and WebRTC Data Channel
-through the TURN server using aiortc library.
+Tests STUN binding, TURN allocation, and a WebRTC Data Channel through the
+TURN server (relay-only) using the aiortc / aioice libraries.
 
 Usage:
-    # Activate venv first:
-    source scripts/.venv/bin/activate
+    # Activate the bundled venv first:
+    source venv/bin/activate
 
-    # Basic test (STUN + TURN allocation)
-    ./coturn-test.py -H <host> -P <port> -u <username> -p <password>
+    # Basic test (STUN + TURN allocation + WebRTC over UDP)
+    ./app.py -H <host> -P <port> -u <username> -p <password>
 
-    # Full WebRTC Data Channel test through TURN relay
-    ./coturn-test.py -H <host> -P <port> -u <username> -p <password>
-    # Force TCP or TLS transport for TURN
-    ./coturn-test.py -H <host> -P <port> -u <username> -p <password> --transport tcp
+    # Force TCP or TLS transport for every sub-test
+    ./app.py -H <host> -P <port> -u <username> -p <password> --transport tcp
+    ./app.py -H <host> -P <port> -u <username> -p <password> --transport tls
 
     # STUN only
-    ./coturn-test.py -H <host> -P <port> -u <username> -p <password> --stun-only
+    ./app.py -H <host> -P <port> -u <username> -p <password> --stun-only
 
     # TURN allocation only
-    ./coturn-test.py -H <host> -P <port> -u <username> -p <password> --turn-only
+    ./app.py -H <host> -P <port> -u <username> -p <password> --turn-only
+
+    # WebRTC Data Channel only, 25 Mbps for 30s
+    ./app.py -H <host> -P <port> -u <username> -p <password> \\
+        --webrtc-only --rate-mbps 25 --duration 30
 
 CLI Parameters:
     -H, --host       TURN server address (hostname or IP) [required]
@@ -36,20 +39,27 @@ CLI Parameters:
     --stun-only      Only test STUN binding
     --turn-only      Only test TURN allocation
     --webrtc-only    Only test WebRTC Data Channel (default is all tests)
-    --transport     TURN transport for WebRTC test (udp|tcp|tls) [default: udp]
-    --duration      Duration in seconds for WebRTC data stream [default: 10]
-    --rate-mbps     Target Mbps for WebRTC data stream [default: 1]
-    --transport     TURN transport for WebRTC test (udp|tcp|tls) [default: udp]
+    --transport      TURN transport for every sub-test (udp|tcp|tls) [default: udp]
+    --duration       Duration in seconds for the WebRTC data stream [default: 10]
+    --rate-mbps      Target Mbps for the WebRTC data stream [default: 1]
+    --insecure       Skip TLS certificate verification (TLS STUN/TURN only)
 
 Requirements:
-    pip install aiortc
-    Or use bundled venv: source scripts/.venv/bin/activate
+    pip install -r requirements.txt
+    Or use the bundled venv: source venv/bin/activate
+
+Note on internals:
+    The relay-only enforcement and the candidate-pair inspection rely on
+    private attributes of aiortc/aioice (the WebRTC API has no
+    iceTransportPolicy="relay" in aiortc). They are validated against the
+    pinned versions in requirements.txt and may break on a library upgrade.
 """
 
 import argparse
 import asyncio
 import hashlib
 import random
+import ssl
 import sys
 import time
 
@@ -68,6 +78,21 @@ except ImportError:
     AIORTC_AVAILABLE = False
 
 
+def eprint(*args, **kwargs):
+    """Print diagnostics/errors to stderr so they don't pollute stdout."""
+    kwargs.setdefault("file", sys.stderr)
+    print(*args, **kwargs)
+
+
+def make_ssl_context(insecure):
+    """Build a client SSL context, optionally skipping verification."""
+    ctx = ssl.create_default_context()
+    if insecure:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def build_turn_url(host, port, transport):
     """Compose TURN/TURNS URL with explicit transport parameter."""
     scheme = "turns" if transport == "tls" else "turn"
@@ -80,7 +105,7 @@ async def wait_for_ice_gathering_complete(pc, timeout=10):
     if pc.iceGatheringState == "complete":
         return
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     future = loop.create_future()
 
     @pc.on("icegatheringstatechange")
@@ -113,7 +138,12 @@ def filter_sdp_for_relay_only(description, label):
 
 
 def prune_local_candidates_to_relay(pc, label):
-    """Remove non-relay candidates from the local ICE gatherer."""
+    """Remove non-relay candidates from the local ICE gatherer.
+
+    aiortc has no iceTransportPolicy="relay", so we drop host/srflx
+    candidates from the underlying aioice connection before connectivity
+    checks start. Relies on private attributes (see module docstring).
+    """
     try:
         ice_gatherer = pc.sctp.transport.transport.iceGatherer  # type: ignore[attr-defined]
         conn = ice_gatherer._connection  # type: ignore[attr-defined]
@@ -129,69 +159,88 @@ def prune_local_candidates_to_relay(pc, label):
         )
         return after
     except Exception as e:
-        print(f"[WEBRTC] WARNING: Could not prune local candidates for {label}: {e}")
+        eprint(f"[WEBRTC] WARNING: Could not prune local candidates for {label}: {e}")
         return None
 
 
-async def test_stun_binding(host, port, timeout=30):
-    """Test STUN binding request."""
-    print(f"\n[STUN] Testing binding request to {host}:{port}...")
+def instrument_sctp_retransmits(pc):
+    """Wrap a peer's SCTP transport to count DATA chunk (re)transmissions.
+
+    A reliable/ordered data channel hides channel loss from the application
+    (every byte is eventually delivered), so the SCTP retransmission rate is
+    the only window into how lossy the underlying path actually is. We wrap
+    ``_send_chunk``: aiortc increments ``chunk._sent_count`` before sending, so
+    a DataChunk arriving here with ``_sent_count > 1`` is a retransmission.
+    Relies on aiortc internals (see module docstring); degrades gracefully.
+    """
+    try:
+        from aiortc.rtcsctptransport import DataChunk
+    except Exception:
+        return None
+
+    sctp = getattr(pc, "sctp", None)
+    if sctp is None or not hasattr(sctp, "_send_chunk"):
+        return None
+
+    stats = {"data_sent": 0, "data_retx": 0}
+    original = sctp._send_chunk
+
+    async def counting_send_chunk(chunk):
+        if isinstance(chunk, DataChunk):
+            stats["data_sent"] += 1
+            if getattr(chunk, "_sent_count", 1) > 1:
+                stats["data_retx"] += 1
+        return await original(chunk)
 
     try:
-        # Create UDP socket
-        loop = asyncio.get_event_loop()
-        transport, protocol = await loop.create_datagram_endpoint(
-            lambda: StunProtocol(), remote_addr=(host, port)
-        )
+        sctp._send_chunk = counting_send_chunk
+    except Exception:
+        return None
+    return stats
 
-        try:
-            # Create and send STUN binding request
-            request = stun.Message(
-                message_method=stun.Method.BINDING,
-                message_class=stun.Class.REQUEST,
-            )
-            request.transaction_id = stun.random_transaction_id()
 
-            protocol.send_stun(request)
+def format_retransmit_rate(stats, direction):
+    """Render an SCTP retransmission summary line, or None if no DATA was sent."""
+    if not stats or stats["data_sent"] == 0:
+        return None
+    total = stats["data_sent"]
+    retx = stats["data_retx"]
+    pct = retx / total * 100
+    if pct == 0:
+        verdict = "no loss"
+    elif pct < 1:
+        verdict = "good"
+    elif pct < 5:
+        verdict = "moderate loss"
+    else:
+        verdict = "high loss"
+    return (
+        f"[WEBRTC] SCTP retransmissions {direction}: "
+        f"{retx}/{total} DATA chunks ({pct:.2f}%, {verdict})"
+    )
 
-            # Wait for response
-            response = await asyncio.wait_for(protocol.wait_response(), timeout=timeout)
 
-            if response and response.message_class == stun.Class.RESPONSE:
-                print("[STUN] Binding successful!")
+def report_stun_response(response):
+    """Print a STUN binding response and return whether it was successful."""
+    if response and response.message_class == stun.Class.RESPONSE:
+        print("[STUN] Binding successful!")
 
-                # Extract mapped address
-                mapped_addr = response.attributes.get("XOR-MAPPED-ADDRESS")
-                if mapped_addr:
-                    print(
-                        f"[STUN] Your public address: {mapped_addr[0]}:{mapped_addr[1]}"
-                    )
+        mapped_addr = response.attributes.get("XOR-MAPPED-ADDRESS")
+        if mapped_addr:
+            print(f"[STUN] Your public address: {mapped_addr[0]}:{mapped_addr[1]}")
 
-                software = response.attributes.get("SOFTWARE")
-                if software:
-                    print(f"[STUN] Server software: {software}")
+        software = response.attributes.get("SOFTWARE")
+        if software:
+            print(f"[STUN] Server software: {software}")
 
-                return True
-            else:
-                print(f"[STUN] Unexpected response: {response}")
-                return False
+        return True
 
-        finally:
-            transport.close()
-
-    except asyncio.TimeoutError:
-        print(f"[STUN] Timeout after {timeout}s")
-        return False
-    except Exception as e:
-        print(f"[STUN] Error: {e}")
-        import traceback
-
-        traceback.print_exc()
-        return False
+    eprint(f"[STUN] Unexpected response: {response}")
+    return False
 
 
 class StunProtocol(asyncio.DatagramProtocol):
-    """Simple STUN protocol handler."""
+    """Simple STUN protocol handler for UDP binding requests."""
 
     def __init__(self):
         self.transport = None
@@ -209,13 +258,13 @@ class StunProtocol(asyncio.DatagramProtocol):
             if self.response_future and not self.response_future.done():
                 self.response_future.set_exception(e)
 
+    def arm(self):
+        """Create the response future before sending, to avoid a race."""
+        self.response_future = asyncio.get_running_loop().create_future()
+
     def send_stun(self, message):
         data = bytes(message)
         self.transport.sendto(data)
-
-    async def wait_response(self):
-        self.response_future = asyncio.get_event_loop().create_future()
-        return await self.response_future
 
 
 class TurnTestProtocol(asyncio.DatagramProtocol):
@@ -231,53 +280,140 @@ class TurnTestProtocol(asyncio.DatagramProtocol):
         pass
 
 
-async def test_turn_allocation(host, port, username, password, timeout=30):
-    """Test TURN allocation."""
-    print(f"\n[TURN] Testing allocation to {host}:{port} with user '{username}'...")
+def build_binding_request():
+    """Create a STUN binding request (constructor already sets a random id)."""
+    return stun.Message(
+        message_method=stun.Method.BINDING,
+        message_class=stun.Class.REQUEST,
+    )
+
+
+async def _stun_binding_udp(host, port, timeout):
+    """STUN binding request over UDP."""
+    loop = asyncio.get_running_loop()
+    transport, protocol = await loop.create_datagram_endpoint(
+        lambda: StunProtocol(), remote_addr=(host, port)
+    )
+    try:
+        protocol.arm()
+        protocol.send_stun(build_binding_request())
+        response = await asyncio.wait_for(protocol.response_future, timeout=timeout)
+        return report_stun_response(response)
+    finally:
+        transport.close()
+
+
+async def _stun_binding_stream(host, port, timeout, use_tls, insecure):
+    """STUN binding request over TCP (RFC 5389 framing) or TLS."""
+    ssl_ctx = make_ssl_context(insecure) if use_tls else None
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(host, port, ssl=ssl_ctx), timeout=timeout
+    )
+    try:
+        writer.write(bytes(build_binding_request()))
+        await writer.drain()
+
+        # The STUN header is 20 bytes; bytes 2-3 hold the attribute length.
+        header = await asyncio.wait_for(reader.readexactly(20), timeout=timeout)
+        length = int.from_bytes(header[2:4], "big")
+        body = b""
+        if length:
+            body = await asyncio.wait_for(
+                reader.readexactly(length), timeout=timeout
+            )
+        response = stun.parse_message(header + body)
+        return report_stun_response(response)
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def test_stun_binding(host, port, timeout=30, transport="udp", insecure=False):
+    """Test a STUN binding request over the selected transport."""
+    print(
+        f"\n[STUN] Testing binding request to {host}:{port} via {transport.upper()}..."
+    )
+
+    try:
+        if transport == "udp":
+            return await _stun_binding_udp(host, port, timeout)
+        return await _stun_binding_stream(
+            host, port, timeout, use_tls=(transport == "tls"), insecure=insecure
+        )
+    except asyncio.TimeoutError:
+        eprint(f"[STUN] Timeout after {timeout}s")
+        return False
+    except Exception as e:
+        eprint(f"[STUN] Error: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return False
+
+
+async def test_turn_allocation(
+    host,
+    port,
+    username,
+    password,
+    timeout=30,
+    transport="udp",
+    insecure=False,
+):
+    """Test TURN allocation over the selected transport."""
+    print(
+        f"\n[TURN] Testing allocation to {host}:{port} via {transport.upper()} "
+        f"with user '{username}'..."
+    )
+
+    endpoint_kwargs = {}
+    if transport in ("tcp", "tls"):
+        endpoint_kwargs["transport"] = "tcp"
+        if transport == "tls":
+            endpoint_kwargs["ssl"] = make_ssl_context(insecure)
+    else:
+        endpoint_kwargs["transport"] = "udp"
 
     try:
         # Create TURN endpoint using aioice
-        transport, protocol = await asyncio.wait_for(
+        turn_transport, _protocol = await asyncio.wait_for(
             turn.create_turn_endpoint(
                 TurnTestProtocol,
                 server_addr=(host, port),
                 username=username,
                 password=password,
+                **endpoint_kwargs,
             ),
             timeout=timeout,
         )
 
         try:
-            # Get allocation info from TurnTransport (access private attrs)
+            # Get allocation info from TurnTransport (private attr, see docstring)
             relayed_address = getattr(
-                transport, "_TurnTransport__relayed_address", None
+                turn_transport, "_TurnTransport__relayed_address", None
             )
-            # Get mapped address from inner protocol
-            inner = getattr(transport, "_TurnTransport__inner_protocol", None)
-            mapped_address = getattr(inner, "mapped_address", None) if inner else None
 
             if relayed_address:
                 print("[TURN] Allocation successful!")
                 print(
                     f"[TURN] Relayed address: {relayed_address[0]}:{relayed_address[1]}"
                 )
-            else:
-                print("[TURN] No relayed address received")
-                return False
+                return True
 
-            if mapped_address:
-                print(f"[TURN] Mapped address: {mapped_address[0]}:{mapped_address[1]}")
-
-            return True
+            eprint("[TURN] No relayed address received")
+            return False
 
         finally:
-            transport.close()
+            turn_transport.close()
 
     except asyncio.TimeoutError:
-        print(f"[TURN] Timeout after {timeout}s")
+        eprint(f"[TURN] Timeout after {timeout}s")
         return False
     except Exception as e:
-        print(f"[TURN] Error: {e}")
+        eprint(f"[TURN] Error: {e}")
         import traceback
 
         traceback.print_exc()
@@ -292,14 +428,15 @@ async def test_webrtc_datachannel(
     timeout=30,
     transport="udp",
     stream_duration=10,
-    rate_mbps=25,
+    rate_mbps=1.0,
+    insecure=False,
 ):
     """
     Full WebRTC Data Channel test through TURN relay.
 
-    Creates two peer connections in one process, forces relay-only candidates
-    via ICE policy, establishes a Data Channel, and verifies bidirectional
-    communication.
+    Creates two peer connections in one process, forces relay-only candidates,
+    establishes a Data Channel, and verifies bidirectional communication with a
+    paced pseudorandom stream (throughput + SHA-256 integrity).
     """
     print(
         f"\n[WEBRTC] Testing Data Channel through TURN relay {host}:{port} via {transport.upper()}..."
@@ -307,6 +444,12 @@ async def test_webrtc_datachannel(
     print(
         f"[WEBRTC] Target stream: {rate_mbps} Mbps for {stream_duration}s (data channel)"
     )
+
+    if transport == "tls" and insecure:
+        eprint(
+            "[WEBRTC] WARNING: --insecure does not apply to the WebRTC turns: "
+            "connection; it always verifies the server certificate."
+        )
 
     # Configure TURN server (transport can be udp/tcp/tls)
     turn_url = build_turn_url(host, port, transport)
@@ -338,6 +481,9 @@ async def test_webrtc_datachannel(
     target_bps = int(rate_mbps * 1_000_000)
     target_bytes = target_bps * stream_duration // 8
     chunk_size = 16384
+    # Cap the SCTP send queue so a slow relay can't blow up memory.
+    max_buffered_bytes = 4 * 1024 * 1024
+    sctp_stats_tx = None
 
     # Connection state handlers
     @pc1.on("connectionstatechange")
@@ -387,7 +533,7 @@ async def test_webrtc_datachannel(
 
         @dc1.on("error")
         def on_dc1_error(error):
-            print(f"[WEBRTC] PC1 data channel error: {error}")
+            eprint(f"[WEBRTC] PC1 data channel error: {error}")
 
         # Step 2: Create and exchange offers (relay-only ICE policy)
         print("[WEBRTC] Creating offer...")
@@ -398,8 +544,8 @@ async def test_webrtc_datachannel(
         await wait_for_ice_gathering_complete(pc1, timeout=timeout)
 
         if "typ relay" not in pc1.localDescription.sdp:
-            print("[WEBRTC] ERROR: No relay candidates in offer (PC1)")
-            print("[WEBRTC] TURN server may not be providing relay candidates")
+            eprint("[WEBRTC] ERROR: No relay candidates in offer (PC1)")
+            eprint("[WEBRTC] TURN server may not be providing relay candidates")
             return False
 
         prune_local_candidates_to_relay(pc1, "PC1")
@@ -417,8 +563,8 @@ async def test_webrtc_datachannel(
         await wait_for_ice_gathering_complete(pc2, timeout=timeout)
 
         if "typ relay" not in pc2.localDescription.sdp:
-            print("[WEBRTC] ERROR: No relay candidates in answer (PC2)")
-            print("[WEBRTC] TURN server may not be providing relay candidates")
+            eprint("[WEBRTC] ERROR: No relay candidates in answer (PC2)")
+            eprint("[WEBRTC] TURN server may not be providing relay candidates")
             return False
 
         prune_local_candidates_to_relay(pc2, "PC2")
@@ -434,12 +580,12 @@ async def test_webrtc_datachannel(
         try:
             await asyncio.wait_for(connection_complete.wait(), timeout=timeout)
         except asyncio.TimeoutError:
-            print(f"[WEBRTC] Connection timeout after {timeout}s")
-            print(f"[WEBRTC] PC1: {pc1.connectionState}, PC2: {pc2.connectionState}")
+            eprint(f"[WEBRTC] Connection timeout after {timeout}s")
+            eprint(f"[WEBRTC] PC1: {pc1.connectionState}, PC2: {pc2.connectionState}")
             return False
 
         if pc1.connectionState != "connected":
-            print(f"[WEBRTC] Connection failed: {pc1.connectionState}")
+            eprint(f"[WEBRTC] Connection failed: {pc1.connectionState}")
             return False
 
         print("[WEBRTC] Connection established through TURN relay!")
@@ -449,8 +595,13 @@ async def test_webrtc_datachannel(
         try:
             await asyncio.wait_for(dc1_open.wait(), timeout=10)
         except asyncio.TimeoutError:
-            print("[WEBRTC] Data channel open timeout")
+            eprint("[WEBRTC] Data channel open timeout")
             return False
+
+        # Count SCTP DATA retransmissions on the sender for the bulk stream
+        # (the DCEP open handshake is already done, so this measures the stream
+        # only). Reveals path loss that the reliable channel hides at app level.
+        sctp_stats_tx = instrument_sctp_retransmits(pc1)
 
         # Step 7: High-rate pseudorandom stream
         print(
@@ -458,30 +609,35 @@ async def test_webrtc_datachannel(
         )
         start = time.monotonic()
         deadline = start + stream_duration
-        target_bps_float = float(target_bps)
-        bytes_per_sec = target_bps_float / 8.0
+        bytes_per_sec = target_bps / 8.0
         bytes_sent = 0
 
         while bytes_sent < target_bytes and time.monotonic() < deadline:
             remaining = target_bytes - bytes_sent
-            if remaining <= 0:
-                break
             chunk_len = min(chunk_size, remaining)
             chunk = rng.randbytes(chunk_len)
             sender_hasher.update(chunk)
             dc1.send(chunk)
             bytes_sent += chunk_len
 
-            # pace to target rate
-            elapsed = time.monotonic() - start
-            if elapsed > 0:
-                expected_bytes = min(target_bytes, bytes_per_sec * elapsed)
+            # Backpressure: if the relay can't drain the queue fast enough,
+            # wait instead of letting bufferedAmount grow without bound.
+            while (
+                dc1.bufferedAmount > max_buffered_bytes
+                and time.monotonic() < deadline
+            ):
+                await asyncio.sleep(0.01)
+
+            # Pace to the target rate: sleep exactly enough to stay on schedule.
+            if bytes_per_sec > 0:
+                elapsed = time.monotonic() - start
+                expected_bytes = bytes_per_sec * elapsed
                 if bytes_sent > expected_bytes:
-                    sleep_time = min(
-                        0.05, (bytes_sent - expected_bytes) / bytes_per_sec
-                    )
-                    if sleep_time > 0:
-                        await asyncio.sleep(sleep_time)
+                    await asyncio.sleep((bytes_sent - expected_bytes) / bytes_per_sec)
+
+        # Capture the moment the send window closed (before the ACK wait), so
+        # the reported send rate reflects the paced stream and not the drain.
+        send_done = time.monotonic()
 
         # Signal end of stream
         dc1.send("__END__")
@@ -493,32 +649,38 @@ async def test_webrtc_datachannel(
             await asyncio.wait_for(ack_received.wait(), timeout=ack_timeout)
         except asyncio.TimeoutError:
             buffered = getattr(dc1, "bufferedAmount", None)
-            send_elapsed = time.monotonic() - start
+            send_elapsed = send_done - start
+            recv_elapsed = time.monotonic() - start
             bytes_received = recv_stats["bytes"]
             send_mbps = (
                 (bytes_sent * 8 / 1_000_000) / send_elapsed if send_elapsed else 0
             )
             recv_mbps = (
-                (bytes_received * 8 / 1_000_000) / send_elapsed if send_elapsed else 0
+                (bytes_received * 8 / 1_000_000) / recv_elapsed if recv_elapsed else 0
             )
-            print(
+            eprint(
                 f"[WEBRTC] Progress before timeout: sent {bytes_sent} bytes ({send_mbps:.2f} Mbps paced), received {bytes_received} bytes ({recv_mbps:.2f} Mbps)"
             )
             if buffered is not None:
-                print(
+                eprint(
                     f"[WEBRTC] Did not receive ACK from receiver (bufferedAmount={buffered} bytes)"
                 )
             else:
-                print("[WEBRTC] Did not receive ACK from receiver")
+                eprint("[WEBRTC] Did not receive ACK from receiver")
+            retx_line = format_retransmit_rate(sctp_stats_tx, "PC1->PC2 (stream)")
+            if retx_line:
+                eprint(retx_line)
             return False
 
         # Step 9: Verify throughput and integrity
-        send_elapsed = time.monotonic() - start
+        recv_done = time.monotonic()
         await recv_stats["end"].wait()
+        send_elapsed = send_done - start
+        recv_elapsed = recv_done - start
         bytes_received = recv_stats["bytes"]
         send_mbps = (bytes_sent * 8 / 1_000_000) / send_elapsed if send_elapsed else 0
         recv_mbps = (
-            (bytes_received * 8 / 1_000_000) / send_elapsed if send_elapsed else 0
+            (bytes_received * 8 / 1_000_000) / recv_elapsed if recv_elapsed else 0
         )
 
         expected_hash = sender_hasher.hexdigest()
@@ -528,35 +690,44 @@ async def test_webrtc_datachannel(
             f"[WEBRTC] Sent {bytes_sent} bytes in {send_elapsed:.2f}s ({send_mbps:.2f} Mbps)"
         )
         print(
-            f"[WEBRTC] Received {bytes_received} bytes in {send_elapsed:.2f}s ({recv_mbps:.2f} Mbps)"
+            f"[WEBRTC] Received {bytes_received} bytes in {recv_elapsed:.2f}s ({recv_mbps:.2f} Mbps)"
         )
 
+        # Channel-quality metric: SCTP retransmission rate on the sender. Since
+        # the channel is reliable, the app sees no loss; this is the only signal
+        # of how lossy the underlying path/relay is. Print it before the
+        # pass/fail checks so it is visible even when throughput is below target.
+        retx_line = format_retransmit_rate(sctp_stats_tx, "PC1->PC2 (stream)")
+        if retx_line:
+            print(retx_line)
+
         if bytes_received != bytes_sent:
-            print(
+            eprint(
                 f"[WEBRTC] Byte count mismatch (sent {bytes_sent}, received {bytes_received})"
             )
             return False
 
         if bytes_received < target_bytes * 0.9:
-            print(
+            eprint(
                 f"[WEBRTC] Throughput below target (received {bytes_received} < 90% of {target_bytes})"
             )
             return False
 
         if send_mbps < rate_mbps * 0.8 or recv_mbps < rate_mbps * 0.8:
-            print(
+            eprint(
                 f"[WEBRTC] Throughput below expectation (send {send_mbps:.2f} Mbps, recv {recv_mbps:.2f} Mbps, target {rate_mbps} Mbps)"
             )
             return False
 
         if expected_hash != received_hash:
-            print(
+            eprint(
                 f"[WEBRTC] Hash mismatch: sent {expected_hash}, received {received_hash}"
             )
             return False
 
         print("[WEBRTC] Payload integrity verified (SHA-256 match)")
 
+        # Inspect the selected candidate pair (private attrs, see docstring)
         pair = None
         try:
             ice_transport = pc1.sctp.transport.transport  # type: ignore[attr-defined]
@@ -566,7 +737,7 @@ async def test_webrtc_datachannel(
             pair = None
 
         if not pair:
-            print("[WEBRTC] WARNING: Could not determine selected candidate pair")
+            eprint("[WEBRTC] WARNING: Could not determine selected candidate pair")
             return True
 
         local_candidate = pair.local_candidate
@@ -582,13 +753,13 @@ async def test_webrtc_datachannel(
             print("[WEBRTC] Data Channel test PASSED!")
             return True
 
-        print(
+        eprint(
             f"[WEBRTC] Unexpected candidate types (local={local_type}, remote={remote_type})"
         )
         return False
 
     except Exception as e:
-        print(f"[WEBRTC] Error: {e}")
+        eprint(f"[WEBRTC] Error: {e}")
         import traceback
 
         traceback.print_exc()
@@ -631,23 +802,26 @@ Examples:
     parser.add_argument(
         "-t", "--timeout", type=int, default=30, help="Timeout in seconds (default: 30)"
     )
-    parser.add_argument(
+
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--stun-only", action="store_true", help="Only test STUN binding"
     )
-    parser.add_argument(
+    mode.add_argument(
         "--turn-only", action="store_true", help="Only test TURN allocation"
     )
-    parser.add_argument(
+    mode.add_argument(
         "--webrtc-only",
         "--webrtc-test",
         action="store_true",
         help="Only run WebRTC Data Channel test (default runs all tests)",
     )
+
     parser.add_argument(
         "--transport",
         choices=["udp", "tcp", "tls"],
         default="udp",
-        help="TURN transport for WebRTC test (default: udp; tls uses turns:)",
+        help="TURN transport for every sub-test (default: udp; tls uses turns:)",
     )
     parser.add_argument(
         "--duration",
@@ -661,6 +835,11 @@ Examples:
         default=1.0,
         help="Target Mbps for WebRTC data stream (default: 1)",
     )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Skip TLS certificate verification (applies to TLS STUN/TURN tests only)",
+    )
 
     args = parser.parse_args()
 
@@ -668,11 +847,21 @@ Examples:
     if args.port is None:
         args.port = 5349 if args.transport == "tls" else 3478
 
+    # Validate numeric inputs (argparse exits with code 2 on parser.error)
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
+    if args.timeout <= 0:
+        parser.error("--timeout must be a positive number of seconds")
+    if args.duration <= 0:
+        parser.error("--duration must be a positive number of seconds")
+    if args.rate_mbps <= 0:
+        parser.error("--rate-mbps must be greater than 0")
+
     # Check dependencies
     if not AIORTC_AVAILABLE:
-        print("ERROR: aiortc not installed")
-        print("Install with: pip install aiortc")
-        print("Or activate venv: source scripts/.venv/bin/activate")
+        eprint("ERROR: aiortc not installed")
+        eprint("Install with: pip install -r requirements.txt")
+        eprint("Or activate venv: source venv/bin/activate")
         sys.exit(1)
 
     print("CoTURN Server Test")
@@ -704,11 +893,17 @@ Examples:
     async def run_tests():
         if run_stun:
             results["stun"] = await test_stun_binding(
-                args.host, args.port, args.timeout
+                args.host, args.port, args.timeout, args.transport, args.insecure
             )
         if run_turn:
             results["turn"] = await test_turn_allocation(
-                args.host, args.port, args.username, args.password, args.timeout
+                args.host,
+                args.port,
+                args.username,
+                args.password,
+                args.timeout,
+                args.transport,
+                args.insecure,
             )
         if run_webrtc:
             results["webrtc"] = await test_webrtc_datachannel(
@@ -720,6 +915,7 @@ Examples:
                 args.transport,
                 args.duration,
                 args.rate_mbps,
+                args.insecure,
             )
 
     asyncio.run(run_tests())

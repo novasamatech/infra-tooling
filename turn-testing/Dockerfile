@@ -28,5 +28,6 @@ COPY app.py .
 # Switch to the non-privileged user
 USER pyuser
 
-# By default, run the script
-CMD ["python", "app.py"]
+# Run the script; CLI args passed to `docker run <image> ...` are appended
+# (e.g. `docker run <image> -H turn.example.com -u user -p pass`).
+ENTRYPOINT ["python", "app.py"]
