@@ -1,5 +1,9 @@
-# Copyright © 2025 Novasama Technologies GmbH
+# Copyright © 2026 Novasama Technologies GmbH
 # SPDX-License-Identifier: Apache-2.0
+
+# Single image for both entry points. It defaults to the Prometheus exporter;
+# the one-shot CLI is reached by overriding the CMD (see the bottom of this file
+# and README.md → Docker).
 
 # Use the official Python image based on Alpine
 FROM python:3.13-alpine
@@ -22,12 +26,26 @@ COPY requirements.txt .
 # Install dependencies without caching
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the Python script into the container
-COPY app.py .
+# Copy the shared library, both entry points, the config template, and the
+# version file (the exporter reads .version for coturn_exporter_build_info).
+COPY turntest.py app.py exporter.py coturn-exporter.example.toml .version .
 
 # Switch to the non-privileged user
 USER pyuser
 
-# Run the script; CLI args passed to `docker run <image> ...` are appended
-# (e.g. `docker run <image> -H turn.example.com -u user -p pass`).
-ENTRYPOINT ["python", "app.py"]
+# Prometheus scrape endpoint (used by the default exporter CMD).
+EXPOSE 9686
+
+# ENTRYPOINT is the interpreter, so the CMD (script + args) is what you replace
+# at `docker run` time. Default = the exporter; mount your config at
+# /config/coturn-exporter.toml:
+#
+#   docker run --rm -p 9686:9686 \
+#     -v "$PWD/coturn-exporter.toml:/config/coturn-exporter.toml:ro" <image>
+#
+# To run the one-shot CLI instead, override the CMD with `app.py` and its flags:
+#
+#   docker run --rm <image> app.py -H turn.example.com -u user -p pass --transport tcp
+#
+ENTRYPOINT ["python"]
+CMD ["exporter.py", "-c", "/config/coturn-exporter.toml"]

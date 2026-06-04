@@ -11,17 +11,22 @@ Guidance for AI agents and contributors working on this directory. Read
 
 ## Scope
 
-A single-file Python CLI (`app.py`) that tests a CoTURN server: STUN binding,
-TURN allocation, and a relay-only WebRTC data-channel throughput/integrity
-check. No package, no submodules — keep it a self-contained script.
+Tooling that tests a CoTURN server: STUN binding, TURN allocation, and a
+relay-only WebRTC data-channel throughput/integrity check. The shared logic
+lives in a small library (`turntest.py`) with two thin front-ends: the
+single-shot CLI (`app.py`) and a Prometheus exporter (`exporter.py`). Keep it
+flat — a library module plus entry points, not a package.
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| `app.py` | The whole tool. Executable, `#!/usr/bin/env python3`. |
+| `turntest.py` | The shared library: STUN/TURN/WebRTC tests, the exporter-only `webrtc_capacity_probe`, helpers, and the `StunResult`/`TurnResult`/`WebRtcResult`/`WebRtcCapacityResult` dataclasses. No `main()`. |
+| `app.py` | Single-shot CLI front-end. Executable, `#!/usr/bin/env python3`; imports from `turntest`. |
+| `exporter.py` | Prometheus exporter front-end: probes many servers on a timer, serves `/metrics`. Imports from `turntest`. |
+| `coturn-exporter.example.toml` | Placeholder exporter config (committed). The **live** config with real creds is never committed. |
 | `requirements.txt` | **Pinned** deps. The code relies on private internals of these exact versions. |
-| `Dockerfile` | Alpine + Python 3.13, non-root user, `ENTRYPOINT ["python","app.py"]`. |
+| `Dockerfile` | Single image, both entry points. Alpine + Python 3.13, non-root, `EXPOSE 9686`. `ENTRYPOINT ["python"]`, `CMD` runs the exporter by default; override the `CMD` with `app.py …` for the CLI. |
 | `Makefile` | Test runner: creates `venv/` on demand and runs the full scenario matrix. `make help`. |
 | `.version` | Image/release version tag (bump on behavioral changes). |
 | `venv/` | Local virtualenv (gitignored). Not committed. |
@@ -32,12 +37,13 @@ This is Python, not a JS project — run it directly through the venv (the globa
 "never run the JS toolchain on the host" rule does **not** apply here):
 
 ```sh
-venv/bin/python -m py_compile app.py     # quick syntax check
+venv/bin/python -m py_compile turntest.py app.py exporter.py   # quick syntax check
 ```
 
 There are **no unit tests**; validation is done against a live CoTURN server via
 the [`Makefile`](Makefile). It creates `./venv` on demand (installing
-`requirements.txt`) and runs the full scenario matrix — UDP/TCP/TLS ×
+`requirements.txt`) and runs the full scenario matrix — the no-network exporter
+smoke (`test-exporter`: modules compile + example config parses), UDP/TCP/TLS ×
 stun/turn/webrtc/all-three, the `--insecure` smoke, the argument guards (each
 must exit 2), and the low/moderate/high speed modes (which print the SCTP
 retransmission metric).
@@ -49,8 +55,10 @@ defaults**:
 export TURN_HOST=...        # hostname (required for the TLS WebRTC cert check)
 export TURN_PORT=3478       # UDP/TCP STUN/TURN port
 export TURN_TLS_PORT=5349   # TLS (turns:) port
-export TURN_USER=...
-export TURN_PASS=...
+# then EITHER static auth …
+export TURN_USER=... TURN_PASS=...
+# … OR a TURN REST secret (mutually exclusive with TURN_USER/TURN_PASS)
+export TURN_SECRET=...       # coturn static-auth-secret
 make test                   # full run; `make help` lists individual targets
                             # (test-udp / test-tcp / test-tls / test-guards / test-speed)
 ```
@@ -68,10 +76,71 @@ behaviours are by design and worth remembering:
 
 ## Architecture / invariants
 
-* **`main()`** parses args, picks which sub-tests to run (the three `--*-only`
-  flags are a mutually exclusive group), then drives them inside one
-  `asyncio.run`. Exit `0` = all selected tests passed, `1` = a failure, `2` =
-  bad args.
+* **Library split.** All test logic lives in `turntest.py`; `app.py` and
+  `exporter.py` only import from it. The three `test_*` coroutines **return**
+  result dataclasses (`StunResult`/`TurnResult`/`WebRtcResult`) *and* keep every
+  original stdout/stderr progress line — so the CLI output is byte-for-byte
+  unchanged while the exporter can read the measured metrics. `.ok` is the
+  pass/fail flag. When editing a `test_*` function, every `return` must hand back
+  the right dataclass (the WebRTC path funnels them through the local `_wr()`
+  helper, which folds in the live SCTP retransmit counts). Do **not** move prints
+  to stderr or drop them — the CLI contract depends on them. A fourth coroutine,
+  `webrtc_capacity_probe` (→ `WebRtcCapacityResult`), is exporter-only and the CLI
+  never calls it.
+* **`app.py main()`** parses args, picks which sub-tests to run (the three
+  `--*-only` flags are a mutually exclusive group), then drives them inside one
+  `asyncio.run`, reading `.ok` from each result. Exit `0` = all selected tests
+  passed, `1` = a failure, `2` = bad args.
+* **`exporter.py`** loads a TOML config (`load_config`), then loops
+  `run_cycle` → sleep(`interval`) forever, probing every server sequentially
+  (`probe_server`) and updating the Prometheus metrics (`Metrics` — gauges plus
+  the `coturn_cycles_total` counter and the `coturn_exporter_build_info` info).
+  Sequential by design — concurrent WebRTC probes would skew each other's
+  throughput and load the relay. The HTTP server runs in `prometheus_client`'s
+  background thread; the asyncio loop and a `SIGTERM`/`SIGINT` handler share an
+  `asyncio.Event` for clean shutdown (exit `0`). The probe coroutines already
+  swallow their own errors, but `probe_server` wraps each in a try/except so one
+  crash never kills the cycle — an unreachable host or bad credentials just set
+  `coturn_probe_success=0` for the affected sub-tests and the loop keeps cycling.
+  `coturn_exporter_build_info{version}` is read from `.version` next to the script
+  (copied into the image by the Dockerfile; falls back to `unknown`).
+* **Exporter WebRTC = capacity ramp, not a fixed rate.** The exporter does **not**
+  call `test_webrtc_datachannel`; it calls `turntest.webrtc_capacity_probe`, which
+  ramps the send rate (`ramp_start_mbps` × `ramp_factor` per step, `ramp_step_duration`
+  each) and stops at the first step whose *incremental* SCTP retransmit ratio
+  reaches the threshold (`retransmit_threshold_percent`, default 0.5 %).
+  `capacity_mbps` is the last rate **below** the threshold (the over-capacity step
+  that trips the threshold is excluded — we `break` before recording it), and
+  `stopped_on_threshold` distinguishes a real knee from hitting
+  `ramp_max_mbps`/`ramp_max_duration`. The exporter exposes only
+  `coturn_webrtc_capacity_bits_per_second` (the dataclass `capacity_mbps` × 1e6 —
+  base units per Prometheus convention) + `coturn_webrtc_threshold_reached`; the
+  per-test pass/fail is `coturn_probe_success{server,transport,test}`. **No
+  retransmit-ratio metric** (the ramp drives *to* the threshold, so loss at
+  capacity is sub-threshold ~0 by construction) and **no relay-confirmed metric**
+  (relay-only is already enforced; `coturn_probe_success` implies it).
+  `WebRtcCapacityResult` still
+  computes `retransmit_ratio`/`relay_confirmed` for the log line and library
+  callers, but they are not published. `duration` is recorded for stun/turn only
+  (the webrtc value is the ramp wall-time, an artifact).
+  Each step is measured by per-step counter **deltas**; the cumulative SCTP counter
+  is never exposed, so the over-driven step can't pollute earlier steps.
+  A discarded **warm-up** (`ramp_warmup_duration` at `start_mbps`) runs before the
+  ramp so SCTP slow-start / initial-RTO retransmits don't contaminate the first
+  measured step — without it the first step reads a spurious double-digit ratio and
+  capacity is underreported. Each
+  step snapshots the cumulative SCTP counters, sends a paced burst, then **settles**
+  (drains `bufferedAmount`, then sleeps ~0.5 s) before reading the counters again so
+  late retransmits are attributed to the right step. If `instrument_sctp_retransmits`
+  returns `None` the probe fails fast — without the counter the ramp has no stop
+  signal. The CLI's `test_webrtc_datachannel` (fixed `--rate-mbps`/`--duration`) is
+  unchanged and untouched by this path.
+* **Authentication** is resolved in `main()` to a `username`/`password` pair that
+  the rest of the code uses unchanged. Two mutually exclusive modes: static
+  (`-u`/`-p`) or TURN REST (`--auth-secret`, coturn `static-auth-secret`).
+  `make_rest_credentials()` derives `username = <expiry>[:userid]` and
+  `password = base64(HMAC-SHA1(secret, username))` — the secret is the raw HMAC
+  key, and each process run mints a fresh credential (`--auth-ttl`, default 1h).
 * **stdout vs stderr:** progress (`[STUN]`/`[TURN]`/`[WEBRTC] …`) goes to
   stdout; errors/warnings go through `eprint()` to stderr. Keep that split.
 * **Transport handling:** `--transport` must flow into *all three* sub-tests.
@@ -129,5 +198,9 @@ behaviours are by design and worth remembering:
 If you change `requirements.txt`, recreate the venv (`make clean && make venv`)
 and run `make test` against a real server. Confirm the private-attribute access
 points still resolve: relay pruning logs "kept N relay", "Relay-only path
-confirmed" prints, and the "SCTP retransmissions" line appears. Update
-`.version` accordingly.
+confirmed" prints, and the "SCTP retransmissions" line appears. The exporter's
+`webrtc_capacity_probe` leans on the same internals — also run the exporter
+against a real server and confirm its `[CAPACITY] step …` lines show non-zero
+DATA-chunk counts and `[CAPACITY] … Relay-only path confirmed` prints (if
+`instrument_sctp_retransmits` breaks, the probe logs "could not instrument SCTP
+retransmissions" and fails). Update `.version` accordingly.

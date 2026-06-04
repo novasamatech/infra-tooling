@@ -1,0 +1,71 @@
+# Copyright © 2026 Novasama Technologies GmbH
+# SPDX-License-Identifier: Apache-2.0
+#
+# Example configuration for exporter.py (the CoTURN Prometheus exporter).
+# Copy this file, fill in real servers/credentials, and run:
+#
+#   ./exporter.py -c coturn-exporter.toml
+#
+# Do NOT commit a file containing real credentials. Keep the live config out of
+# the repo (e.g. mount it as a secret) — only this placeholder example is tracked.
+
+# ---- HTTP endpoint -------------------------------------------------------- #
+listen_address = "0.0.0.0"   # metrics bind address
+listen_port    = 9686        # GET http://<addr>:9686/metrics
+
+# ---- Scheduling ----------------------------------------------------------- #
+interval = 300               # seconds between probe cycles (default 5 minutes)
+
+# ---- Global defaults (each server may override any of these) -------------- #
+timeout  = 30                # per-operation timeout, seconds
+insecure = false             # skip TLS verification for STUN/TURN (not WebRTC)
+auth_ttl = 3600              # lifetime of derived TURN REST credentials, seconds
+
+# Which transports and sub-tests to run for every server (override per server).
+transports = ["udp", "tcp", "tls"]
+tests      = ["stun", "turn", "webrtc"]
+
+# ---- Adaptive WebRTC capacity probe --------------------------------------- #
+# The WebRTC test does NOT use a fixed rate or duration. It ramps the send rate
+# up step by step and stops as soon as the SCTP retransmission ratio of a step
+# reaches `retransmit_threshold_percent`. `coturn_webrtc_capacity_bits_per_second` is then
+# the highest rate sustained below that threshold. Because it stops at the first
+# sign of loss, it stays gentle on the relay.
+#
+# The threshold is the one knob you normally touch; the ramp shape has sane
+# defaults (shown here so you can tune if needed).
+retransmit_threshold_percent = 0.5   # stop the ramp at 0.5 % retransmits
+ramp_start_mbps    = 1.0             # first step
+ramp_factor        = 1.5             # multiply the rate by this each step
+ramp_step_duration = 3.0             # seconds spent measuring at each step
+ramp_warmup_duration = 2.0           # discarded warm-up at the start rate so SCTP
+                                     # slow-start doesn't skew the first step (0 disables)
+ramp_max_mbps      = 100.0           # safety cap on the rate
+ramp_max_duration  = 60.0            # safety cap on total ramp time per probe
+
+# ---- Servers (add as many [[servers]] blocks as you need) ----------------- #
+
+# Static long-term credentials (coturn user database / lt-cred-mech):
+[[servers]]
+name     = "example-static"
+host     = "turn.example.com"   # hostname (required for the TLS WebRTC cert check)
+port     = 3478                 # UDP/TCP STUN/TURN port
+tls_port = 5349                 # TLS (turns:) port
+username = "CHANGE_ME"
+password = "CHANGE_ME"
+# Per-server overrides (optional):
+# transports = ["udp", "tcp"]
+# tests      = ["stun", "turn", "webrtc"]
+# retransmit_threshold_percent = 1.0
+
+# TURN REST credentials derived from coturn's static-auth-secret (use-auth-secret):
+[[servers]]
+name        = "example-rest"
+host        = "turn-rest.example.com"
+port        = 3478
+tls_port    = 5349
+auth_secret = "CHANGE_ME"       # coturn static-auth-secret
+auth_user   = "monitor"         # optional user id embedded in the REST username
+# auth_ttl  = 3600
+# Skip the WebRTC capacity probe on this one, only check reachability:
+# tests     = ["stun", "turn"]
