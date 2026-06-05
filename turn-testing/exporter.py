@@ -13,7 +13,7 @@ results as Prometheus metrics over HTTP at ``/metrics``.
 The WebRTC check is an **adaptive capacity probe**: instead of a fixed target
 rate and duration, it ramps the send rate up step by step until the SCTP DATA
 retransmission ratio crosses a configurable threshold (``retransmit_threshold_percent``,
-default 0.5 %). The reported ``coturn_webrtc_capacity_bits_per_second`` is the highest rate
+default 0.5 %). The reported ``turn_testing_webrtc_capacity_bits_per_second`` is the highest rate
 sustained below that threshold — i.e. the relay's usable throughput "knee". The
 ramp stops as soon as loss appears, so it stays gentle on the servers.
 
@@ -25,13 +25,13 @@ Usage:
     ./exporter.py -c coturn-exporter.toml --listen-port 9686 --oneshot
 
 Metrics:
-    coturn_probe_success{server,transport,test}            1 if the sub-test passed, else 0
-    coturn_probe_duration_seconds{server,transport,test}   sub-test latency (stun/turn only)
-    coturn_webrtc_capacity_bits_per_second{server,transport}   max rate sustained < threshold
-    coturn_webrtc_threshold_reached{server,transport}      1 if a knee was found (else hit the cap)
-    coturn_cycle_duration_seconds                          duration of the whole probe cycle
-    coturn_cycles_total                                    number of completed cycles
-    coturn_exporter_build_info{version}                    exporter version (value always 1)
+    turn_testing_probe_success{server,transport,test}            1 if the sub-test passed, else 0
+    turn_testing_probe_duration_seconds{server,transport,test}   sub-test latency (stun/turn only)
+    turn_testing_webrtc_capacity_bits_per_second{server,transport}   max rate sustained < threshold
+    turn_testing_webrtc_threshold_reached{server,transport}      1 if a knee was found (else hit the cap)
+    turn_testing_cycle_duration_seconds                          duration of the whole probe cycle
+    turn_testing_cycles_total                                    number of completed cycles
+    turn_testing_exporter_build_info{version}                    exporter version (value always 1)
 """
 
 import argparse
@@ -284,7 +284,7 @@ class Metrics:
         # Health per server × transport × sub-test (stun/turn/webrtc) — tells you
         # exactly which protocol and transport is failing.
         self.probe_success = Gauge(
-            "coturn_probe_success",
+            "turn_testing_probe_success",
             "1 if the sub-test passed, else 0 (per server, transport, test)",
             probe_labels,
             registry=reg,
@@ -292,34 +292,34 @@ class Metrics:
         # Latency of the sub-test. Only meaningful for stun/turn (the webrtc value
         # would be the ramp wall-time, an artifact), so it is recorded for those two.
         self.duration = Gauge(
-            "coturn_probe_duration_seconds",
+            "turn_testing_probe_duration_seconds",
             "Sub-test latency in seconds (stun/turn only)",
             probe_labels,
             registry=reg,
         )
         # Base unit (bits/second), per Prometheus convention — e.g. 16 Mbit/s = 1.6e7.
         self.capacity_bits_per_second = Gauge(
-            "coturn_webrtc_capacity_bits_per_second",
+            "turn_testing_webrtc_capacity_bits_per_second",
             "Highest WebRTC send rate sustained below the retransmit threshold, in bits/second",
             wr_labels,
             registry=reg,
         )
         self.threshold_reached = Gauge(
-            "coturn_webrtc_threshold_reached",
+            "turn_testing_webrtc_threshold_reached",
             "1 if the ramp found a knee (crossed the threshold); 0 if it hit the rate/time cap",
             wr_labels,
             registry=reg,
         )
         self.cycle_duration = Gauge(
-            "coturn_cycle_duration_seconds",
+            "turn_testing_cycle_duration_seconds",
             "Duration of the most recent probe cycle in seconds",
             registry=reg,
         )
         self.cycles_total = Counter(
-            "coturn_cycles_total", "Number of completed probe cycles", registry=reg
+            "turn_testing_cycles_total", "Number of completed probe cycles", registry=reg
         )
         self.build_info = Info(
-            "coturn_exporter_build", "CoTURN exporter build information", registry=reg
+            "turn_testing_exporter_build", "CoTURN exporter build information", registry=reg
         )
         self.build_info.info({"version": EXPORTER_VERSION})
 

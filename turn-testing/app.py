@@ -49,7 +49,8 @@ CLI Parameters:
     --transport      TURN transport for every sub-test (udp|tcp|tls) [default: udp]
     --duration       Duration in seconds for the WebRTC data stream [default: 10]
     --rate-mbps      Target Mbps for the WebRTC data stream [default: 1]
-    --insecure       Skip TLS certificate verification (TLS STUN/TURN only)
+    --insecure       Skip TLS certificate verification (all TLS sub-tests:
+                     STUN, TURN, and the WebRTC turns: relay) [default: off]
 
 Requirements:
     pip install -r requirements.txt
@@ -161,7 +162,8 @@ Examples:
     parser.add_argument(
         "--insecure",
         action="store_true",
-        help="Skip TLS certificate verification (applies to TLS STUN/TURN tests only)",
+        help="Skip TLS certificate verification (applies to all TLS sub-tests: "
+        "STUN, TURN, and the WebRTC turns: relay connection; default: off)",
     )
 
     args = parser.parse_args()

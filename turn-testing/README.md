@@ -64,7 +64,7 @@ pip install -r requirements.txt
 | `--transport` | Transport for **every** sub-test: `udp`, `tcp`, or `tls`. | `udp` |
 | `--duration` | WebRTC data-stream duration in seconds. | `10` |
 | `--rate-mbps` | Target WebRTC data-stream rate in Mbps. | `1` |
-| `--insecure` | Skip TLS certificate verification (TLS STUN/TURN only — see caveats). | off |
+| `--insecure` | Skip TLS certificate verification for all TLS sub-tests (STUN, TURN, and the WebRTC `turns:` relay — see caveats). | off |
 
 `--stun-only`, `--turn-only`, and `--webrtc-only` are mutually exclusive; with
 none of them set, all three tests run.
@@ -158,7 +158,7 @@ values:
   duration to configure. It ramps the send rate up step by step
   (`ramp_start_mbps` × `ramp_factor` each step) and stops at the first step whose
   SCTP retransmission ratio reaches `retransmit_threshold_percent`
-  (**default 0.5 %**). `coturn_webrtc_capacity_bits_per_second` is then the
+  (**default 0.5 %**). `turn_testing_webrtc_capacity_bits_per_second` is then the
   highest rate sustained below that threshold — the relay's usable throughput
   "knee". Because
   it stops at the first sign of loss, it stays gentle on the relay (no fixed
@@ -173,8 +173,8 @@ values:
 * Per-server authentication is either static (`username`/`password`) or TURN REST
   (`auth_secret`), mirroring the CLI.
 * **Robust to bad targets.** If a server is unreachable, times out, or rejects
-  credentials, the affected sub-tests report `coturn_probe_success = 0` (per
-  `transport` and `test`) and `coturn_webrtc_capacity_bits_per_second = 0`; the
+  credentials, the affected sub-tests report `turn_testing_probe_success = 0` (per
+  `transport` and `test`) and `turn_testing_webrtc_capacity_bits_per_second = 0`; the
   exporter logs the error and keeps cycling — one bad target never crashes it.
   (STUN binding needs no auth, so on a wrong credential STUN can still report `1`
   while TURN/WebRTC report `0` — telling you it's an auth problem, not reachability.)
@@ -187,20 +187,20 @@ values:
 
 ### Metrics
 
-`coturn_probe_success` and `coturn_probe_duration_seconds` carry the labels
+`turn_testing_probe_success` and `turn_testing_probe_duration_seconds` carry the labels
 `server`, `transport`, and `test` (`stun` / `turn` / `webrtc`) — so you can see
-exactly **which protocol on which transport** is failing; the `coturn_webrtc_*`
+exactly **which protocol on which transport** is failing; the `turn_testing_webrtc_*`
 gauges carry `server` and `transport`:
 
 | Metric | Meaning |
 | --- | --- |
-| `coturn_probe_success` | `1` if the sub-test passed, else `0`. Labelled per `server` × `transport` × `test`. |
-| `coturn_probe_duration_seconds` | Sub-test latency, seconds. Recorded for `stun`/`turn` only (the webrtc value would be the ramp wall-time, not a latency). |
-| `coturn_webrtc_capacity_bits_per_second` | Highest send rate sustained **below** the retransmit threshold, in **bits/second** (e.g. `1.6e7` = 16 Mbit/s) — the headline result. |
-| `coturn_webrtc_threshold_reached` | `1` if a knee was found; `0` if the ramp hit the rate/time cap (capacity is then a floor, the real value may be higher). |
-| `coturn_cycle_duration_seconds` | Duration of the most recent probe cycle (no labels). |
-| `coturn_cycles_total` | Completed probe cycles (counter); `increase(coturn_cycles_total[N]) == 0` means the exporter stopped probing. |
-| `coturn_exporter_build_info` | Exporter version carried in the `version` label; value is always `1`. |
+| `turn_testing_probe_success` | `1` if the sub-test passed, else `0`. Labelled per `server` × `transport` × `test`. |
+| `turn_testing_probe_duration_seconds` | Sub-test latency, seconds. Recorded for `stun`/`turn` only (the webrtc value would be the ramp wall-time, not a latency). |
+| `turn_testing_webrtc_capacity_bits_per_second` | Highest send rate sustained **below** the retransmit threshold, in **bits/second** (e.g. `1.6e7` = 16 Mbit/s) — the headline result. |
+| `turn_testing_webrtc_threshold_reached` | `1` if a knee was found; `0` if the ramp hit the rate/time cap (capacity is then a floor, the real value may be higher). |
+| `turn_testing_cycle_duration_seconds` | Duration of the most recent probe cycle (no labels). |
+| `turn_testing_cycles_total` | Completed probe cycles (counter); `increase(turn_testing_cycles_total[N]) == 0` means the exporter stopped probing. |
+| `turn_testing_exporter_build_info` | Exporter version carried in the `version` label; value is always `1`. |
 
 Running the exporter in Docker is covered by the unified image in
 [Docker](#docker) above (it is the default `CMD`).
@@ -235,11 +235,11 @@ groups:
         labels: { severity: critical }
         annotations:
           summary: "CoTURN exporter not scrapeable ({{ $labels.instance }})"
-          description: "All coturn_* metrics are stale; the target alerts are blind until this clears."
+          description: "All turn_testing_* metrics are stale; the target alerts are blind until this clears."
 
       - alert: CoturnExporterStalled
         # The window MUST be larger than the exporter's `interval` (default 300s).
-        expr: increase(coturn_cycles_total[20m]) < 1
+        expr: increase(turn_testing_cycles_total[20m]) < 1
         for: 5m
         labels: { severity: critical }
         annotations:
@@ -250,7 +250,7 @@ groups:
     rules:
       # STUN is unauthenticated → a STUN failure is pure reachability (host/port/DNS/net).
       - alert: CoturnServerUnreachable
-        expr: coturn_probe_success{test="stun"} == 0
+        expr: turn_testing_probe_success{test="stun"} == 0
         for: 15m
         labels: { severity: critical }
         annotations:
@@ -260,8 +260,8 @@ groups:
       # STUN OK but TURN not → auth / allocation problem, not the network.
       - alert: CoturnTurnAllocationFailing
         expr: |
-          coturn_probe_success{test="turn"} == 0
-          and on (server, transport) coturn_probe_success{test="stun"} == 1
+          turn_testing_probe_success{test="turn"} == 0
+          and on (server, transport) turn_testing_probe_success{test="stun"} == 1
         for: 15m
         labels: { severity: critical }
         annotations:
@@ -271,8 +271,8 @@ groups:
       # TURN allocates but the relayed data path won't come up → relay ports / NAT / egress.
       - alert: CoturnRelayPathFailing
         expr: |
-          coturn_probe_success{test="webrtc"} == 0
-          and on (server, transport) coturn_probe_success{test="turn"} == 1
+          turn_testing_probe_success{test="webrtc"} == 0
+          and on (server, transport) turn_testing_probe_success{test="turn"} == 1
         for: 20m
         labels: { severity: critical }
         annotations:
@@ -282,8 +282,8 @@ groups:
       # TLS path fails while a non-TLS transport on the SAME server works → cert/TLS-specific.
       - alert: CoturnTlsProbeFailing
         expr: |
-          coturn_probe_success{transport="tls", test="turn"} == 0
-          and on (server) max by (server) (coturn_probe_success{transport!="tls", test="turn"}) == 1
+          turn_testing_probe_success{transport="tls", test="turn"} == 0
+          and on (server) max by (server) (turn_testing_probe_success{transport!="tls", test="turn"}) == 1
         for: 15m
         labels: { severity: warning }
         annotations:
@@ -294,8 +294,8 @@ groups:
       # below your relays' normal knee, gated on the path being up. Tune 2e6 to your env.
       - alert: CoturnCapacityDegraded
         expr: |
-          avg_over_time(coturn_webrtc_capacity_bits_per_second[1h]) < 2e6
-          and on (server, transport) coturn_probe_success{test="webrtc"} == 1
+          avg_over_time(turn_testing_webrtc_capacity_bits_per_second[1h]) < 2e6
+          and on (server, transport) turn_testing_probe_success{test="webrtc"} == 1
         for: 30m
         labels: { severity: warning }
         annotations:
@@ -310,7 +310,7 @@ groups:
   `CoturnExporterStalled` window **larger than `interval`**.
 * The layered `and on(...)` guards assume `tests = ["stun", "turn", "webrtc"]`
   (the default). If you run a reduced `tests` list, drop the guard and alert on
-  `coturn_probe_success{test="…"} == 0` directly.
+  `turn_testing_probe_success{test="…"} == 0` directly.
 * `CoturnCapacityDegraded`'s `2e6` floor is a placeholder — capacity varies, so
   pick a value well under your relays' typical knee and keep it `warning`.
 
@@ -376,11 +376,14 @@ read [AGENTS.md](AGENTS.md).
 
 ## Caveats
 
-* **TLS verification:** `--insecure` only affects the STUN and standalone TURN
-  allocation tests (whose TLS context this tool controls). The WebRTC
-  `turns:` connection is established by aiortc/aioice internally and **always**
-  verifies the server certificate against the system trust store. Use a
-  certificate trusted by the host (or a hostname, not a bare IP) for the
+* **TLS verification:** off by default — every TLS sub-test verifies the server
+  certificate against the system trust store. `--insecure` (exporter: `insecure`)
+  disables verification for **all** TLS sub-tests: STUN, standalone TURN, *and*
+  the WebRTC `turns:` relay. aiortc/aioice build the WebRTC `turns:` TLS context
+  internally with no public knob to relax it, so the tool reaches into the aioice
+  connection and swaps in a non-verifying context before ICE gathering (a
+  private-attribute access — see *Library internals*). For a verifying run use a
+  certificate trusted by the host and a hostname (not a bare IP) for the
   `--transport tls` WebRTC test.
 * **Library internals:** relay-only enforcement and the candidate-pair
   inspection depend on private attributes of `aiortc`/`aioice`. They are

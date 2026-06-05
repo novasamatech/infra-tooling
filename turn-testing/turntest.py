@@ -215,6 +215,37 @@ def prune_local_candidates_to_relay(pc, label):
         return None
 
 
+def apply_insecure_turns_tls(pc, transport, insecure, label, tag="[WEBRTC]"):
+    """Relax TLS verification on the WebRTC ``turns:`` relay connection.
+
+    aiortc builds the ``turns:`` TLS context itself: it hands aioice
+    ``turn_ssl=True``, which becomes a *verifying* default ``SSLContext``, and
+    exposes no public knob to relax it — so ``insecure`` otherwise never reaches
+    the WebRTC path (STUN/TURN honor it, WebRTC does not). We reach into the
+    aioice ``Connection`` and swap that ``turn_ssl`` flag for a non-verifying
+    ``SSLContext`` *before* candidate gathering starts (``create_turn_endpoint``
+    accepts an ``SSLContext`` in place of the bool). Relies on private attributes
+    (see module docstring).
+
+    No-op unless ``transport == 'tls'`` and ``insecure``. The ``conn.turn_ssl``
+    guard ensures we only relax an existing ``turns:`` context and never
+    accidentally enable TLS on a plaintext ``turn:`` connection. Must run after
+    the peer's SCTP transport exists (offerer: after ``createDataChannel``;
+    answerer: after ``setRemoteDescription``) and before its gathering.
+    """
+    if transport != "tls" or not insecure:
+        return
+    try:
+        conn = pc.sctp.transport.transport.iceGatherer._connection  # type: ignore[attr-defined]
+        if conn.turn_ssl:  # only relax an actual turns: context
+            conn.turn_ssl = make_ssl_context(insecure=True)  # type: ignore[attr-defined]
+            print(f"{tag} {label}: turns: TLS verification disabled (insecure)")
+    except Exception as e:
+        eprint(
+            f"{tag} WARNING: could not apply insecure TLS to turns: for {label}: {e}"
+        )
+
+
 def instrument_sctp_retransmits(pc):
     """Wrap a peer's SCTP transport to count DATA chunk (re)transmissions.
 
@@ -519,12 +550,6 @@ async def test_webrtc_datachannel(
         f"[WEBRTC] Target stream: {rate_mbps} Mbps for {stream_duration}s (data channel)"
     )
 
-    if transport == "tls" and insecure:
-        eprint(
-            "[WEBRTC] WARNING: --insecure does not apply to the WebRTC turns: "
-            "connection; it always verifies the server certificate."
-        )
-
     test_start = time.monotonic()
 
     # Configure TURN server (transport can be udp/tcp/tls)
@@ -635,6 +660,10 @@ async def test_webrtc_datachannel(
         def on_dc1_error(error):
             eprint(f"[WEBRTC] PC1 data channel error: {error}")
 
+        # Honor insecure on the turns: relay connection (must run before PC1
+        # gathers, i.e. before setLocalDescription). No-op unless tls + insecure.
+        apply_insecure_turns_tls(pc1, transport, insecure, "PC1")
+
         # Step 2: Create and exchange offers (relay-only ICE policy)
         print("[WEBRTC] Creating offer...")
         offer = await pc1.createOffer()
@@ -655,6 +684,10 @@ async def test_webrtc_datachannel(
         # Step 3: PC2 processes offer and creates answer
         print("[WEBRTC] PC2 processing offer...")
         await pc2.setRemoteDescription(filtered_offer)
+
+        # PC2 also reaches the relay over turns:; relax its TLS context too,
+        # before it gathers (setLocalDescription below). No-op unless tls + insecure.
+        apply_insecure_turns_tls(pc2, transport, insecure, "PC2")
 
         answer = await pc2.createAnswer()
         await pc2.setLocalDescription(answer)
@@ -953,12 +986,6 @@ async def webrtc_capacity_probe(
         f"{transport.upper()} until retransmits >= {threshold_ratio * 100:.2f}%..."
     )
 
-    if transport == "tls" and insecure:
-        eprint(
-            "[CAPACITY] WARNING: --insecure does not apply to the WebRTC turns: "
-            "connection; it always verifies the server certificate."
-        )
-
     test_start = time.monotonic()
 
     turn_url = build_turn_url(host, port, transport)
@@ -1018,6 +1045,10 @@ async def webrtc_capacity_probe(
         def _on_open():
             dc1_open.set()
 
+        # Honor insecure on the turns: relay connection before PC1 gathers.
+        # No-op unless tls + insecure (see apply_insecure_turns_tls).
+        apply_insecure_turns_tls(pc1, transport, insecure, "PC1", tag="[CAPACITY]")
+
         # Offer / answer with relay-only enforcement (same dance as the CLI test).
         offer = await pc1.createOffer()
         await pc1.setLocalDescription(offer)
@@ -1029,6 +1060,7 @@ async def webrtc_capacity_probe(
         filtered_offer = filter_sdp_for_relay_only(pc1.localDescription, "PC1")
 
         await pc2.setRemoteDescription(filtered_offer)
+        apply_insecure_turns_tls(pc2, transport, insecure, "PC2", tag="[CAPACITY]")
         answer = await pc2.createAnswer()
         await pc2.setLocalDescription(answer)
         await wait_for_ice_gathering_complete(pc2, timeout=timeout)

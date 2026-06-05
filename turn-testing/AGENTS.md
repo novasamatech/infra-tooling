@@ -66,10 +66,11 @@ make test                   # full run; `make help` lists individual targets
 A change is "verified" only after `make test` passes against a real server. Two
 behaviours are by design and worth remembering:
 
-* For `--transport tls`, set `TURN_HOST` to the **hostname** (not an IP): the
-  WebRTC `turns:` path always verifies the certificate and the cert CN is the
-  hostname. An unroutable AAAA record is fine — `create_connection` falls back
-  to IPv4. (`--insecure` only relaxes the STUN/TURN TLS contexts — see gotcha #4.)
+* For a **verifying** `--transport tls` run (without `--insecure`), set
+  `TURN_HOST` to the **hostname** (not an IP): the WebRTC `turns:` path verifies
+  the certificate and the cert CN is the hostname. An unroutable AAAA record is
+  fine — `create_connection` falls back to IPv4. (`--insecure` relaxes **all**
+  TLS contexts, WebRTC included — see gotcha #4.)
 * The high-rate capacity probe in `test-speed` may fail on a constrained path;
   it is marked informational (`-` in the recipe) and does **not** fail
   `make test`. Read its `SCTP retransmissions … (P%)` line to judge the channel.
@@ -94,15 +95,15 @@ behaviours are by design and worth remembering:
 * **`exporter.py`** loads a TOML config (`load_config`), then loops
   `run_cycle` → sleep(`interval`) forever, probing every server sequentially
   (`probe_server`) and updating the Prometheus metrics (`Metrics` — gauges plus
-  the `coturn_cycles_total` counter and the `coturn_exporter_build_info` info).
+  the `turn_testing_cycles_total` counter and the `turn_testing_exporter_build_info` info).
   Sequential by design — concurrent WebRTC probes would skew each other's
   throughput and load the relay. The HTTP server runs in `prometheus_client`'s
   background thread; the asyncio loop and a `SIGTERM`/`SIGINT` handler share an
   `asyncio.Event` for clean shutdown (exit `0`). The probe coroutines already
   swallow their own errors, but `probe_server` wraps each in a try/except so one
   crash never kills the cycle — an unreachable host or bad credentials just set
-  `coturn_probe_success=0` for the affected sub-tests and the loop keeps cycling.
-  `coturn_exporter_build_info{version}` is read from `.version` next to the script
+  `turn_testing_probe_success=0` for the affected sub-tests and the loop keeps cycling.
+  `turn_testing_exporter_build_info{version}` is read from `.version` next to the script
   (copied into the image by the Dockerfile; falls back to `unknown`).
 * **Exporter WebRTC = capacity ramp, not a fixed rate.** The exporter does **not**
   call `test_webrtc_datachannel`; it calls `turntest.webrtc_capacity_probe`, which
@@ -113,12 +114,12 @@ behaviours are by design and worth remembering:
   that trips the threshold is excluded — we `break` before recording it), and
   `stopped_on_threshold` distinguishes a real knee from hitting
   `ramp_max_mbps`/`ramp_max_duration`. The exporter exposes only
-  `coturn_webrtc_capacity_bits_per_second` (the dataclass `capacity_mbps` × 1e6 —
-  base units per Prometheus convention) + `coturn_webrtc_threshold_reached`; the
-  per-test pass/fail is `coturn_probe_success{server,transport,test}`. **No
+  `turn_testing_webrtc_capacity_bits_per_second` (the dataclass `capacity_mbps` × 1e6 —
+  base units per Prometheus convention) + `turn_testing_webrtc_threshold_reached`; the
+  per-test pass/fail is `turn_testing_probe_success{server,transport,test}`. **No
   retransmit-ratio metric** (the ramp drives *to* the threshold, so loss at
   capacity is sub-threshold ~0 by construction) and **no relay-confirmed metric**
-  (relay-only is already enforced; `coturn_probe_success` implies it).
+  (relay-only is already enforced; `turn_testing_probe_success` implies it).
   `WebRtcCapacityResult` still
   computes `retransmit_ratio`/`relay_confirmed` for the log line and library
   callers, but they are not published. `duration` is recorded for stun/turn only
@@ -176,6 +177,10 @@ behaviours are by design and worth remembering:
    against the new versions and update if needed:
    - `turn_transport._TurnTransport__relayed_address`
    - `pc.sctp.transport.transport.iceGatherer._connection`
+   - aioice `Connection.turn_ssl` — overwritten with a non-verifying
+     `ssl.SSLContext` to make the WebRTC `turns:` path honor `--insecure`
+     (`apply_insecure_turns_tls`; `create_turn_endpoint` accepts an `SSLContext`
+     in place of the `bool`). Must be set before gathering.
    - aioice `Connection._local_candidates`, `Connection._nominated`
    - `CandidatePair.local_candidate` / `.remote_candidate`, `Candidate.type`
    - `pc.sctp._send_chunk` (wrapped) + `DataChunk._sent_count` from
@@ -186,9 +191,17 @@ behaviours are by design and worth remembering:
      `_send_chunk`.
    aioice's TURN client has **no** `mapped_address` attribute — don't try to
    read one (an earlier version did, and it was dead code).
-4. **TLS verification.** `--insecure` only reaches the STUN and standalone TURN
-   contexts. aiortc builds the WebRTC `turns:` TLS context itself and always
-   verifies — don't claim `--insecure` covers WebRTC.
+4. **TLS verification.** Off by default (every TLS context verifies). `--insecure`
+   reaches **all** TLS contexts: STUN and standalone TURN build their own context
+   via `make_ssl_context`, and the WebRTC `turns:` path is relaxed by
+   `apply_insecure_turns_tls`, which swaps the aioice `Connection.turn_ssl` bool
+   for a non-verifying `ssl.SSLContext` *before* gathering (offerer: after
+   `createDataChannel`; answerer: after `setRemoteDescription`). It is gated on
+   `transport == "tls"` **and** the `conn.turn_ssl` truthiness guard, so it never
+   enables TLS on a plaintext `turn:` connection. Without `--insecure` the WebRTC
+   `turns:` path keeps verifying against the system trust store (use a hostname,
+   not a bare IP). Verified against this server: TLS-by-IP WebRTC fails cert
+   verification without `--insecure` and passes with it.
 5. **Port defaults follow transport** (`5349` for tls, else `3478`). Because all
    sub-tests now honor `--transport`, this is consistent; if you decouple ports
    per-test, re-check this logic.

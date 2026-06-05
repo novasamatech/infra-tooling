@@ -18,7 +18,8 @@ interval = 300               # seconds between probe cycles (default 5 minutes)
 
 # ---- Global defaults (each server may override any of these) -------------- #
 timeout  = 30                # per-operation timeout, seconds
-insecure = false             # skip TLS verification for STUN/TURN (not WebRTC)
+insecure = false             # skip TLS verification for all TLS sub-tests
+                             # (STUN, TURN, and the WebRTC turns: relay)
 auth_ttl = 3600              # lifetime of derived TURN REST credentials, seconds
 
 # Which transports and sub-tests to run for every server (override per server).
@@ -28,7 +29,7 @@ tests      = ["stun", "turn", "webrtc"]
 # ---- Adaptive WebRTC capacity probe --------------------------------------- #
 # The WebRTC test does NOT use a fixed rate or duration. It ramps the send rate
 # up step by step and stops as soon as the SCTP retransmission ratio of a step
-# reaches `retransmit_threshold_percent`. `coturn_webrtc_capacity_bits_per_second` is then
+# reaches `retransmit_threshold_percent`. `turn_testing_webrtc_capacity_bits_per_second` is then
 # the highest rate sustained below that threshold. Because it stops at the first
 # sign of loss, it stays gentle on the relay.
 #

@@ -27,7 +27,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the shared library, both entry points, the config template, and the
-# version file (the exporter reads .version for coturn_exporter_build_info).
+# version file (the exporter reads .version for turn_testing_exporter_build_info).
 COPY turntest.py app.py exporter.py coturn-exporter.example.toml .version .
 
 # Switch to the non-privileged user
