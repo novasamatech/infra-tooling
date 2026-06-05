@@ -8,6 +8,29 @@ SPDX-License-Identifier: Apache-2.0
 All notable changes to `turn-testing` are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [3.1.0] — 2026-06-05
+
+### Changed
+- Renamed every exporter metric from the `coturn_` prefix to `turn_testing_`:
+  `turn_testing_probe_success{server,transport,test}`,
+  `turn_testing_probe_duration_seconds`, `turn_testing_webrtc_capacity_bits_per_second`,
+  `turn_testing_webrtc_threshold_reached`, `turn_testing_cycle_duration_seconds`,
+  `turn_testing_cycles_total`, and `turn_testing_exporter_build_info{version}`.
+  **Breaking for scrapers:** update any dashboards, recording/alerting rules, and
+  queries that reference the old `coturn_*` names.
+- `--insecure` (CLI) and `insecure` (exporter) now relax TLS verification on the
+  WebRTC `turns:` relay connection too, not just STUN/TURN — so `--insecure` is
+  consistent across all TLS sub-tests. Default is unchanged (**off**: every TLS
+  context verifies).
+
+### Fixed
+- WebRTC `turns:` (TLS) ignored `--insecure`/`insecure` and always verified the
+  certificate, so the `tls` WebRTC test/capacity probe failed against TURN
+  servers with a self-signed/untrusted cert or when probing by IP, even though
+  STUN/TURN over TLS passed. `apply_insecure_turns_tls` now swaps the aioice
+  connection's `turn_ssl` flag for a non-verifying context before ICE gathering
+  (offerer and answerer).
+
 ## [3.0.0] — 2026-06-04
 
 ### Added
