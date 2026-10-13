@@ -16,17 +16,21 @@ RUN addgroup -g 1000 pyuser && adduser -D -G pyuser -u 1000 pyuser
 # Define the working directory inside the container
 WORKDIR /app
 
-# Copy the Python script into the container
-COPY script.py .
-
-# Copy the requirements.txt file into the container
+# Copy the pinned requirements first, so the dependency layer stays cached
+# when only the script changes
 COPY requirements.txt .
 
 # Install dependencies without caching
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy the Python script into the container
+COPY script.py .
+
 # Switch to the non-privileged user
 USER pyuser
+
+# Prometheus scrape endpoint (CF_EXPORTER_METRICS_PORT, default 8000)
+EXPOSE 8000
 
 # By default, run the script
 CMD ["python", "script.py"]
