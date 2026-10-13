@@ -1,0 +1,27 @@
+# Tool configuration only: cf-exporter is a single script, not a package.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers"
+markers = [
+    "live: talks to the real Cloudflare API; needs CF_EXPORTER_API_TOKEN",
+]
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 90
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "S", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# assert is how pytest works; tests use dummy credentials and spawn the exporter.
+"tests/*" = ["S101", "S105", "S106", "S603"]
