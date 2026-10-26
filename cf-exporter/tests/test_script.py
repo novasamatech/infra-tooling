@@ -897,9 +897,9 @@ def test_collector_scrape_sees_one_consistent_snapshot():
     collector = script.CloudflareCollector()
     collector.update(snapshot())
     families = collector.collect()
-    visits = next(families)
+    visits = next(family for family in families if family.name == "cf_visits")
     collector.update(snapshot(visits={}, requests={}))
-    requests_ = next(families)
+    requests_ = next(family for family in families if family.name == "cf_requests")
     assert len(visits.samples) == 1
     assert len(requests_.samples) == 1
 

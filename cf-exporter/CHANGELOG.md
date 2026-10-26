@@ -8,6 +8,39 @@ SPDX-License-Identifier: Apache-2.0
 All notable changes to `cf-exporter` are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] — 2026-10-26
+
+Existing metric names, labels and label order, collection queries, slicing and
+API budgets are unchanged. No runtime dependencies are added.
+
+### Added
+
+- `cf_exporter_snapshot_window_end_seconds` gauge per successfully collected
+  zone, with `zone_name` and RFC3339 UTC `window_start` labels. Its value is the
+  exclusive API window end, from the same atomic snapshot as the analytics.
+  It also describes successful empty windows and zones without nonzero groups;
+  failed zones and previous-day snapshots omit it with their analytics.
+- Exposition regression coverage for independent instances, daily boundaries
+  without an observed zero, empty windows, revisions and failure isolation.
+
+### Fixed
+
+- Completed-day profiling preserves the actual snapshot window rather than
+  replacing its start with the current time to render historical analytics.
+- Live and image checks validate the window sample of every successful zone,
+  including its UTC bounds and one shared window per cycle, rather than only
+  the presence of metric families. Day-scoped families are validated whenever
+  the exposition contains them, not only when the estimated cycle start is today.
+- Runtime builds make the Python script readable by the non-root container
+  user even when source permissions are restrictive.
+
+### Changed
+
+- Document the consumer-independent window contract and replace the misleading
+  generic `increase()` recipe. Daily estimates are not process counters;
+  downward revisions are preserved. Missing history, overlapping windows, late
+  data and the unobserved end of a UTC day are explicitly described.
+
 ## [1.5.0] — 2026-10-26
 
 Metric names, labels and label order of `cf_visits` / `cf_requests` are unchanged.

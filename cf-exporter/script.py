@@ -197,6 +197,7 @@ class Snapshot:
     groups: dict[LabelValues, int] = field(default_factory=dict)
     limited: dict[LabelValues, int] = field(default_factory=dict)
     window_start: datetime | None = None
+    window_end: datetime | None = None
     zone_success: dict[str, int] = field(default_factory=dict)
     # None until the first cycle has finished.
     cycle_success: int | None = None
@@ -777,6 +778,7 @@ def collect_once(api: CloudflareAPI, now: datetime | None = None) -> Snapshot:
         groups=groups,
         limited=limited,
         window_start=since,
+        window_end=until,
         zone_success=zone_success,
         cycle_success=int(cycle_ok),
         cycle_timestamp=time.time(),
@@ -810,7 +812,10 @@ class CloudflareCollector(Collector):
             or snapshot.window_start.date() == datetime.now(UTC).date()
         ):
             yield from self._day_metrics(snapshot)
+        yield from self._health_metrics(snapshot)
 
+    @staticmethod
+    def _health_metrics(snapshot: Snapshot) -> Iterator[Metric]:
         zone_success = GaugeMetricFamily(
             "cf_exporter_zone_scrape_success",
             "Whether the last collection of the zone succeeded (1) or failed (0)",
@@ -840,6 +845,17 @@ class CloudflareCollector(Collector):
 
     @staticmethod
     def _day_metrics(snapshot: Snapshot) -> Iterator[Metric]:
+        window = GaugeMetricFamily(
+            "cf_exporter_snapshot_window_end_seconds",
+            "Exclusive API window end as Unix seconds; window_start identifies the UTC window",
+            labels=("zone_name", "window_start"),
+        )
+        if snapshot.window_start is not None and snapshot.window_end is not None:
+            start, end = rfc3339(snapshot.window_start), snapshot.window_end.timestamp()
+            for zone_name, success in snapshot.zone_success.items():
+                if success:
+                    window.add_metric((zone_name, start), end)
+        yield window
         for kind, label_names in (
             ("visits", VISITS_LABELS),
             ("requests", REQUESTS_LABELS),

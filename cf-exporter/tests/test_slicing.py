@@ -415,6 +415,14 @@ def test_new_metrics_and_midnight_omission(traffic, api, registry, monkeypatch):
     collector = script.CloudflareCollector()
     registry.register(collector)
     collector.update(script.collect_once(api, now=END))
+    assert collector.snapshot.window_end == END
+    assert (
+        registry.get_sample_value(
+            "cf_exporter_snapshot_window_end_seconds",
+            {"zone_name": "example.org", "window_start": script.rfc3339(START)},
+        )
+        == END.timestamp()
+    )
     assert registry.get_sample_value("cf_zone_requests", {"zone_name": "example.org"}) == 14
     assert registry.get_sample_value("cf_zone_visits", {"zone_name": "example.org"}) == 0
     assert (
@@ -433,6 +441,7 @@ def test_new_metrics_and_midnight_omission(traffic, api, registry, monkeypatch):
     Clock.now_value = START + timedelta(days=1)
     body = generate_latest(registry).decode()
     for family in (
+        "cf_exporter_snapshot_window_end_seconds",
         "cf_visits",
         "cf_requests",
         "cf_cache_requests",

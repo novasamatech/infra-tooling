@@ -15,7 +15,6 @@ import re
 import resource
 import sys
 import time
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -23,6 +22,15 @@ from prometheus_client import CollectorRegistry, generate_latest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import script
+
+
+class HistoricalCollector(script.CloudflareCollector):
+    """Render historical snapshots for profiling without changing their window."""
+
+    def collect(self):
+        snapshot = self.snapshot
+        yield from self._day_metrics(snapshot)
+        yield from self._health_metrics(snapshot)
 
 
 def main():
@@ -51,7 +59,7 @@ def main():
 
     api.graphql = measured
     registry = CollectorRegistry()
-    collector = script.CloudflareCollector()
+    collector = HistoricalCollector() if args.day else script.CloudflareCollector()
     registry.register(collector)
     if args.day:
         # Pin the full historical window rather than the empty following day.
@@ -59,11 +67,7 @@ def main():
     for cycle in range(args.cycles):
         counters.update(graphql_requests=0, analytics_selections=0)
         snapshot = script.collect_once(api, now=now)
-        # Only the profiling collector renders historical data after midnight.
-        # Production collect() continues to suppress stale day-scoped metrics.
-        collector.update(
-            replace(snapshot, window_start=datetime.now(UTC)) if args.day else snapshot
-        )
+        collector.update(snapshot)
         started = time.monotonic()
         body = generate_latest(registry)
         exposition_seconds = time.monotonic() - started

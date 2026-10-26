@@ -19,6 +19,7 @@ cloudflare-exporter; establish which service produced an error before fixing it.
 | [tests/conftest.py](tests/conftest.py) | Fake Cloudflare responses and shared fixtures |
 | [tests/test_script.py](tests/test_script.py) | Offline regression tests, including localhost transport checks |
 | [tests/test_slicing.py](tests/test_slicing.py) | Time-filtered slicing, caps, totals and midnight regressions |
+| [tests/test_windows.py](tests/test_windows.py) | Snapshot window contract and actual Prometheus rendering |
 | [tests/test_live.py](tests/test_live.py) | Real API, schema and process checks |
 | [tests/image_smoke.py](tests/image_smoke.py) | Container lifecycle and metrics smoke check |
 | [tests/profile_live.py](tests/profile_live.py) | Live resource measurements and completed-day sum validation |
@@ -95,6 +96,10 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
   collection rather than a successful empty result.
 - Publish complete snapshots atomically after collection. Remove stale series;
   omit a failed zone's analytics for that cycle and preserve other zones' results.
+- Export `cf_exporter_snapshot_window_end_seconds` only for successful zones,
+  with `zone_name` and RFC3339 `window_start` labels from that same snapshot.
+  Its value is the exclusive API window end, not collection completion time.
+  Historical profiling must preserve these bounds when rendering a past day.
 - Omit all day-scoped families when a snapshot's window belongs to an earlier
   UTC day, including if collection crossed midnight. Always serve zone/cycle health.
 - Keep the process running after collection failures and expose failures through
@@ -107,6 +112,14 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
 - Use monotonic time for durations and scheduling. Preserve clean signal exits.
 
 ## Validation And Scope
+
+Keep this exporter independent of the operator's infrastructure and consumers.
+Validate metric semantics through the actual Prometheus exposition, existing
+offline fixtures, live API checks and the container smoke test. Do not add a
+metrics database, visualization service, query-engine harness, dashboard queries
+or consumer-specific test configuration/dependencies unless the operator
+explicitly requests them. Reading and checking the exported samples is sufficient
+for exporter-contract regression coverage.
 
 For behavior changes, add focused regression coverage and run `make lint` and
 `make test`. The configured coverage minimum is 90%; test counts and exact coverage

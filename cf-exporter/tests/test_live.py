@@ -23,6 +23,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from image_smoke import checked_snapshot_windows
 from prometheus_client import generate_latest
 
 import script
@@ -81,6 +82,7 @@ def type_name(type_ref):
 
 
 DAY_FAMILIES = (
+    "cf_exporter_snapshot_window_end_seconds",
     "cf_visits",
     "cf_requests",
     "cf_cache_requests",
@@ -94,9 +96,13 @@ DAY_FAMILIES = (
 def assert_day_families(text, cycle_start):
     """Require the day-scoped families unless the UTC day changed after the cycle
     started; the exporter omits them then by design."""
-    if cycle_start.date() == datetime.now(UTC).date():
+    window_present = "# TYPE cf_exporter_snapshot_window_end_seconds gauge" in text
+    if window_present or cycle_start.date() == datetime.now(UTC).date():
         for name in DAY_FAMILIES:
             assert f"# TYPE {name} gauge" in text
+        checked_snapshot_windows(text)
+    else:
+        assert all(f"# TYPE {name} gauge" not in text for name in DAY_FAMILIES)
 
 
 def scraped_cycle_start(body):
@@ -216,6 +222,11 @@ def test_full_cycle_renders_metrics(api, zones, registry):
     assert registry.get_sample_value("cf_exporter_last_cycle_success") == 1
     text = generate_latest(registry).decode()
     assert_day_families(text, snapshot.window_start)
+    if "# TYPE cf_exporter_snapshot_window_end_seconds gauge" in text:
+        assert checked_snapshot_windows(text) == {
+            zone["name"]: (script.rfc3339(snapshot.window_start), snapshot.window_end.timestamp())
+            for zone in zones
+        }
 
 
 def test_invalid_api_token_is_reported_not_fatal():
