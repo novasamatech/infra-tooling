@@ -10,8 +10,9 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [1.6.0] — 2026-10-26
 
-Existing metric names, labels and label order, collection queries, slicing and
-API budgets are unchanged. No runtime dependencies are added.
+Existing metric names, labels, label order and traffic scope are unchanged.
+Each zone uses one more analytics selection per cycle for the edge dataset; the
+baseline reserve grows from 5 to 6 selections. No runtime dependencies are added.
 
 ### Added
 
@@ -20,11 +21,38 @@ API budgets are unchanged. No runtime dependencies are added.
   exclusive API window end, from the same atomic snapshot as the analytics.
   It also describes successful empty windows and zones without nonzero groups;
   failed zones and previous-day snapshots omit it with their analytics.
+- `cf_edge_requests` gauge of client requests for every host of every zone,
+  with `zone_name`, `host_name`, `method_name`, `path`, `edge_response_status`,
+  `origin_response_status`. Only this dataset uses `requestSource: "eyeball"`,
+  in its first selection and every slice, so Cloudflare's own subrequests are
+  excluded. The client-facing edge status is kept separately from the origin
+  status, including Cloudflare-generated responses with origin status `0`.
+  It is integrated into slicing, hints, caps, truncation and group metrics as
+  `dataset="edge"`, and follows the snapshot window and midnight visibility.
+- `cf_exporter_dataset_available{zone_name, dataset}` for successfully collected
+  zones. A plan without `edgeResponseStatus` or `requestSource` reports `0` for
+  the edge dataset, which is then not queried, while the other datasets are still
+  collected and a warning is logged. An API error is not treated as missing
+  support and still fails the zone.
 - Exposition regression coverage for independent instances, daily boundaries
   without an observed zero, empty windows, revisions and failure isolation.
+- Live checks compare edge groups for a completed UTC day with an independently
+  fetched client-request total, and the filter value with requests grouped by
+  source. Image and live checks validate edge samples and dataset health.
+  Profiling reports zones without the edge dataset and validates edge sums the
+  same way, outside its measured selections.
 
 ### Fixed
 
+- Validate edge dimensions before omitting zero-valued groups, trimming probe
+  groups or discarding parent pages. Missing edge status, malformed string
+  dimensions and invalid status types/ranges fail the zone rather than creating
+  plausible but incorrect labels or an apparently successful empty collection.
+- Keep live reference filters independent of production filter constants and
+  skip source-specific validation for unsupported zones. Profiling tracks the
+  zones actually discovered in each cycle and checks raw request sources too.
+- Image checks reject duplicate edge samples, nonfinite values and inconsistent
+  availability, group counts or truncation flags.
 - Completed-day profiling preserves the actual snapshot window rather than
   replacing its start with the current time to render historical analytics.
 - Live and image checks validate the window sample of every successful zone,

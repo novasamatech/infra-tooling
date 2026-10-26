@@ -20,6 +20,7 @@ cloudflare-exporter; establish which service produced an error before fixing it.
 | [tests/test_script.py](tests/test_script.py) | Offline regression tests, including localhost transport checks |
 | [tests/test_slicing.py](tests/test_slicing.py) | Time-filtered slicing, caps, totals and midnight regressions |
 | [tests/test_windows.py](tests/test_windows.py) | Snapshot window contract and actual Prometheus rendering |
+| [tests/test_edge.py](tests/test_edge.py) | Client-facing edge dataset, its filter and dataset availability |
 | [tests/test_live.py](tests/test_live.py) | Real API, schema and process checks |
 | [tests/image_smoke.py](tests/image_smoke.py) | Container lifecycle and metrics smoke check |
 | [tests/profile_live.py](tests/profile_live.py) | Live resource measurements and completed-day sum validation |
@@ -77,7 +78,7 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
 - Discover each zone's available fields and page size. Query only supported
   dimensions, omit an empty dimensions selection, and respect `maxPageSize`.
 - Use GraphQL variables and aliased analytics selections for visits, requests,
-  cache and dimensionless totals. Settings use a separate HTTP request. Sliced
+  cache, edge and dimensionless totals. Settings use a separate HTTP request. Sliced
   retries use additional requests for only the full selections.
 - Export all nonzero groups by default with disjoint, half-open time slices.
   Reuse slice-count hints per zone/selection until UTC midnight; a failed slice
@@ -88,6 +89,18 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
   Expose residual truncation and support the optional `CF_EXPORTER_GROUP_LIMIT`.
 - Keep cache metrics dynamic across all hosts, including `origin_response_status`.
   Keep dimensionless zone totals and per-dataset group/truncation metrics aligned.
+- Restrict only the edge dataset (`cf_edge_requests`) to client requests with
+  `EYEBALL_FILTER`, in its first selection and every slice; the other datasets and
+  zone totals keep every request source. Never compare edge sums with unfiltered
+  totals, and fetch no production client total. Keep both edge and origin status;
+  an edge status is never `unknown`, and origin `0` never stands in for it.
+  Validate edge dimensions even in zero-valued groups and discarded probe/parent
+  pages; status values must match the API's unsigned 16-bit integer type.
+  Validation totals must not reuse the production filter constant as their oracle.
+- Decide dataset support from `availableFields` (`DATASET_FIELDS`). An unsupported
+  dataset is not queried, reports `cf_exporter_dataset_available` `0` without
+  group or truncation series, logs a warning and leaves the zone successful. An
+  API error is never taken as missing support.
 - Keep unavailable dimensions as `unknown`, empty referers as `direct`, and omit
   zero-valued groups. Order capped results largest first and warn on actual cuts;
   decide cuts from the pages only (a zero visits tail is complete; a configured cap

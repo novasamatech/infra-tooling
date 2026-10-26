@@ -23,7 +23,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from image_smoke import checked_snapshot_windows
+from image_smoke import checked_edge_family, checked_snapshot_windows
+from profile_live import request_sources
 from prometheus_client import generate_latest
 
 import script
@@ -47,7 +48,7 @@ query Type($name: String!) {
       args { name type { ...TypeRef } }
     }
     enumValues(includeDeprecated: true) { name isDeprecated deprecationReason }
-    inputFields { name }
+    inputFields { name type { ...TypeRef } }
   }
 }
 fragment TypeRef on __Type {
@@ -86,10 +87,12 @@ DAY_FAMILIES = (
     "cf_visits",
     "cf_requests",
     "cf_cache_requests",
+    "cf_edge_requests",
     "cf_zone_requests",
     "cf_zone_visits",
     "cf_exporter_groups",
     "cf_exporter_group_limit_reached",
+    "cf_exporter_dataset_available",
 )
 
 
@@ -101,6 +104,7 @@ def assert_day_families(text, cycle_start):
         for name in DAY_FAMILIES:
             assert f"# TYPE {name} gauge" in text
         checked_snapshot_windows(text)
+        checked_edge_family(text)
     else:
         assert all(f"# TYPE {name} gauge" not in text for name in DAY_FAMILIES)
 
@@ -149,7 +153,11 @@ def test_queried_graphql_schema_is_current(api):
     # Cloudflare exposes input-field names but not their deprecation status.
     filter_arg = next(a for a in dataset["args"] if a["name"] == "filter")
     filter_fields = introspect(api, type_name(filter_arg["type"]))["inputFields"]
-    assert {"datetime_geq", "datetime_lt"} <= {f["name"] for f in filter_fields}
+    assert {"datetime_geq", "datetime_lt", "requestSource"} <= {f["name"] for f in filter_fields}
+    assert (
+        type_name(next(f for f in filter_fields if f["name"] == "requestSource")["type"])
+        == "string"
+    )
 
     order_by = next(a for a in dataset["args"] if a["name"] == "orderBy")
     order_values = introspect(api, type_name(order_by["type"]))["enumValues"]
@@ -161,12 +169,12 @@ def test_queried_graphql_schema_is_current(api):
     sums = introspect(api, type_name(current(groups, "sum")["type"]))["fields"]
     current(sums, "visits")
     dimensions = introspect(api, type_name(current(groups, "dimensions")["type"]))["fields"]
-    for dimension in {
-        *script.VISITS_DIMENSIONS.values(),
-        *script.REQUESTS_DIMENSIONS.values(),
-        *script.CACHE_DIMENSIONS.values(),
-    }:
+    for dimension in {d for mapping in script.DATASETS.values() for d in mapping.values()}:
         current(dimensions, dimension)
+    # The eyeball filter compares against this dimension's values.
+    assert type_name(current(dimensions, "requestSource")["type"]) == "string"
+    for status in ("edgeResponseStatus", "originResponseStatus"):
+        assert type_name(current(dimensions, status)["type"]) == "uint16"
 
 
 def test_every_zone_is_collected(api, zones):
@@ -181,20 +189,35 @@ def test_every_zone_is_collected(api, zones):
         except script.CloudflareAPIError as e:
             failures[zone["name"]] = str(e)
             continue
-        for labels, value in result.visits.items():
-            assert len(labels) == len(script.VISITS_LABELS)
-            assert value > 0
-        for labels, value in result.requests.items():
-            assert len(labels) == len(script.REQUESTS_LABELS)
-            assert value > 0
-        for labels, value in result.cache.items():
-            assert len(labels) == len(script.CACHE_LABELS)
-            assert value > 0
+        for kind, label_names in (
+            ("visits", script.VISITS_LABELS),
+            ("requests", script.REQUESTS_LABELS),
+            ("cache", script.CACHE_LABELS),
+            ("edge", script.EDGE_LABELS),
+        ):
+            for labels, value in getattr(result, kind).items():
+                assert len(labels) == len(label_names)
+                assert value > 0
+        eyeball = 0
+        if result.available["edge"]:
+            eyeball, sources = request_sources(api.graphql, zone["id"], since, until)
+            # A wrong filter value would look like a zone without client traffic.
+            if result.total_requests:
+                assert sources.get("eyeball", 0) > 0, (zone["name"], sources)
+            assert eyeball == sources.get("eyeball", 0) <= result.total_requests
+        else:
+            assert not result.edge
+        # Edge groups are compared with the eyeball total, never the unfiltered one.
+        expected = {
+            "visits": result.total_visits,
+            "requests": result.total_requests,
+            "cache": result.total_requests,
+            "edge": eyeball,
+        }
         for kind in script.DATASETS:
-            if not result.limited[kind]:
-                total = result.total_visits if kind == "visits" else result.total_requests
+            if result.available[kind] and not result.limited[kind]:
                 actual = sum(getattr(result, kind).values())
-                assert actual == total, (zone["name"], kind, actual, total)
+                assert actual == expected[kind], (zone["name"], kind, actual, expected[kind])
     assert not failures
 
 

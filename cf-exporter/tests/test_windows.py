@@ -3,55 +3,17 @@
 
 """The snapshot contract, checked through the real Prometheus exposition."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
 import pytest
-from conftest import json_response, requests_group
+from conftest import DAY, exposition, json_response, publish, requests_group, samples
 from image_smoke import checked_snapshot_windows
 from profile_live import HistoricalCollector
-from prometheus_client import CollectorRegistry, generate_latest
-from prometheus_client.parser import text_string_to_metric_families
 
 import script
 
-START = datetime(2026, 10, 26, tzinfo=UTC)
+START = DAY
 WINDOW = "cf_exporter_snapshot_window_end_seconds"
-
-
-@pytest.fixture
-def clock(monkeypatch):
-    class Clock(datetime):
-        value = START + timedelta(hours=12)
-
-        @classmethod
-        def now(cls, tz=None):
-            return cls.value
-
-    monkeypatch.setattr(script, "datetime", Clock)
-    return Clock
-
-
-def exposition(collector):
-    registry = CollectorRegistry()
-    registry.register(collector)
-    return generate_latest(registry).decode()
-
-
-def samples(collector, name):
-    return [
-        sample
-        for family in text_string_to_metric_families(exposition(collector))
-        for sample in family.samples
-        if sample.name == name
-    ]
-
-
-def publish(api, clock, moment, collector=None):
-    clock.value = moment
-    if collector is None:
-        collector = script.CloudflareCollector()
-    collector.update(script.collect_once(api, now=moment))
-    return collector
 
 
 def cache_group(count, status="hit", origin=200):
@@ -265,6 +227,7 @@ def test_cycle_that_finishes_after_midnight_keeps_its_original_window(cloudflare
             "visits": [],
             "requests": [],
             "cache": [cache_group(3)],
+            "edge": [],
             "totals": [{"count": 3, "sum": {"visits": 0}}],
         }
         return json_response(200, {"data": {"viewer": {"zones": [node]}}})

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shlex
@@ -20,7 +21,11 @@ from pathlib import Path
 
 DAY_FAMILIES = (
     "cf_exporter_snapshot_window_end_seconds",
+    "cf_visits",
+    "cf_requests",
     "cf_cache_requests",
+    "cf_edge_requests",
+    "cf_exporter_dataset_available",
     "cf_zone_requests",
     "cf_zone_visits",
     "cf_exporter_groups",
@@ -67,6 +72,81 @@ def checked_snapshot_windows(body: str) -> dict[str, tuple[str, float]]:
     if len(set(result.values())) > 1:
         raise ValueError("zones of one snapshot have different windows")
     return result
+
+
+DATASET_NAMES = ("visits", "requests", "cache", "edge")
+EDGE_LABELS = frozenset(
+    {
+        "zone_name",
+        "host_name",
+        "method_name",
+        "path",
+        "edge_response_status",
+        "origin_response_status",
+    }
+)
+
+
+def _by_zone_and_dataset(body: str, name: str) -> dict[tuple[str, str], float]:
+    result = {}
+    for labels, value in _sample_values(body, name):
+        key = (labels.get("zone_name"), labels.get("dataset"))
+        if set(labels) != {"zone_name", "dataset"} or key in result:
+            raise ValueError(f"invalid or duplicate {name} sample")
+        result[key] = value
+    return result
+
+
+def checked_edge_family(body: str) -> dict[str, int]:
+    """Validate cf_edge_requests and dataset health from one exposition.
+
+    Returns the number of edge samples of every zone that collects the dataset.
+    """
+    successful = {
+        labels["zone_name"]
+        for labels, value in _sample_values(body, "cf_exporter_zone_scrape_success")
+        if value == 1
+    }
+    available = _by_zone_and_dataset(body, "cf_exporter_dataset_available")
+    if set(available) != {(zone, kind) for zone in successful for kind in DATASET_NAMES}:
+        raise ValueError("dataset availability does not match successful zones")
+    if any(value not in (0, 1) for value in available.values()):
+        raise ValueError("dataset availability is neither 0 nor 1")
+    if any(available[(zone, kind)] != 1 for zone in successful for kind in DATASET_NAMES[:3]):
+        raise ValueError("an always collected dataset is reported unavailable")
+    groups = _by_zone_and_dataset(body, "cf_exporter_groups")
+    limited = _by_zone_and_dataset(body, "cf_exporter_group_limit_reached")
+    collected = {key for key, value in available.items() if value == 1}
+    if set(groups) != collected or set(limited) != collected:
+        raise ValueError("dataset health does not match its availability")
+    if any(not math.isfinite(v) or v < 0 or not v.is_integer() for v in groups.values()):
+        raise ValueError("invalid dataset group count")
+    if any(value not in (0, 1) for value in limited.values()):
+        raise ValueError("invalid dataset truncation flag")
+    counts = dict.fromkeys(successful, 0)
+    seen = set()
+    for labels, value in _sample_values(body, "cf_edge_requests"):
+        if set(labels) != EDGE_LABELS:
+            raise ValueError("unexpected edge labels")
+        key = tuple(sorted(labels.items()))
+        if key in seen:
+            raise ValueError("duplicate edge sample")
+        seen.add(key)
+        if available.get((labels["zone_name"], "edge")) != 1:
+            raise ValueError("edge samples for a zone without the edge dataset")
+        for label in ("edge_response_status", "origin_response_status"):
+            status = labels[label]
+            if label == "origin_response_status" and status == "unknown":
+                continue
+            if not re.fullmatch(r"[0-9]{1,5}", status) or int(status) > 65535:
+                raise ValueError("edge sample with an invalid status")
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("edge sample without requests")
+        counts[labels["zone_name"]] += 1
+    for zone in successful:
+        if available[(zone, "edge")] == 1 and groups[(zone, "edge")] != counts[zone]:
+            raise ValueError("edge samples do not match cf_exporter_groups")
+    return {zone: count for zone, count in counts.items() if available[(zone, "edge")] == 1}
 
 
 def cycle_started_today(body: str) -> bool:
@@ -152,6 +232,7 @@ def main() -> int:
                                         return 1
                                 try:
                                     checked_snapshot_windows(body)
+                                    checked_edge_family(body)
                                 except (KeyError, ValueError) as error:
                                     print(f"image smoke test: FAILED - {error}")
                                     return 1
