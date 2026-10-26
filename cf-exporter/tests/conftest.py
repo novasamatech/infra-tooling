@@ -5,25 +5,26 @@
 
 import json
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import responses
-from prometheus_client import CollectorRegistry
+from prometheus_client import CollectorRegistry, generate_latest
+from prometheus_client.parser import text_string_to_metric_families
 
 import script
 
 BASE_URL = "https://cf.test/client/v4"
 NOW = datetime(2026, 10, 13, 7, 40, 12, 345678, tzinfo=UTC)
+# The UTC day of the exposition tests; their clock starts at its noon.
+DAY = datetime(2026, 10, 26, tzinfo=UTC)
 
 ALL_FIELDS = frozenset(
     {
         "count",
         "sum_visits",
-        *(
-            f"dimensions_{d}"
-            for d in (*script.VISITS_DIMENSIONS.values(), *script.REQUESTS_DIMENSIONS.values())
-        ),
+        "dimensions_requestSource",
+        *(f"dimensions_{d}" for mapping in script.DATASETS.values() for d in mapping.values()),
     }
 )
 # What a Free-plan zone offers (verified against the live API).
@@ -46,6 +47,23 @@ def graphql_error(message, code="authz"):
     return json_response(
         200, {"data": None, "errors": [{"message": message, "extensions": {"code": code}}]}
     )
+
+
+# An aliased selection and the content of its filter object.
+SELECTION = re.compile(r"(\w+): httpRequestsAdaptiveGroups\(\s*limit: \S+\s*filter: \{([^}]*)\}")
+
+
+def eyeball_only(filters, group):
+    """Whether the group passes the selection's filter. Unmarked groups are eyeball traffic."""
+    source = group.get("dimensions", {}).get("requestSource", "eyeball")
+    selected = re.search(r'requestSource:\s*"([^"\\]*)"', filters)
+    return selected is None or source == selected[1]
+
+
+def without_source(group):
+    """The exporter never selects requestSource, so the API would not return it."""
+    dimensions = {k: v for k, v in group.get("dimensions", {}).items() if k != "requestSource"}
+    return {**group, "dimensions": dimensions} if "dimensions" in group else group
 
 
 class FakeCloudflare:
@@ -71,6 +89,7 @@ class FakeCloudflare:
         cache=(),
         totals=None,
         responder=None,
+        edge=(),
     ):
         self.zones[zone_id] = {
             "name": name,
@@ -78,6 +97,7 @@ class FakeCloudflare:
             "visits": list(visits),
             "requests": list(requests),
             "cache": list(cache),
+            "edge": list(edge),
             "totals": totals,
             "responder": responder,
             "error": error,
@@ -122,9 +142,8 @@ class FakeCloudflare:
         else:
             if zone["responder"]:
                 return zone["responder"](body)
-            kinds = re.findall(r"(\w+): httpRequestsAdaptiveGroups\(", body["query"])
             node = {}
-            for kind in kinds:
+            for kind, filters in SELECTION.findall(body["query"]):
                 if kind == "totals":
                     node[kind] = (
                         zone["totals"]
@@ -137,7 +156,8 @@ class FakeCloudflare:
                         ]
                     )
                 else:
-                    node[kind] = zone[kind][: body["variables"]["limit"]]
+                    groups = [g for g in zone[kind] if eyeball_only(filters, g)]
+                    node[kind] = [without_source(g) for g in groups][: body["variables"]["limit"]]
         return json_response(200, {"data": {"viewer": {"zones": [node]}}, "errors": None})
 
 
@@ -161,3 +181,43 @@ def cloudflare(rsps):
 def registry():
     """A private registry, so tests never touch the global one."""
     return CollectorRegistry()
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """The exporter's UTC clock; assign `clock.value` to move it."""
+
+    class Clock(datetime):
+        value = DAY + timedelta(hours=12)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.value
+
+    monkeypatch.setattr(script, "datetime", Clock)
+    return Clock
+
+
+def exposition(collector):
+    registry = CollectorRegistry()
+    registry.register(collector)
+    return generate_latest(registry).decode()
+
+
+def samples(collector, name):
+    """Samples of one family, parsed from the actual Prometheus exposition."""
+    return [
+        sample
+        for family in text_string_to_metric_families(exposition(collector))
+        for sample in family.samples
+        if sample.name == name
+    ]
+
+
+def publish(api, clock, moment, collector=None):
+    """Run a cycle at `moment` and publish its snapshot, as the main loop does."""
+    clock.value = moment
+    if collector is None:
+        collector = script.CloudflareCollector()
+    collector.update(script.collect_once(api, now=moment))
+    return collector

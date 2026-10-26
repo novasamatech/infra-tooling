@@ -23,8 +23,8 @@ COPY requirements.txt .
 # Install dependencies without caching
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the Python script into the container
-COPY script.py .
+# Preserve script access for pyuser regardless of the source file's permissions.
+COPY --chmod=755 script.py .
 
 # Switch to the non-privileged user
 USER pyuser

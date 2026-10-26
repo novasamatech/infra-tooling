@@ -503,7 +503,10 @@ def test_collect_zone_respects_plan_page_size(cloudflare, api, caplog):
 def test_collect_zone_at_midnight_avoids_empty_range_query(cloudflare, api):
     cloudflare.add_zone("z1", "example.com")
     assert script.collect_zone(api, "z1", "example.com", SINCE, SINCE) == script.ZoneMetrics(
-        {}, {}, limited=dict.fromkeys(script.DATASETS, 0)
+        {},
+        {},
+        limited=dict.fromkeys(script.DATASETS, 0),
+        available=dict.fromkeys(script.DATASETS, 1),
     )
     assert cloudflare.data_calls() == []
 
@@ -897,9 +900,9 @@ def test_collector_scrape_sees_one_consistent_snapshot():
     collector = script.CloudflareCollector()
     collector.update(snapshot())
     families = collector.collect()
-    visits = next(families)
+    visits = next(family for family in families if family.name == "cf_visits")
     collector.update(snapshot(visits={}, requests={}))
-    requests_ = next(families)
+    requests_ = next(family for family in families if family.name == "cf_requests")
     assert len(visits.samples) == 1
     assert len(requests_.samples) == 1
 

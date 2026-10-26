@@ -19,6 +19,8 @@ cloudflare-exporter; establish which service produced an error before fixing it.
 | [tests/conftest.py](tests/conftest.py) | Fake Cloudflare responses and shared fixtures |
 | [tests/test_script.py](tests/test_script.py) | Offline regression tests, including localhost transport checks |
 | [tests/test_slicing.py](tests/test_slicing.py) | Time-filtered slicing, caps, totals and midnight regressions |
+| [tests/test_windows.py](tests/test_windows.py) | Snapshot window contract and actual Prometheus rendering |
+| [tests/test_edge.py](tests/test_edge.py) | Client-facing edge dataset, its filter and dataset availability |
 | [tests/test_live.py](tests/test_live.py) | Real API, schema and process checks |
 | [tests/image_smoke.py](tests/image_smoke.py) | Container lifecycle and metrics smoke check |
 | [tests/profile_live.py](tests/profile_live.py) | Live resource measurements and completed-day sum validation |
@@ -76,7 +78,7 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
 - Discover each zone's available fields and page size. Query only supported
   dimensions, omit an empty dimensions selection, and respect `maxPageSize`.
 - Use GraphQL variables and aliased analytics selections for visits, requests,
-  cache and dimensionless totals. Settings use a separate HTTP request. Sliced
+  cache, edge and dimensionless totals. Settings use a separate HTTP request. Sliced
   retries use additional requests for only the full selections.
 - Export all nonzero groups by default with disjoint, half-open time slices.
   Reuse slice-count hints per zone/selection until UTC midnight; a failed slice
@@ -87,14 +89,34 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
   Expose residual truncation and support the optional `CF_EXPORTER_GROUP_LIMIT`.
 - Keep cache metrics dynamic across all hosts, including `origin_response_status`.
   Keep dimensionless zone totals and per-dataset group/truncation metrics aligned.
+- Restrict only the edge dataset (`cf_edge_requests`) to client requests with
+  `EYEBALL_FILTER`, in its first selection and every slice; the other datasets and
+  zone totals keep every request source. Never compare edge sums with unfiltered
+  totals, and fetch no production client total. Keep both edge and origin status;
+  an edge status is never `unknown`, and origin `0` never stands in for it.
+  Validate edge dimensions even in zero-valued groups and discarded probe/parent
+  pages; status values must match the API's unsigned 16-bit integer type.
+  Keep strict type policies dataset-scoped (`DIMENSION_TYPES`) so shared field
+  names do not silently change older families' label conversion.
+  Validation totals must not reuse the production filter constant as their oracle.
+- Decide dataset support from `availableFields` (`DATASET_FIELDS`). An unsupported
+  dataset is not queried, reports `cf_exporter_dataset_available` `0` without
+  group or truncation series, logs a warning and leaves the zone successful. An
+  API error is never taken as missing support.
 - Keep unavailable dimensions as `unknown`, empty referers as `direct`, and omit
   zero-valued groups. Order capped results largest first and warn on actual cuts;
   decide cuts from the pages only (a zero visits tail is complete; a configured cap
   probes one extra group), never from the separately fetched zone totals.
 - Validate response structure. Missing or malformed data must report a failed
-  collection rather than a successful empty result.
+  collection rather than a successful empty result. Validate every fetched group
+  once before splitting or capping; aggregation consumes only validated groups.
 - Publish complete snapshots atomically after collection. Remove stale series;
   omit a failed zone's analytics for that cycle and preserve other zones' results.
+- Export `cf_exporter_snapshot_window_end_seconds` only for successful zones,
+  with `zone_name` and RFC3339 `window_start` labels from that same snapshot.
+  Its value is the exclusive API window end, not collection completion time.
+  Historical profiling must preserve these bounds when rendering a past day and
+  override only the visibility gate, not the collector's family enumeration.
 - Omit all day-scoped families when a snapshot's window belongs to an earlier
   UTC day, including if collection crossed midnight. Always serve zone/cycle health.
 - Keep the process running after collection failures and expose failures through
@@ -107,6 +129,14 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
 - Use monotonic time for durations and scheduling. Preserve clean signal exits.
 
 ## Validation And Scope
+
+Keep this exporter independent of the operator's infrastructure and consumers.
+Validate metric semantics through the actual Prometheus exposition, existing
+offline fixtures, live API checks and the container smoke test. Do not add a
+metrics database, visualization service, query-engine harness, dashboard queries
+or consumer-specific test configuration/dependencies unless the operator
+explicitly requests them. Reading and checking the exported samples is sufficient
+for exporter-contract regression coverage.
 
 For behavior changes, add focused regression coverage and run `make lint` and
 `make test`. The configured coverage minimum is 90%; test counts and exact coverage

@@ -49,8 +49,8 @@ GRAPHQL_QUOTA_WINDOW_SECONDS = 300
 # Share of that quota one cycle may plan for, leaving room for retries and for
 # other clients of the same user.
 GRAPHQL_QUOTA_SHARE = 2 / 3
-# Selections each zone needs per cycle: settings, three datasets and totals.
-BASELINE_SELECTIONS = 5
+# Selections each zone needs per cycle: settings, four datasets and totals.
+BASELINE_SELECTIONS = 6
 # The cycle before UTC midnight is moved earlier when it would not finish this
 # many seconds before midnight, so the day's final minutes are still exported.
 DAY_CLOSE_MARGIN_SECONDS = 30
@@ -59,6 +59,7 @@ DAY_CLOSE_MARGIN_SECONDS = 30
 # such a response fails at once and the next cycle tries again.
 MAX_RETRY_AFTER_SECONDS = 30
 UNKNOWN = "unknown"
+UINT16_MAX = (1 << 16) - 1
 
 # Prometheus label -> httpRequestsAdaptiveGroups dimension, in label order.
 VISITS_DIMENSIONS = {
@@ -85,12 +86,46 @@ CACHE_DIMENSIONS = {
     label: REQUESTS_DIMENSIONS[label]
     for label in ("host_name", "method_name", "path", "cache_status", "origin_response_status")
 }
+EDGE_DIMENSIONS = {
+    "host_name": "clientRequestHTTPHost",
+    "method_name": "clientRequestHTTPMethodName",
+    "path": "clientRequestPath",
+    "edge_response_status": "edgeResponseStatus",
+    "origin_response_status": "originResponseStatus",
+}
 VISITS_LABELS = ("zone_name", *VISITS_DIMENSIONS)
 REQUESTS_LABELS = ("zone_name", *REQUESTS_DIMENSIONS)
 CACHE_LABELS = ("zone_name", *CACHE_DIMENSIONS)
-DATASETS = {"visits": VISITS_DIMENSIONS, "requests": REQUESTS_DIMENSIONS, "cache": CACHE_DIMENSIONS}
+EDGE_LABELS = ("zone_name", *EDGE_DIMENSIONS)
+DATASETS = {
+    "visits": VISITS_DIMENSIONS,
+    "requests": REQUESTS_DIMENSIONS,
+    "cache": CACHE_DIMENSIONS,
+    "edge": EDGE_DIMENSIONS,
+}
 # Fields the query needs regardless of plan (names as in availableFields).
 REQUIRED_FIELDS = frozenset({"count", "sum_visits"})
+# Restricts a selection to requests from clients, excluding Cloudflare's own
+# subrequests (e.g. from Workers). Only the edge dataset uses it; the other
+# datasets keep counting every request source.
+EYEBALL_FILTER = 'requestSource: "eyeball"'
+FILTERED_DATASETS = {"edge": EYEBALL_FILTER}
+# Fields without which a dataset is not collected for the zone at all, rather
+# than reported as "unknown" or from unfiltered traffic.
+DATASET_FIELDS = {
+    "edge": frozenset({"dimensions_edgeResponseStatus", "dimensions_requestSource"}),
+}
+# Strict response types are dataset-specific: older families retain their
+# existing label conversion policy even when they query the same dimensions.
+DIMENSION_TYPES = {
+    "edge": {
+        "edgeResponseStatus": int,
+        "originResponseStatus": int,
+        "clientRequestHTTPHost": str,
+        "clientRequestHTTPMethodName": str,
+        "clientRequestPath": str,
+    },
+}
 
 # Which fields a zone may query depends on its plan (e.g. Free zones lack
 # clientRequestQuery and clientRequestReferer), so it is checked every cycle.
@@ -177,6 +212,9 @@ class ZoneMetrics:
     total_requests: float = 0
     total_visits: float = 0
     limited: dict[str, int] = field(default_factory=dict)
+    edge: dict[LabelValues, float] = field(default_factory=dict)
+    # Whether the zone's plan supports each dataset (1) or it was skipped (0).
+    available: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -192,11 +230,14 @@ class Snapshot:
     visits: dict[LabelValues, float] = field(default_factory=dict)
     requests: dict[LabelValues, float] = field(default_factory=dict)
     cache: dict[LabelValues, float] = field(default_factory=dict)
+    edge: dict[LabelValues, float] = field(default_factory=dict)
     zone_requests: dict[str, float] = field(default_factory=dict)
     zone_visits: dict[str, float] = field(default_factory=dict)
     groups: dict[LabelValues, int] = field(default_factory=dict)
     limited: dict[LabelValues, int] = field(default_factory=dict)
+    available: dict[LabelValues, int] = field(default_factory=dict)
     window_start: datetime | None = None
+    window_end: datetime | None = None
     zone_success: dict[str, int] = field(default_factory=dict)
     # None until the first cycle has finished.
     cycle_success: int | None = None
@@ -387,11 +428,16 @@ def build_analytics_query(
     visits_dimensions: list[str],
     requests_dimensions: list[str],
     cache_dimensions: Sequence[str] = (),
+    edge_dimensions: Sequence[str] = (),
     datasets: tuple[str, ...] = (*DATASETS, "totals"),
 ) -> str:
     """Build an aliased query for just the selections needed by this window."""
     dimensions = dict(
-        zip(DATASETS, (visits_dimensions, requests_dimensions, cache_dimensions), strict=True)
+        zip(
+            DATASETS,
+            (visits_dimensions, requests_dimensions, cache_dimensions, edge_dimensions),
+            strict=True,
+        )
     )
     selections = []
     for kind in datasets:
@@ -405,10 +451,11 @@ def build_analytics_query(
         )
         limit = "1" if totals else "$limit"
         order = "sum_visits_DESC" if kind == "visits" else "count_DESC"
+        extra = f", {FILTERED_DATASETS[kind]}" if kind in FILTERED_DATASETS else ""
         selections.append(f"""
       {kind}: httpRequestsAdaptiveGroups(
         limit: {limit}
-        filter: {{datetime_geq: $since, datetime_lt: $until}}
+        filter: {{datetime_geq: $since, datetime_lt: $until{extra}}}
         orderBy: [{order}]
       ) {{ {value} {selection} }}""")
     # GraphQL rejects declarations of unused variables (e.g. a totals-only query).
@@ -424,7 +471,8 @@ query HttpRequests($zoneTag: string!, $since: Time!, $until: Time!{limit_variabl
 """
 
 
-def _zone_node(data: dict, zone_id: str) -> dict:
+def zone_node(data: dict, zone_id: str) -> dict:
+    """Return the single requested zone node or raise CloudflareAPIError."""
     viewer = data.get("viewer")
     zones = viewer.get("zones") if isinstance(viewer, dict) else None
     if not isinstance(zones, list) or len(zones) != 1 or not isinstance(zones[0], dict):
@@ -435,7 +483,7 @@ def _zone_node(data: dict, zone_id: str) -> dict:
 def fetch_dataset_settings(api: CloudflareAPI, zone_id: str) -> DatasetSettings:
     """Return the dataset fields and page size the zone's plan allows."""
     data = api.graphql(AVAILABLE_FIELDS_QUERY, {"zoneTag": zone_id})
-    node = _zone_node(data, zone_id).get("settings")
+    node = zone_node(data, zone_id).get("settings")
     settings = node.get("httpRequestsAdaptiveGroups") if isinstance(node, dict) else None
     if not isinstance(settings, dict) or settings.get("enabled") is not True:
         raise CloudflareAPIError("httpRequestsAdaptiveGroups is not enabled for the zone")
@@ -473,7 +521,7 @@ def _label_values(
     return tuple(values)
 
 
-def _checked_value(kind: str, group, value_of: Callable[[dict], float | None]) -> float:
+def checked_value(kind: str, group, value_of: Callable[[dict], float | None]) -> float:
     """Return a group's count or visits, rejecting anything but a finite number >= 0."""
     if not isinstance(group, dict):
         raise CloudflareAPIError(f"GraphQL: {kind} contains an invalid group")
@@ -491,27 +539,50 @@ def _checked_value(kind: str, group, value_of: Callable[[dict], float | None]) -
     return value
 
 
-def _group_list(kind: str, groups) -> list:
+def group_list(kind: str, groups) -> list:
+    """Return a group list, rejecting missing or non-list data with CloudflareAPIError."""
     if not isinstance(groups, list):
         raise CloudflareAPIError(f"GraphQL: {kind} contains no valid group list")
     return groups
 
 
+def _group_dimensions(kind: str, group: dict, available: list[str]) -> dict:
+    dimensions = group.get("dimensions", {})
+    if not isinstance(dimensions, dict):
+        raise CloudflareAPIError(f"GraphQL: {kind} contains invalid dimensions")
+    types = DIMENSION_TYPES.get(kind, {})
+    required_fields = DATASET_FIELDS.get(kind, ())
+    if types or required_fields:
+        for dimension in available:
+            value = dimensions.get(dimension)
+            if value is None:
+                if f"dimensions_{dimension}" in required_fields:
+                    raise CloudflareAPIError(
+                        f"GraphQL: {kind} contains a group without {dimension}"
+                    )
+                continue
+            expected_type = types.get(dimension)
+            if expected_type is not None and (
+                type(value) is not expected_type
+                or (expected_type is int and not 0 <= value <= UINT16_MAX)
+            ):
+                raise CloudflareAPIError(f"GraphQL: {kind} contains invalid {dimension}")
+    return dimensions
+
+
 def _aggregate(
     zone_name: str,
-    kind: str,
-    groups: list[dict] | None,
+    groups: list[dict],
     dimension_map: Mapping[str, str],
     available: list[str],
     value_of: Callable[[dict], float | None],
     label_pool: dict[str, str] | None = None,
 ) -> dict[LabelValues, float]:
+    """Aggregate previously validated groups without repeating response checks."""
     samples: dict[LabelValues, float] = {}
-    for group in _group_list(kind, groups):
-        value = _checked_value(kind, group, value_of)
+    for group in groups:
+        value = value_of(group)
         dimensions = group.get("dimensions", {})
-        if not isinstance(dimensions, dict):
-            raise CloudflareAPIError(f"GraphQL: {kind} contains invalid dimensions")
         if not value:
             continue
         labels = _label_values(zone_name, dimension_map, dimensions, available, label_pool)
@@ -551,20 +622,32 @@ def collect_zone(
     missing = REQUIRED_FIELDS - fields
     if missing:
         raise CloudflareAPIError(f"fields not available for the zone: {', '.join(sorted(missing))}")
+    # A dataset the plan cannot serve is skipped explicitly; the others are collected.
+    supported = {kind: int(DATASET_FIELDS.get(kind, frozenset()) <= fields) for kind in DATASETS}
+    for kind, ok in supported.items():
+        if not ok:
+            logging.warning(
+                "Zone %s: plan does not offer %s; the %s dataset is not collected",
+                zone_name,
+                ", ".join(sorted(DATASET_FIELDS[kind] - fields)),
+                kind,
+            )
+    collected = tuple(kind for kind, ok in supported.items() if ok)
     if api.hint_day != since:
         api.slice_hints.clear()
         api.hint_day = since
     if since == until:
-        return ZoneMetrics(visits={}, requests={}, limited=dict.fromkeys(DATASETS, 0))
+        return ZoneMetrics(
+            visits={}, requests={}, limited=dict.fromkeys(collected, 0), available=supported
+        )
 
     def available(dimension_map: Mapping[str, str]) -> list[str]:
         return [d for d in dimension_map.values() if f"dimensions_{d}" in fields]
 
     dimensions = {kind: available(mapping) for kind, mapping in DATASETS.items()}
     unavailable = sorted(
-        (set(VISITS_DIMENSIONS.values()) | set(REQUESTS_DIMENSIONS.values()))
-        - set(dimensions["visits"])
-        - set(dimensions["requests"])
+        {d for mapping in DATASETS.values() for d in mapping.values()}
+        - {d for kind in collected for d in dimensions[kind]}
     )
     if unavailable:
         logging.debug("Zone %s: plan does not offer %s", zone_name, ", ".join(unavailable))
@@ -578,20 +661,20 @@ def collect_zone(
         if any(k != "totals" for k in kinds):
             variables["limit"] = page_size
         query = build_analytics_query(*dimensions.values(), datasets=kinds)
-        return _zone_node(api.graphql(query, variables), zone_id)
+        return zone_node(api.graphql(query, variables), zone_id)
 
     def value_of(kind: str, group: dict) -> float | None:
         return (group.get("sum") or {}).get("visits") if kind == "visits" else group.get("count")
 
-    samples: dict[str, dict[LabelValues, float]] = {kind: {} for kind in DATASETS}
+    samples: dict[str, dict[LabelValues, float]] = {kind: {} for kind in collected}
     label_pool: dict[str, str] = {}
     # Why each selection is incomplete. Decided from the pages themselves: a
     # separately fetched total can differ from the slices for the current day.
     cuts: dict[str, str] = {}
-    leaves = dict.fromkeys(DATASETS, 0)
-    budget = dict.fromkeys(DATASETS, MAX_SLICE_REQUESTS)
+    leaves = dict.fromkeys(collected, 0)
+    budget = dict.fromkeys(collected, MAX_SLICE_REQUESTS)
     scheduled: dict[tuple[datetime, datetime], list[str]] = {(since, until): ["totals"]}
-    for kind in DATASETS:
+    for kind in collected:
         hint = 1 if single_page else api.slice_hints.get((zone_id, kind), 1)
         count = min(hint, MAX_SLICE_REQUESTS, 1 + api.slice_allowance)
         windows = _windows(since, until, count)
@@ -604,10 +687,15 @@ def collect_zone(
         split = []
         seconds = (end - start).total_seconds()
         for kind in kinds:
-            groups = _group_list(kind, node.pop(kind, None))
+            groups = group_list(kind, node.pop(kind, None))
             read = partial(value_of, kind)
+            # Validate once, including parent/probe groups that will not be aggregated.
+            # A malformed response is not proof of a complete or empty dataset.
+            for group in groups:
+                checked_value(kind, group, read)
+                _group_dimensions(kind, group, dimensions[kind])
             # Ordered largest first: a page cut nothing if its last group is zero.
-            full = len(groups) >= page_size and _checked_value(kind, groups[-1], read) > 0
+            full = len(groups) >= page_size and read(groups[-1]) > 0
             if (
                 full
                 and not single_page
@@ -618,7 +706,7 @@ def collect_zone(
                 budget[kind] -= 2
                 api.slice_allowance -= 2
                 split.append(kind)
-                continue  # Discard this parent page unread; only its children count.
+                continue  # Discard the validated parent page; only its children count.
             leaves[kind] += 1
             if full:
                 cuts.setdefault(
@@ -631,7 +719,6 @@ def collect_zone(
                 )
             values = _aggregate(
                 zone_name,
-                kind,
                 groups[:limit] if single_page else groups,
                 DATASETS[kind],
                 dimensions[kind],
@@ -658,11 +745,11 @@ def collect_zone(
             if not isinstance(totals, list) or len(totals) > 1:
                 raise CloudflareAPIError("GraphQL: totals contains no valid aggregate list")
             if totals:  # An empty list means no traffic in the window.
-                total_requests = _checked_value("totals", totals[0], partial(value_of, "requests"))
-                total_visits = _checked_value("totals", totals[0], partial(value_of, "visits"))
+                total_requests = checked_value("totals", totals[0], partial(value_of, "requests"))
+                total_visits = checked_value("totals", totals[0], partial(value_of, "visits"))
         merge(node, tuple(k for k in kinds if k != "totals"), start, end)
 
-    limited = dict.fromkeys(DATASETS, 0)
+    limited = dict.fromkeys(collected, 0)
     for kind, values in samples.items():
         if limit and len(values) > limit:
             samples[kind] = dict(
@@ -679,7 +766,7 @@ def collect_zone(
                 cuts[kind],
             )
     # Publish hints only after every selection and slice succeeded.
-    api.slice_hints.update({(zone_id, kind): leaves[kind] for kind in DATASETS})
+    api.slice_hints.update({(zone_id, kind): leaves[kind] for kind in collected})
     return ZoneMetrics(
         visits=samples["visits"],
         requests=samples["requests"],
@@ -687,6 +774,8 @@ def collect_zone(
         total_requests=total_requests,
         total_visits=total_visits,
         limited=limited,
+        edge=samples.get("edge", {}),
+        available=supported,
     )
 
 
@@ -700,10 +789,12 @@ def collect_once(api: CloudflareAPI, now: datetime | None = None) -> Snapshot:
     visits: dict[LabelValues, float] = {}
     requests_: dict[LabelValues, float] = {}
     cache: dict[LabelValues, float] = {}
+    edge: dict[LabelValues, float] = {}
     zone_requests: dict[str, float] = {}
     zone_visits: dict[str, float] = {}
     groups: dict[LabelValues, int] = {}
     limited: dict[LabelValues, int] = {}
+    available: dict[LabelValues, int] = {}
     zone_success: dict[str, int] = {}
 
     try:
@@ -748,17 +839,22 @@ def collect_once(api: CloudflareAPI, now: datetime | None = None) -> Snapshot:
         visits.update(result.visits)
         requests_.update(result.requests)
         cache.update(result.cache)
+        edge.update(result.edge)
         zone_requests[zone_name] = result.total_requests
         zone_visits[zone_name] = result.total_visits
         for kind in DATASETS:
-            groups[(zone_name, kind)] = len(getattr(result, kind))
-            limited[(zone_name, kind)] = result.limited[kind]
+            available[(zone_name, kind)] = result.available[kind]
+            # An unsupported dataset has no group count: zero would mean no traffic.
+            if result.available[kind]:
+                groups[(zone_name, kind)] = len(getattr(result, kind))
+                limited[(zone_name, kind)] = result.limited[kind]
         logging.info(
-            "Zone %s processed: %d visits metrics, %d requests metrics, %d cache metrics",
+            "Zone %s processed: %d visits, %d requests, %d cache and %d edge metrics",
             zone_name,
             len(result.visits),
             len(result.requests),
             len(result.cache),
+            len(result.edge),
         )
 
     duration = time.monotonic() - started
@@ -772,11 +868,14 @@ def collect_once(api: CloudflareAPI, now: datetime | None = None) -> Snapshot:
         visits=visits,
         requests=requests_,
         cache=cache,
+        edge=edge,
         zone_requests=zone_requests,
         zone_visits=zone_visits,
         groups=groups,
         limited=limited,
+        available=available,
         window_start=since,
+        window_end=until,
         zone_success=zone_success,
         cycle_success=int(cycle_ok),
         cycle_timestamp=time.time(),
@@ -805,12 +904,20 @@ class CloudflareCollector(Collector):
 
     def collect(self) -> Iterator[Metric]:
         snapshot = self.snapshot
-        if (
+        if self._day_visible(snapshot):
+            yield from self._day_metrics(snapshot)
+        yield from self._health_metrics(snapshot)
+
+    @staticmethod
+    def _day_visible(snapshot: Snapshot) -> bool:
+        """Whether the captured snapshot's analytics belong to the current UTC day."""
+        return (
             snapshot.window_start is None
             or snapshot.window_start.date() == datetime.now(UTC).date()
-        ):
-            yield from self._day_metrics(snapshot)
+        )
 
+    @staticmethod
+    def _health_metrics(snapshot: Snapshot) -> Iterator[Metric]:
         zone_success = GaugeMetricFamily(
             "cf_exporter_zone_scrape_success",
             "Whether the last collection of the zone succeeded (1) or failed (0)",
@@ -840,16 +947,33 @@ class CloudflareCollector(Collector):
 
     @staticmethod
     def _day_metrics(snapshot: Snapshot) -> Iterator[Metric]:
-        for kind, label_names in (
-            ("visits", VISITS_LABELS),
-            ("requests", REQUESTS_LABELS),
-            ("cache", CACHE_LABELS),
+        window = GaugeMetricFamily(
+            "cf_exporter_snapshot_window_end_seconds",
+            "Exclusive API window end as Unix seconds; window_start identifies the UTC window",
+            labels=("zone_name", "window_start"),
+        )
+        if snapshot.window_start is not None and snapshot.window_end is not None:
+            start, end = rfc3339(snapshot.window_start), snapshot.window_end.timestamp()
+            for zone_name, success in snapshot.zone_success.items():
+                if success:
+                    window.add_metric((zone_name, start), end)
+        yield window
+        for kind, label_names, name, description in (
+            ("visits", VISITS_LABELS, "cf_visits", "Total visits since midnight UTC"),
+            ("requests", REQUESTS_LABELS, "cf_requests", "Total requests since midnight UTC"),
+            (
+                "cache",
+                CACHE_LABELS,
+                "cf_cache_requests",
+                "Total requests by cache status since midnight UTC",
+            ),
+            (
+                "edge",
+                EDGE_LABELS,
+                "cf_edge_requests",
+                "Client requests by edge and origin response status since midnight UTC",
+            ),
         ):
-            name, description = (
-                ("cf_cache_requests", "Total requests by cache status since midnight UTC")
-                if kind == "cache"
-                else (f"cf_{kind}", f"Total {kind} since midnight UTC")
-            )
             metric = GaugeMetricFamily(name, description, labels=label_names)
             for labels, value in getattr(snapshot, kind).items():
                 metric.add_metric(labels, value)
@@ -878,6 +1002,12 @@ class CloudflareCollector(Collector):
                 "Whether groups were truncated (1) or complete (0)",
                 ("zone_name", "dataset"),
                 snapshot.limited,
+            ),
+            (
+                "cf_exporter_dataset_available",
+                "Whether the zone's plan supports the dataset (1) or it is not collected (0)",
+                ("zone_name", "dataset"),
+                snapshot.available,
             ),
         ):
             metric = GaugeMetricFamily(name, description, labels=label_names)

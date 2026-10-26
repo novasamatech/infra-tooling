@@ -23,6 +23,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from image_smoke import WINDOW_TYPE_LINE, checked_edge_family, checked_snapshot_windows
+from profile_live import expected_totals, request_sources, source_filter_valid
 from prometheus_client import generate_latest
 
 import script
@@ -46,7 +48,7 @@ query Type($name: String!) {
       args { name type { ...TypeRef } }
     }
     enumValues(includeDeprecated: true) { name isDeprecated deprecationReason }
-    inputFields { name }
+    inputFields { name type { ...TypeRef } }
   }
 }
 fragment TypeRef on __Type {
@@ -81,22 +83,30 @@ def type_name(type_ref):
 
 
 DAY_FAMILIES = (
+    "cf_exporter_snapshot_window_end_seconds",
     "cf_visits",
     "cf_requests",
     "cf_cache_requests",
+    "cf_edge_requests",
     "cf_zone_requests",
     "cf_zone_visits",
     "cf_exporter_groups",
     "cf_exporter_group_limit_reached",
+    "cf_exporter_dataset_available",
 )
 
 
 def assert_day_families(text, cycle_start):
     """Require the day-scoped families unless the UTC day changed after the cycle
     started; the exporter omits them then by design."""
-    if cycle_start.date() == datetime.now(UTC).date():
+    window_present = WINDOW_TYPE_LINE in text
+    if window_present or cycle_start.date() == datetime.now(UTC).date():
         for name in DAY_FAMILIES:
             assert f"# TYPE {name} gauge" in text
+        checked_snapshot_windows(text)
+        checked_edge_family(text)
+    else:
+        assert all(f"# TYPE {name} gauge" not in text for name in DAY_FAMILIES)
 
 
 def scraped_cycle_start(body):
@@ -143,7 +153,11 @@ def test_queried_graphql_schema_is_current(api):
     # Cloudflare exposes input-field names but not their deprecation status.
     filter_arg = next(a for a in dataset["args"] if a["name"] == "filter")
     filter_fields = introspect(api, type_name(filter_arg["type"]))["inputFields"]
-    assert {"datetime_geq", "datetime_lt"} <= {f["name"] for f in filter_fields}
+    assert {"datetime_geq", "datetime_lt", "requestSource"} <= {f["name"] for f in filter_fields}
+    assert (
+        type_name(next(f for f in filter_fields if f["name"] == "requestSource")["type"])
+        == "string"
+    )
 
     order_by = next(a for a in dataset["args"] if a["name"] == "orderBy")
     order_values = introspect(api, type_name(order_by["type"]))["enumValues"]
@@ -155,12 +169,12 @@ def test_queried_graphql_schema_is_current(api):
     sums = introspect(api, type_name(current(groups, "sum")["type"]))["fields"]
     current(sums, "visits")
     dimensions = introspect(api, type_name(current(groups, "dimensions")["type"]))["fields"]
-    for dimension in {
-        *script.VISITS_DIMENSIONS.values(),
-        *script.REQUESTS_DIMENSIONS.values(),
-        *script.CACHE_DIMENSIONS.values(),
-    }:
+    for dimension in {d for mapping in script.DATASETS.values() for d in mapping.values()}:
         current(dimensions, dimension)
+    # The eyeball filter compares against this dimension's values.
+    assert type_name(current(dimensions, "requestSource")["type"]) == "string"
+    for status in ("edgeResponseStatus", "originResponseStatus"):
+        assert type_name(current(dimensions, status)["type"]) == "uint16"
 
 
 def test_every_zone_is_collected(api, zones):
@@ -175,20 +189,30 @@ def test_every_zone_is_collected(api, zones):
         except script.CloudflareAPIError as e:
             failures[zone["name"]] = str(e)
             continue
-        for labels, value in result.visits.items():
-            assert len(labels) == len(script.VISITS_LABELS)
-            assert value > 0
-        for labels, value in result.requests.items():
-            assert len(labels) == len(script.REQUESTS_LABELS)
-            assert value > 0
-        for labels, value in result.cache.items():
-            assert len(labels) == len(script.CACHE_LABELS)
-            assert value > 0
+        for kind, label_names in (
+            ("visits", script.VISITS_LABELS),
+            ("requests", script.REQUESTS_LABELS),
+            ("cache", script.CACHE_LABELS),
+            ("edge", script.EDGE_LABELS),
+        ):
+            for labels, value in getattr(result, kind).items():
+                assert len(labels) == len(label_names)
+                assert value > 0
+        eyeball = 0
+        if result.available["edge"]:
+            eyeball, sources = request_sources(api.graphql, zone["id"], since, until)
+            # A wrong filter value would look like a zone without client traffic.
+            assert source_filter_valid(
+                eyeball, sources, result.total_requests, completed_day=True
+            ), (zone["name"], eyeball, sources)
+        else:
+            assert not result.edge
+        # Edge groups are compared with the eyeball total, never the unfiltered one.
+        expected = expected_totals(result.total_visits, result.total_requests, eyeball)
         for kind in script.DATASETS:
-            if not result.limited[kind]:
-                total = result.total_visits if kind == "visits" else result.total_requests
+            if result.available[kind] and not result.limited[kind]:
                 actual = sum(getattr(result, kind).values())
-                assert actual == total, (zone["name"], kind, actual, total)
+                assert actual == expected[kind], (zone["name"], kind, actual, expected[kind])
     assert not failures
 
 
@@ -216,6 +240,11 @@ def test_full_cycle_renders_metrics(api, zones, registry):
     assert registry.get_sample_value("cf_exporter_last_cycle_success") == 1
     text = generate_latest(registry).decode()
     assert_day_families(text, snapshot.window_start)
+    if WINDOW_TYPE_LINE in text:
+        assert checked_snapshot_windows(text) == {
+            zone["name"]: (script.rfc3339(snapshot.window_start), snapshot.window_end.timestamp())
+            for zone in zones
+        }
 
 
 def test_invalid_api_token_is_reported_not_fatal():
