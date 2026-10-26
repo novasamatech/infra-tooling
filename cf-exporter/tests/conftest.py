@@ -4,6 +4,7 @@
 """Shared fixtures: an in-memory fake of the Cloudflare REST + GraphQL APIs."""
 
 import json
+import re
 from datetime import UTC, datetime
 
 import pytest
@@ -67,12 +68,18 @@ class FakeCloudflare:
         error=None,
         enabled=True,
         max_page_size=script.GROUPS_LIMIT,
+        cache=(),
+        totals=None,
+        responder=None,
     ):
         self.zones[zone_id] = {
             "name": name,
             "fields": fields,
             "visits": list(visits),
             "requests": list(requests),
+            "cache": list(cache),
+            "totals": totals,
+            "responder": responder,
             "error": error,
             "enabled": enabled,
             "max_page_size": max_page_size,
@@ -113,7 +120,24 @@ class FakeCloudflare:
         elif zone["error"]:
             return graphql_error(zone["error"])
         else:
-            node = {"visits": zone["visits"], "requests": zone["requests"]}
+            if zone["responder"]:
+                return zone["responder"](body)
+            kinds = re.findall(r"(\w+): httpRequestsAdaptiveGroups\(", body["query"])
+            node = {}
+            for kind in kinds:
+                if kind == "totals":
+                    node[kind] = (
+                        zone["totals"]
+                        if zone["totals"] is not None
+                        else [
+                            {
+                                "count": sum(g["count"] for g in zone["requests"]),
+                                "sum": {"visits": sum(g["sum"]["visits"] for g in zone["visits"])},
+                            }
+                        ]
+                    )
+                else:
+                    node[kind] = zone[kind][: body["variables"]["limit"]]
         return json_response(200, {"data": {"viewer": {"zones": [node]}}, "errors": None})
 
 

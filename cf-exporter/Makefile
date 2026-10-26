@@ -3,170 +3,134 @@
 #
 # Developer workflow for the Cloudflare exporter (script.py).
 #
-# Two local virtualenvs live next to this Makefile. Each is rebuilt from scratch
-# whenever its lock file changes, so it always matches the dependency files:
-#
-#   venv/      runtime:     requirements.txt only (exactly what the image ships)
-#   venv-dev/  development: requirements-dev.txt (runtime + test/lint tooling)
-#
-# Direct dependencies are declared in requirements.in / requirements-dev.in;
-# `make lock` resolves them into the pinned requirements*.txt lock files.
-#
-# `make run`, the live tests and the image smoke test need a Cloudflare API
-# token in the ENVIRONMENT (it is never written to disk by this Makefile):
-#
-#   export CF_EXPORTER_API_TOKEN=...
-#   make test-live
+# Every Python task runs in a local Python 3.13 image built from Dockerfile.dev,
+# with the sources mounted at /src; no host virtualenv is needed. The image tag
+# hashes the pinned requirements and Dockerfile.dev, so it is rebuilt only when
+# they change. Token-dependent targets read CF_EXPORTER_API_TOKEN from the
+# environment and pass it to the container through stdin.
 
 MAKEFILE_PATH := $(abspath $(lastword $(MAKEFILE_LIST)))
 ROOT          := $(dir $(MAKEFILE_PATH))
-
-REQ_IN        := $(ROOT)requirements.in
-REQ_DEV_IN    := $(ROOT)requirements-dev.in
-REQ           := $(ROOT)requirements.txt
-REQ_DEV       := $(ROOT)requirements-dev.txt
-
-RUN_VENV      := $(ROOT)venv
-RUN_PY        := $(RUN_VENV)/bin/python
-RUN_STAMP     := $(RUN_VENV)/.installed
-DEV_VENV      := $(ROOT)venv-dev
-DEV_PY        := $(DEV_VENV)/bin/python
-DEV_STAMP     := $(DEV_VENV)/.installed
-LOCK_VENV     := $(ROOT).venv-lock
-LOCK_PY       := $(LOCK_VENV)/bin/python
-
-# Interpreter used to create the venvs (override if your python3 lives elsewhere).
-PYTHON ?= python3
-
-# Container image (tag = first non-empty line of .version, as in CI).
 CONTAINER_ENGINE ?= podman
 IMAGE            ?= ghcr.io/novasamatech/infra-tooling/cf-exporter
 VERSION          := $(shell sed -n '/[^[:space:]]/{s/[[:space:]]//g;p;q;}' "$(ROOT).version")
+DEV_HASH         := $(shell cat "$(ROOT)requirements.txt" "$(ROOT)requirements-dev.txt" "$(ROOT)Dockerfile.dev" \
+                      | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16)
+# Local-only name: the dev image is never published.
+DEV_REPO         := cf-exporter-dev
+DEV_IMAGE        ?= $(DEV_REPO):$(DEV_HASH)
 PORT             ?= 8000
-SMOKE_TIMEOUT    ?= 120
+SMOKE_TIMEOUT    ?= 180
+PROFILE_ARGS     ?= --cycles 2
+
+# Keep generated source/coverage files owned by the operator with either engine.
+ifneq ($(findstring podman,$(CONTAINER_ENGINE)),)
+USER_FLAGS := --userns=keep-id
+else
+USER_FLAGS := --user $(shell id -u):$(shell id -g)
+endif
+DEV_RUN = $(CONTAINER_ENGINE) run --rm $(USER_FLAGS) -v "$(ROOT):/src" -w /src
+CONFIG_ENV = --env CF_EXPORTER_REQUEST_TIMEOUT --env CF_EXPORTER_SCRAPE_INTERVAL \
+             --env CF_EXPORTER_METRICS_PORT --env CF_EXPORTER_LOGLEVEL --env CF_EXPORTER_GROUP_LIMIT
+# Only stdin carries the token; it never enters container arguments or metadata.
+TOKEN_RUN = printf '%s\n' "$$CF_EXPORTER_API_TOKEN" | $(DEV_RUN) -i $(CONFIG_ENV)
+TOKEN_ENTRY = /bin/sh -c 'IFS= read -r CF_EXPORTER_API_TOKEN; export CF_EXPORTER_API_TOKEN; exec "$$@"' sh
 
 .DEFAULT_GOAL := help
-
-.PHONY: help venv venv-dev run test test-live test-all coverage lint fmt \
-        lock outdated image image-run test-image clean check-token
+.PHONY: help dev-image run test test-live test-all coverage lint fmt lock outdated \
+        profile-live image image-run test-image clean check-token
 
 help:
-	@echo "cf-exporter — make targets:"
-	@echo "  make venv        build ./venv (runtime deps) — runs automatically"
-	@echo "  make venv-dev    build ./venv-dev (runtime + dev deps) — runs automatically"
-	@echo "  make run         run the exporter from ./venv on :\$$CF_EXPORTER_METRICS_PORT (default 8000)"
-	@echo "  make test        offline unit tests with coverage (no token needed)"
-	@echo "  make test-live   live tests against the real Cloudflare API (needs token)"
-	@echo "  make test-all    unit + live tests (needs token)"
-	@echo "  make coverage    unit tests + HTML coverage report in ./htmlcov"
+	@echo "cf-exporter — Python 3.13 container tasks (no host virtualenvs):"
+	@echo "  make run         run the exporter on :$(PORT) (needs token)"
+	@echo "  make test        offline tests with coverage"
+	@echo "  make test-live   real Cloudflare API and process tests (needs token)"
+	@echo "  make test-all    offline + live tests with coverage (needs token)"
+	@echo "  make coverage    offline tests + HTML coverage in ./htmlcov"
 	@echo "  make lint        ruff lint + format check"
 	@echo "  make fmt         ruff auto-format + autofix"
-	@echo "  make lock        re-resolve requirements*.in into pinned requirements*.txt"
-	@echo "  make outdated    list dependencies with newer releases"
-	@echo "  make image       build the container image $(IMAGE):$(VERSION)"
-	@echo "  make image-run   run the image on :$(PORT) (needs token)"
-	@echo "  make test-image  build + start the image and wait for a successful cycle (needs token)"
-	@echo "  make clean       remove venvs, caches and coverage output"
-	@echo ""
+	@echo "  make lock        resolve requirements*.in with Python 3.13"
+	@echo "  make outdated    list dependency updates"
+	@echo "  make profile-live  live cycle, memory and exposition measurements (needs token)"
+	@echo "  make image       build $(IMAGE):$(VERSION)"
+	@echo "  make image-run   run the runtime image on :$(PORT) (needs token)"
+	@echo "  make test-image  build + check the runtime image (needs token)"
+	@echo "  make clean       remove caches, coverage output and all dev images"
 	@echo "Token-dependent targets read CF_EXPORTER_API_TOKEN from the environment."
 
-# ---------------------------------------------------------------- venvs ----
-# File targets: a venv is recreated from scratch only when its lock file(s)
-# change, so it never accumulates packages that were dropped from the pins.
-$(RUN_STAMP): $(REQ)
-	@echo ">> building runtime virtualenv $(RUN_VENV)"
-	rm -rf "$(RUN_VENV)"
-	"$(PYTHON)" -m venv "$(RUN_VENV)"
-	"$(RUN_PY)" -m pip install --quiet --upgrade pip
-	"$(RUN_PY)" -m pip install --quiet --requirement "$(REQ)"
-	@touch "$@"
+dev-image:
+	@$(CONTAINER_ENGINE) image inspect "$(DEV_IMAGE)" >/dev/null 2>&1 || \
+	  $(CONTAINER_ENGINE) build -f "$(ROOT)Dockerfile.dev" -t "$(DEV_IMAGE)" "$(ROOT)"
 
-$(DEV_STAMP): $(REQ) $(REQ_DEV)
-	@echo ">> building development virtualenv $(DEV_VENV)"
-	rm -rf "$(DEV_VENV)"
-	"$(PYTHON)" -m venv "$(DEV_VENV)"
-	"$(DEV_PY)" -m pip install --quiet --upgrade pip
-	"$(DEV_PY)" -m pip install --quiet --requirement "$(REQ_DEV)"
-	@touch "$@"
-
-venv: $(RUN_STAMP)
-
-venv-dev: $(DEV_STAMP)
-
-# ------------------------------------------------------------ lock files ---
-# Resolve the direct dependencies in a throwaway venv inside this folder and
-# freeze the result. Dev pins are resolved against the runtime pins, so the
-# two lock files can never disagree; requirements-dev.txt includes
-# requirements.txt and lists only the extra packages.
-lock:
-	@echo ">> resolving dependency pins"
-	@set -eu; \
-	trap 'rm -rf "$(LOCK_VENV)"; rm -f "$(REQ).tmp" "$(REQ_DEV).tmp"' EXIT; \
-	rm -rf "$(LOCK_VENV)"; \
-	"$(PYTHON)" -m venv "$(LOCK_VENV)"; \
-	"$(LOCK_PY)" -m pip install --quiet --upgrade pip; \
-	"$(LOCK_PY)" -m pip install --quiet --requirement "$(REQ_IN)"; \
-	{ echo "# Generated by \`make lock\` from requirements.in — do not edit by hand."; \
-	  "$(LOCK_PY)" -m pip freeze; } > "$(REQ).tmp"; \
-	"$(LOCK_PY)" -m pip install --quiet --requirement "$(REQ_DEV_IN)" --constraint "$(REQ).tmp"; \
-	{ echo "# Generated by \`make lock\` from requirements-dev.in — do not edit by hand."; \
-	  echo "-r requirements.txt"; \
-	  "$(LOCK_PY)" -m pip freeze | grep -vxFf "$(REQ).tmp"; } > "$(REQ_DEV).tmp"; \
-	mv "$(REQ).tmp" "$(REQ)"; \
-	mv "$(REQ_DEV).tmp" "$(REQ_DEV)"
-	@echo ">> updated $(notdir $(REQ)) and $(notdir $(REQ_DEV)); venvs rebuild on next use"
-
-outdated: $(DEV_STAMP)
-	"$(DEV_PY)" -m pip list --outdated
-
-# ------------------------------------------------------------------ run ----
 check-token:
 	@case "$$CF_EXPORTER_API_TOKEN" in \
 	  *[![:space:]]*) ;; \
 	  *) echo "ERROR: CF_EXPORTER_API_TOKEN is not set or is blank"; exit 1 ;; \
 	esac
 
-run: $(RUN_STAMP) check-token
-	cd "$(ROOT)" && "$(RUN_PY)" script.py
+run: dev-image check-token
+	@$(TOKEN_RUN) -p "$(PORT):$(PORT)" --env CF_EXPORTER_METRICS_PORT=$(PORT) "$(DEV_IMAGE)" $(TOKEN_ENTRY) python script.py
 
-# ---------------------------------------------------------------- tests ----
-test: $(DEV_STAMP)
-	cd "$(ROOT)" && "$(DEV_PY)" -m pytest -m "not live" --cov=script --cov-report=term-missing
+test: dev-image
+	$(DEV_RUN) "$(DEV_IMAGE)" python -m pytest -m "not live" --cov=script --cov-report=term-missing
 
-test-live: $(DEV_STAMP) check-token
-	cd "$(ROOT)" && "$(DEV_PY)" -m pytest -m live -v
+test-live: dev-image check-token
+	@$(TOKEN_RUN) "$(DEV_IMAGE)" $(TOKEN_ENTRY) python -m pytest -m live -v
 
-test-all: $(DEV_STAMP) check-token
-	cd "$(ROOT)" && "$(DEV_PY)" -m pytest -v --cov=script --cov-report=term-missing
+test-all: dev-image check-token
+	@$(TOKEN_RUN) "$(DEV_IMAGE)" $(TOKEN_ENTRY) python -m pytest -v --cov=script --cov-report=term-missing
 
-coverage: $(DEV_STAMP)
-	cd "$(ROOT)" && "$(DEV_PY)" -m pytest -m "not live" --cov=script --cov-report=term-missing --cov-report=html
+coverage: dev-image
+	$(DEV_RUN) "$(DEV_IMAGE)" python -m pytest -m "not live" --cov=script --cov-report=term-missing --cov-report=html
 
-lint: $(DEV_STAMP)
-	cd "$(ROOT)" && "$(DEV_PY)" -m ruff check .
-	cd "$(ROOT)" && "$(DEV_PY)" -m ruff format --check .
+lint: dev-image
+	$(DEV_RUN) "$(DEV_IMAGE)" python -m ruff check .
+	$(DEV_RUN) "$(DEV_IMAGE)" python -m ruff format --check .
 
-fmt: $(DEV_STAMP)
-	cd "$(ROOT)" && "$(DEV_PY)" -m ruff format .
-	cd "$(ROOT)" && "$(DEV_PY)" -m ruff check --fix .
+fmt: dev-image
+	$(DEV_RUN) "$(DEV_IMAGE)" python -m ruff format .
+	$(DEV_RUN) "$(DEV_IMAGE)" python -m ruff check --fix .
 
-# ---------------------------------------------------------------- image ----
+outdated: dev-image
+	$(DEV_RUN) "$(DEV_IMAGE)" python -m pip list --outdated
+
+# For example PROFILE_ARGS='--day 2026-10-25 --cycles 2' for a completed UTC day.
+profile-live: dev-image check-token
+	@$(TOKEN_RUN) "$(DEV_IMAGE)" $(TOKEN_ENTRY) python tests/profile_live.py $(PROFILE_ARGS)
+
+# Resolve inside an ephemeral container; only completed lock files reach /src.
+lock:
+	$(DEV_RUN) python:3.13-alpine /bin/sh -ec '\
+	  trap '\''rm -f /src/requirements.txt.tmp /src/requirements-dev.txt.tmp'\'' EXIT; \
+	  python -m venv /tmp/cf-resolver; \
+	  /tmp/cf-resolver/bin/python -m pip install --quiet --upgrade pip; \
+	  /tmp/cf-resolver/bin/python -m pip install --quiet -r requirements.in; \
+	  { echo "# Generated by \`make lock\` from requirements.in — do not edit by hand."; \
+	    /tmp/cf-resolver/bin/python -m pip freeze; } > requirements.txt.tmp; \
+	  /tmp/cf-resolver/bin/python -m pip install --quiet -r requirements-dev.in -c requirements.txt.tmp; \
+	  { echo "# Generated by \`make lock\` from requirements-dev.in — do not edit by hand."; \
+	    echo "-r requirements.txt"; \
+	    /tmp/cf-resolver/bin/python -m pip freeze | grep -vxFf requirements.txt.tmp; } > requirements-dev.txt.tmp; \
+	  mv requirements.txt.tmp requirements.txt; \
+	  mv requirements-dev.txt.tmp requirements-dev.txt'
+
 image:
 	$(CONTAINER_ENGINE) build -t "$(IMAGE):$(VERSION)" "$(ROOT)"
 
-# Feed the token through stdin so container metadata never stores the secret.
 image-run: check-token
 	@printf '%s\n' "$$CF_EXPORTER_API_TOKEN" | $(CONTAINER_ENGINE) run --rm -i \
-	  -p "$(PORT):8000" "$(IMAGE):$(VERSION)" /bin/sh -c \
-	  'IFS= read -r CF_EXPORTER_API_TOKEN; export CF_EXPORTER_API_TOKEN; exec python script.py'
+	  $(CONFIG_ENV) --env CF_EXPORTER_METRICS_PORT=8000 -p "$(PORT):8000" "$(IMAGE):$(VERSION)" $(TOKEN_ENTRY) python script.py
 
-# Start the image detached and wait until a full collection cycle succeeded.
-test-image: image $(DEV_STAMP) check-token
-	cd "$(ROOT)" && "$(DEV_PY)" tests/image_smoke.py \
+# Host driver uses only stdlib; the exporter itself runs in Python 3.13.
+test-image: image check-token
+	cd "$(ROOT)" && python3 tests/image_smoke.py \
 	  "$(CONTAINER_ENGINE)" "$(IMAGE):$(VERSION)" "$(PORT)" "$(SMOKE_TIMEOUT)"
 
-# ---------------------------------------------------------------- clean ----
 clean:
-	rm -rf "$(RUN_VENV)" "$(DEV_VENV)" "$(LOCK_VENV)" \
-	  "$(ROOT).pytest_cache" "$(ROOT).ruff_cache" "$(ROOT)htmlcov" "$(ROOT).coverage"
+	rm -rf "$(ROOT).pytest_cache" "$(ROOT).ruff_cache" "$(ROOT)htmlcov" "$(ROOT).coverage"
 	find "$(ROOT)" -name __pycache__ -type d -prune -exec rm -rf {} +
+	@# Every dev image tag, including those left behind by earlier pins.
+	@for image in $$($(CONTAINER_ENGINE) images --format '{{.Repository}}:{{.Tag}}' \
+	    | grep -E '(^|/)$(DEV_REPO):'); do \
+	  $(CONTAINER_ENGINE) image rm "$$image"; \
+	done

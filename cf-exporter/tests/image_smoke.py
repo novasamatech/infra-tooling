@@ -5,6 +5,7 @@
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -13,6 +14,28 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+DAY_FAMILIES = (
+    "cf_cache_requests",
+    "cf_zone_requests",
+    "cf_zone_visits",
+    "cf_exporter_groups",
+    "cf_exporter_group_limit_reached",
+)
+
+
+def cycle_started_today(body: str) -> bool:
+    """Whether the last cycle started on the current UTC day.
+
+    A cycle that started before midnight publishes no day-scoped families once
+    the day has changed, so the check must not expect them.
+    """
+    pattern = r"^(cf_exporter_(?:last_cycle_timestamp|cycle_duration)_seconds) (\S+)$"
+    values = dict(re.findall(pattern, body, re.MULTILINE))
+    started = float(values["cf_exporter_last_cycle_timestamp_seconds"]) - float(
+        values["cf_exporter_cycle_duration_seconds"]
+    )
+    return time.gmtime(started)[:3] == time.gmtime()[:3]
 
 
 def main() -> int:
@@ -74,6 +97,16 @@ def main() -> int:
                             metadata_checked
                             and "cf_exporter_last_cycle_success 1.0" in body.splitlines()
                         ):
+                            if cycle_started_today(body):
+                                for name in DAY_FAMILIES:
+                                    if f"# TYPE {name} gauge" not in body:
+                                        print(f"image smoke test: FAILED - missing {name}")
+                                        return 1
+                            else:
+                                print(
+                                    "image smoke test: cycle crossed UTC midnight, "
+                                    "day-scoped families are omitted by design"
+                                )
                             print(f"image smoke test: OK ({image})")
                             return 0
                     except (urllib.error.URLError, ConnectionError):
