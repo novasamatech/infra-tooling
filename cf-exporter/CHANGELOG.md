@@ -8,6 +8,66 @@ SPDX-License-Identifier: Apache-2.0
 All notable changes to `cf-exporter` are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] — 2026-10-26
+
+Metric names, labels and label order of `cf_visits` / `cf_requests` are unchanged.
+
+### Added
+
+- `cf_cache_requests` gauge for every host of every zone, with `zone_name`,
+  `host_name`, `method_name`, `path`, `cache_status`, `origin_response_status`.
+- Dimensionless `cf_zone_requests` and `cf_zone_visits` day-to-date totals.
+- `cf_exporter_groups` and `cf_exporter_group_limit_reached`, labelled by zone
+  and dataset (`visits`, `requests`, `cache`), to expose export size and truncation.
+- Optional `CF_EXPORTER_GROUP_LIMIT`: unset, empty or zero exports all groups;
+  a positive value exports the largest N nonzero label sets per zone/selection.
+- Time-filtered regression tests, completed-day live sum checks and a repeatable
+  live profiling driver for memory, selection count and exposition cost.
+
+### Fixed
+
+- Default exports no longer drop groups beyond a single API page. Adaptive,
+  half-open time slicing retries only full selections, discards parent pages
+  and merges all child values. Slice-count hints are reused until UTC midnight.
+- Full visits pages ending in zero no longer cause false truncation warnings.
+  A configured cap requests one extra group to see whether it cut anything;
+  truncation is decided from the pages, never from the separately fetched totals.
+- Yesterday's analytics and group metrics disappear immediately at UTC midnight,
+  even before the next collection finishes. Health metrics remain available.
+- Any failed slice discards the entire zone's analytics for that cycle.
+- A long `Retry-After` (Cloudflare asks for up to 5 minutes) no longer stalls a
+  cycle for each retried request. Waits above 30 seconds fail the request at
+  once, and after an HTTP 429 (or a GraphQL budget error with another status)
+  the remaining zones are skipped and reported as failed until the next cycle.
+- The traffic between the last cycle of a day and midnight was never exported
+  (since 1.4.0, up to one scrape interval). Once a day, the cycle before
+  midnight is moved earlier so that it finishes 30 seconds before midnight.
+- The image smoke test and live checks no longer fail when a cycle crosses UTC
+  midnight, where day-scoped families are omitted by design.
+
+### Changed
+
+- One initial aliased analytics request per zone includes visits, requests, cache
+  and totals; sliced retries use additional HTTP requests. Settings discovery
+  remains a separate request. Full slices stop at 60s and expose residual cuts.
+- Slicing is bounded by a GraphQL budget shared by all zones of a cycle: two
+  thirds of the documented quota (300 selections per 5 minutes), scaled to the
+  scrape interval, after every zone's baseline selections; at most 32 requests
+  per selection and zone. A burst of unique groups is reported as truncation
+  instead of exhausting the rate limit.
+- All development commands use a cached Python 3.13 Alpine container, replacing
+  host virtualenvs. Pins determine the dev image tag, files retain host ownership,
+  and token-dependent targets feed credentials through stdin. Lock resolution
+  uses a throwaway container; the image smoke driver remains stdlib-only on host.
+  `make clean` removes every local dev image tag, `make profile-live` runs the
+  live profiler.
+- Runtime image base and dependencies are unchanged.
+- Repeated label strings are shared within each zone's collection. Two live
+  cycles over the completed UTC day 2026-10-25 (46337 requests, 5013 visits and
+  15308 cache groups, all equal to the zone totals) peaked at 127.14 MiB RSS,
+  with 66733 custom samples and a 19.4 MiB exposition. They took 22.7 s with 42
+  analytics selections, then 11.2 s with 37 once slice hints applied.
+
 ## [1.4.0] — 2026-10-13
 
 Metric names and labels of `cf_visits` / `cf_requests` are unchanged.

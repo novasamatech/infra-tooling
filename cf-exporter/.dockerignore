@@ -1,5 +1,5 @@
-# Allowlist: the image only needs the script and its pinned dependencies.
-# Keeps local venvs, caches and tests out of the build context.
+# Shared allowlist for runtime and development builds.
 *
 !script.py
 !requirements.txt
+!requirements-dev.txt

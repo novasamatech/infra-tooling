@@ -10,6 +10,7 @@ token is only ever read from the environment; tests never print it.
 """
 
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -18,7 +19,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -45,6 +46,7 @@ query Type($name: String!) {
       args { name type { ...TypeRef } }
     }
     enumValues(includeDeprecated: true) { name isDeprecated deprecationReason }
+    inputFields { name }
   }
 }
 fragment TypeRef on __Type {
@@ -78,6 +80,35 @@ def type_name(type_ref):
     return type_ref["name"]
 
 
+DAY_FAMILIES = (
+    "cf_visits",
+    "cf_requests",
+    "cf_cache_requests",
+    "cf_zone_requests",
+    "cf_zone_visits",
+    "cf_exporter_groups",
+    "cf_exporter_group_limit_reached",
+)
+
+
+def assert_day_families(text, cycle_start):
+    """Require the day-scoped families unless the UTC day changed after the cycle
+    started; the exporter omits them then by design."""
+    if cycle_start.date() == datetime.now(UTC).date():
+        for name in DAY_FAMILIES:
+            assert f"# TYPE {name} gauge" in text
+
+
+def scraped_cycle_start(body):
+    pattern = r"^(cf_exporter_(?:last_cycle_timestamp|cycle_duration)_seconds) (\S+)$"
+    values = {name: float(value) for name, value in re.findall(pattern, body, re.MULTILINE)}
+    return datetime.fromtimestamp(
+        values["cf_exporter_last_cycle_timestamp_seconds"]
+        - values["cf_exporter_cycle_duration_seconds"],
+        UTC,
+    )
+
+
 def current(fields, name):
     """Return the named field/enum value, asserting it exists and is not deprecated."""
     by_name = {f["name"]: f for f in fields}
@@ -109,6 +140,11 @@ def test_queried_graphql_schema_is_current(api):
     for arg in ("limit", "filter", "orderBy"):
         assert arg in {a["name"] for a in dataset["args"]}
 
+    # Cloudflare exposes input-field names but not their deprecation status.
+    filter_arg = next(a for a in dataset["args"] if a["name"] == "filter")
+    filter_fields = introspect(api, type_name(filter_arg["type"]))["inputFields"]
+    assert {"datetime_geq", "datetime_lt"} <= {f["name"] for f in filter_fields}
+
     order_by = next(a for a in dataset["args"] if a["name"] == "orderBy")
     order_values = introspect(api, type_name(order_by["type"]))["enumValues"]
     current(order_values, "count_DESC")
@@ -119,12 +155,19 @@ def test_queried_graphql_schema_is_current(api):
     sums = introspect(api, type_name(current(groups, "sum")["type"]))["fields"]
     current(sums, "visits")
     dimensions = introspect(api, type_name(current(groups, "dimensions")["type"]))["fields"]
-    for dimension in {*script.VISITS_DIMENSIONS.values(), *script.REQUESTS_DIMENSIONS.values()}:
+    for dimension in {
+        *script.VISITS_DIMENSIONS.values(),
+        *script.REQUESTS_DIMENSIONS.values(),
+        *script.CACHE_DIMENSIONS.values(),
+    }:
         current(dimensions, dimension)
 
 
 def test_every_zone_is_collected(api, zones):
-    since, until = script.day_window(datetime.now(UTC))
+    # Use a completed day for exact sums: fresh analytics can still be ingested
+    # while separate slice requests are being served.
+    until = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    since = until - timedelta(days=1)
     failures = {}
     for zone in zones:
         try:
@@ -138,6 +181,14 @@ def test_every_zone_is_collected(api, zones):
         for labels, value in result.requests.items():
             assert len(labels) == len(script.REQUESTS_LABELS)
             assert value > 0
+        for labels, value in result.cache.items():
+            assert len(labels) == len(script.CACHE_LABELS)
+            assert value > 0
+        for kind in script.DATASETS:
+            if not result.limited[kind]:
+                total = result.total_visits if kind == "visits" else result.total_requests
+                actual = sum(getattr(result, kind).values())
+                assert actual == total, (zone["name"], kind, actual, total)
     assert not failures
 
 
@@ -164,8 +215,7 @@ def test_full_cycle_renders_metrics(api, zones, registry):
     collector.update(snapshot)
     assert registry.get_sample_value("cf_exporter_last_cycle_success") == 1
     text = generate_latest(registry).decode()
-    assert "# TYPE cf_requests gauge" in text
-    assert "# TYPE cf_visits gauge" in text
+    assert_day_families(text, snapshot.window_start)
 
 
 def test_invalid_api_token_is_reported_not_fatal():
@@ -227,7 +277,7 @@ def test_exporter_process_end_to_end(zones):
         assert body and "cf_exporter_last_cycle_success 1.0" in body
         for zone in zones:
             assert f'cf_exporter_zone_scrape_success{{zone_name="{zone["name"]}"}} 1.0' in body
-        assert "# TYPE cf_requests gauge" in body
+        assert_day_families(body, scraped_cycle_start(body))
 
         process.send_signal(signal.SIGTERM)
         assert process.wait(timeout=15) == 0

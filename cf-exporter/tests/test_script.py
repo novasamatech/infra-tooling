@@ -8,6 +8,7 @@ import logging
 import signal
 import sys
 import threading
+import time
 from datetime import UTC, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -19,9 +20,11 @@ from conftest import (
     BASE_URL,
     FREE_FIELDS,
     NOW,
+    json_response,
     requests_group,
     visits_group,
 )
+from image_smoke import cycle_started_today
 from prometheus_client import generate_latest
 from responses import matchers
 
@@ -106,6 +109,8 @@ def test_parse_env_empty_values_use_defaults():
         ("CF_EXPORTER_SCRAPE_INTERVAL", "-5", "must be >= 1"),
         ("CF_EXPORTER_METRICS_PORT", "0", "must be between 1 and 65535"),
         ("CF_EXPORTER_METRICS_PORT", "70000", "must be between 1 and 65535"),
+        ("CF_EXPORTER_GROUP_LIMIT", "-1", "must be >= 0"),
+        ("CF_EXPORTER_GROUP_LIMIT", "1.5", "must be an integer"),
     ],
 )
 def test_parse_env_rejects_invalid_values(name, value, message):
@@ -308,6 +313,57 @@ def test_transient_http_errors_are_retried_with_backoff(monkeypatch, status, met
             worker.join()
 
 
+@pytest.mark.parametrize("retry_after, attempts, sleeps_expected", [("300", 1, []), ("2", 2, [2])])
+def test_retry_after_is_waited_for_only_when_short(
+    monkeypatch, retry_after, attempts, sleeps_expected
+):
+    """Regression: a 5-minute Retry-After used to stall the whole cycle per request."""
+    sleeps = []
+    monkeypatch.setattr("urllib3.util.retry.time.sleep", sleeps.append)
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            calls.append(self.command)
+            limited = len(calls) == 1
+            self.send_response(429 if limited else 200)
+            if limited:
+                self.send_header("Retry-After", retry_after)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            body = {"errors": [{"message": "budget depleted"}]} if limited else {"success": True}
+            self.wfile.write(json.dumps(body).encode())
+
+        def log_message(self, *args):
+            pass
+
+    with HTTPServer(("127.0.0.1", 0), Handler) as server:
+        worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+        worker.start()
+        client = script.CloudflareAPI(
+            "dummy-credential", base_url=f"http://127.0.0.1:{server.server_port}"
+        )
+        client.session.trust_env = False
+        try:
+            if attempts == 1:
+                with pytest.raises(script.RateLimitedError, match="HTTP 429: budget depleted"):
+                    client._request("POST", "/graphql")
+            else:
+                assert client._request("POST", "/graphql") == {"success": True}
+            assert len(calls) == attempts
+            assert sleeps == sleeps_expected
+        finally:
+            client.session.close()
+            server.shutdown()
+            worker.join()
+
+
+def test_rate_limit_without_json_body_is_reported(rsps, api):
+    rsps.add(responses.GET, f"{BASE_URL}/zones", status=429, body="Too Many Requests")
+    with pytest.raises(script.RateLimitedError, match="GET /zones: HTTP 429: rate limited"):
+        api.list_zones()
+
+
 def test_non_json_response_is_reported(rsps, api):
     rsps.add(responses.GET, f"{BASE_URL}/zones", status=502, body="<html>Bad gateway</html>")
     with pytest.raises(script.CloudflareAPIError, match="HTTP 502, response is not JSON"):
@@ -348,7 +404,21 @@ def test_graphql_errors_raise_with_messages(rsps, api):
             ],
         },
     )
-    with pytest.raises(script.CloudflareAPIError, match=r"GraphQL: first \(authz\); second"):
+    with pytest.raises(script.CloudflareAPIError, match=r"GraphQL: first \(authz\); second") as e:
+        api.graphql("q", {})
+    assert not isinstance(e.value, script.RateLimitedError)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"message": "rate limiter budget depleted, try again after 5 minutes"},
+        {"message": "limit reached", "extensions": {"code": "budget"}},
+    ],
+)
+def test_graphql_budget_errors_without_http_429_are_rate_limits(rsps, api, error):
+    rsps.add(responses.POST, f"{BASE_URL}/graphql", json={"data": None, "errors": [error]})
+    with pytest.raises(script.RateLimitedError):
         api.graphql("q", {})
 
 
@@ -422,15 +492,19 @@ def test_query_omits_dimensions_when_none_are_available(cloudflare, api):
 
 
 def test_collect_zone_respects_plan_page_size(cloudflare, api, caplog):
-    cloudflare.add_zone("z1", "example.com", requests=[requests_group(1)], max_page_size=1)
-    script.collect_zone(api, "z1", "example.com", SINCE, UNTIL)
+    cloudflare.add_zone(
+        "z1", "example.com", requests=[requests_group(2), requests_group(1)], max_page_size=1
+    )
+    script.collect_zone(api, "z1", "example.com", SINCE, UNTIL, limit=1)
     assert cloudflare.data_calls()[0]["variables"]["limit"] == 1
     assert "hit the 1 group limit" in caplog.text
 
 
 def test_collect_zone_at_midnight_avoids_empty_range_query(cloudflare, api):
     cloudflare.add_zone("z1", "example.com")
-    assert script.collect_zone(api, "z1", "example.com", SINCE, SINCE) == script.ZoneMetrics({}, {})
+    assert script.collect_zone(api, "z1", "example.com", SINCE, SINCE) == script.ZoneMetrics(
+        {}, {}, limited=dict.fromkeys(script.DATASETS, 0)
+    )
     assert cloudflare.data_calls() == []
 
 
@@ -471,7 +545,7 @@ def test_partial_or_invalid_analytics_is_a_zone_failure(rsps, api, node):
                 }
             }
             if "AvailableFields" in query
-            else node
+            else ({"cache": [], "totals": [], **node} if isinstance(node, dict) else node)
         )
         return (
             200,
@@ -621,6 +695,7 @@ def test_collect_zone_warns_when_group_limit_is_hit(cloudflare, api, caplog):
         requests=[
             requests_group(2, clientRequestPath="/a"),
             requests_group(1, clientRequestPath="/b"),
+            requests_group(1, clientRequestPath="/c"),
         ],
     )
     script.collect_zone(api, "z1", "big.example", SINCE, UNTIL, limit=2)
@@ -663,6 +738,25 @@ def test_collect_once_isolates_failing_zones(cloudflare, api, caplog):
     assert snapshot.cycle_success == 0
     assert [labels[0] for labels in snapshot.requests] == ["ok.example"]
     assert "Zone bad.example: collection failed: GraphQL: quota exceeded" in caplog.text
+
+
+def test_rate_limit_skips_remaining_zones_until_next_cycle(cloudflare, api, caplog):
+    cloudflare.add_zone(
+        "a",
+        "a.example",
+        responder=lambda body: json_response(429, {"errors": [{"message": "budget depleted"}]}),
+    )
+    cloudflare.add_zone("b", "b.example")
+    cloudflare.add_zone("c", "c.example")
+    snapshot = script.collect_once(api, now=NOW)
+    assert snapshot.zone_success == {"a.example": 0, "b.example": 0, "c.example": 0}
+    assert snapshot.cycle_success == 0
+    assert {call["variables"]["zoneTag"] for call in cloudflare.graphql_calls} == {"a"}
+    assert "skipping the remaining zones this cycle" in caplog.text
+    # The next cycle tries every zone again.
+    cloudflare.zones["a"]["responder"] = None
+    snapshot = script.collect_once(api, now=NOW)
+    assert snapshot.zone_success == {"a.example": 1, "b.example": 1, "c.example": 1}
 
 
 def test_collect_once_all_zones_ok(cloudflare, api):
@@ -771,6 +865,19 @@ def test_collector_before_first_cycle_has_no_cycle_metrics(registry):
     assert "cf_exporter_last_cycle_success" not in text
 
 
+def test_smoke_check_detects_cycles_that_crossed_midnight(registry):
+    collector = script.CloudflareCollector()
+    registry.register(collector)
+    now = time.time()
+    collector.update(script.Snapshot(cycle_success=1, cycle_timestamp=now, cycle_duration=0.0))
+    assert cycle_started_today(generate_latest(registry).decode())
+    since_midnight = now % 86400
+    collector.update(
+        script.Snapshot(cycle_success=1, cycle_timestamp=now, cycle_duration=since_midnight + 60)
+    )
+    assert not cycle_started_today(generate_latest(registry).decode())
+
+
 def test_collector_drops_series_missing_from_new_snapshot(registry):
     """Regression: cf_requests series used to live forever."""
     collector = script.CloudflareCollector()
@@ -845,12 +952,33 @@ def test_run_survives_unexpected_errors_and_keeps_going(monkeypatch, caplog):
     assert collector.snapshot.cycle_success == 1
 
 
+def fixed_clock(monkeypatch, moment):
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return moment
+
+    monkeypatch.setattr(script, "datetime", Clock)
+
+
 def test_run_sleeps_for_the_rest_of_the_interval(monkeypatch):
+    fixed_clock(monkeypatch, datetime(2026, 10, 26, 12, 0, tzinfo=UTC))
     monkeypatch.setattr(script, "collect_once", lambda api: snapshot())
     stop = StopAfter(2)
     script.run(None, script.CloudflareCollector(), 300, stop)
     assert len(stop.timeouts) == 2
     assert all(299 < t <= 300 for t in stop.timeouts)
+
+
+def test_run_moves_the_last_cycle_of_the_day_before_midnight(monkeypatch):
+    """Regression: the traffic between the last cycle and midnight was never exported."""
+    fixed_clock(monkeypatch, datetime(2026, 10, 26, 23, 57, tzinfo=UTC))
+    monkeypatch.setattr(script, "collect_once", lambda api: snapshot())
+    stop = StopAfter(2)
+    script.run(None, script.CloudflareCollector(), 300, stop)
+    # 180 s to midnight minus the margin; then the regular interval, once a day.
+    assert 149 < stop.timeouts[0] <= 150
+    assert 299 < stop.timeouts[1] <= 300
 
 
 def test_run_stops_when_event_is_set(monkeypatch):
@@ -891,6 +1019,7 @@ def test_main_wires_everything_together(monkeypatch, quiet_logging, registry):
     assert set(handlers) == {signal.SIGTERM, signal.SIGINT}
     api, collector, interval, event = runs[0]
     assert api.session.headers["Authorization"] == "Bearer abc"
+    assert api.query_budget == script.cycle_query_budget(42) == 28
     assert isinstance(collector, script.CloudflareCollector)
     assert interval == 42
     assert not event.is_set()
