@@ -23,8 +23,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from image_smoke import checked_edge_family, checked_snapshot_windows
-from profile_live import request_sources
+from image_smoke import WINDOW_TYPE_LINE, checked_edge_family, checked_snapshot_windows
+from profile_live import expected_totals, request_sources, source_filter_valid
 from prometheus_client import generate_latest
 
 import script
@@ -99,7 +99,7 @@ DAY_FAMILIES = (
 def assert_day_families(text, cycle_start):
     """Require the day-scoped families unless the UTC day changed after the cycle
     started; the exporter omits them then by design."""
-    window_present = "# TYPE cf_exporter_snapshot_window_end_seconds gauge" in text
+    window_present = WINDOW_TYPE_LINE in text
     if window_present or cycle_start.date() == datetime.now(UTC).date():
         for name in DAY_FAMILIES:
             assert f"# TYPE {name} gauge" in text
@@ -202,18 +202,13 @@ def test_every_zone_is_collected(api, zones):
         if result.available["edge"]:
             eyeball, sources = request_sources(api.graphql, zone["id"], since, until)
             # A wrong filter value would look like a zone without client traffic.
-            if result.total_requests:
-                assert sources.get("eyeball", 0) > 0, (zone["name"], sources)
-            assert eyeball == sources.get("eyeball", 0) <= result.total_requests
+            assert source_filter_valid(
+                eyeball, sources, result.total_requests, completed_day=True
+            ), (zone["name"], eyeball, sources)
         else:
             assert not result.edge
         # Edge groups are compared with the eyeball total, never the unfiltered one.
-        expected = {
-            "visits": result.total_visits,
-            "requests": result.total_requests,
-            "cache": result.total_requests,
-            "edge": eyeball,
-        }
+        expected = expected_totals(result.total_visits, result.total_requests, eyeball)
         for kind in script.DATASETS:
             if result.available[kind] and not result.limited[kind]:
                 actual = sum(getattr(result, kind).values())
@@ -245,7 +240,7 @@ def test_full_cycle_renders_metrics(api, zones, registry):
     assert registry.get_sample_value("cf_exporter_last_cycle_success") == 1
     text = generate_latest(registry).decode()
     assert_day_families(text, snapshot.window_start)
-    if "# TYPE cf_exporter_snapshot_window_end_seconds gauge" in text:
+    if WINDOW_TYPE_LINE in text:
         assert checked_snapshot_windows(text) == {
             zone["name"]: (script.rfc3339(snapshot.window_start), snapshot.window_end.timestamp())
             for zone in zones

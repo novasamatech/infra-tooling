@@ -51,14 +51,14 @@ def request_sources(graphql, zone_id, since, until):
         return 0, {}
     # Deliberately do not reuse the production filter: this is its independent oracle.
     variables = {"zoneTag": zone_id, "since": script.rfc3339(since), "until": script.rfc3339(until)}
-    node = script._zone_node(graphql(SOURCES_QUERY, variables), zone_id)
-    totals = script._group_list("eyeball", node.get("eyeball"))
+    node = script.zone_node(graphql(SOURCES_QUERY, variables), zone_id)
+    totals = script.group_list("eyeball", node.get("eyeball"))
     if len(totals) > 1:
         raise script.CloudflareAPIError("GraphQL: multiple dimensionless eyeball totals")
-    eyeball = script._checked_value("eyeball", totals[0], lambda g: g.get("count")) if totals else 0
+    eyeball = script.checked_value("eyeball", totals[0], lambda g: g.get("count")) if totals else 0
     sources = {}
-    for group in script._group_list("sources", node.get("sources")):
-        count = script._checked_value("sources", group, lambda g: g.get("count"))
+    for group in script.group_list("sources", node.get("sources")):
+        count = script.checked_value("sources", group, lambda g: g.get("count"))
         dimensions = group.get("dimensions")
         source = dimensions.get("requestSource") if isinstance(dimensions, dict) else None
         if not isinstance(source, str) or not source or source in sources:
@@ -67,13 +67,25 @@ def request_sources(graphql, zone_id, since, until):
     return eyeball, sources
 
 
+def expected_totals(visits, requests, eyeball):
+    """Map datasets to matching-scope reference totals (scalars or per-zone maps)."""
+    return {"visits": visits, "requests": requests, "cache": requests, "edge": eyeball}
+
+
+def source_filter_valid(eyeball, sources, requests, *, completed_day):
+    """Check the raw source value, requiring exact comparable totals only for a past day."""
+    raw_eyeball = sources.get("eyeball", 0)
+    return (not requests or raw_eyeball > 0) and (
+        not completed_day or eyeball == raw_eyeball <= requests
+    )
+
+
 class HistoricalCollector(script.CloudflareCollector):
     """Render historical snapshots for profiling without changing their window."""
 
-    def collect(self):
-        snapshot = self.snapshot
-        yield from self._day_metrics(snapshot)
-        yield from self._health_metrics(snapshot)
+    @staticmethod
+    def _day_visible(snapshot: script.Snapshot) -> bool:
+        return True
 
 
 def main():
@@ -135,18 +147,14 @@ def main():
             for zone in edge_zones
         }
         edge_totals = {zone: total for zone, (total, _) in references.items()}
-        source_filter_valid = all(
-            (not snapshot.zone_requests[zone] or sources.get("eyeball", 0) > 0)
-            and (not args.day or total == sources.get("eyeball", 0) <= snapshot.zone_requests[zone])
+        sources_valid = all(
+            source_filter_valid(
+                total, sources, snapshot.zone_requests[zone], completed_day=bool(args.day)
+            )
             for zone, (total, sources) in references.items()
         )
         # Edge groups are compared with the eyeball total, never cf_zone_requests.
-        expected = {
-            "visits": snapshot.zone_visits,
-            "requests": snapshot.zone_requests,
-            "cache": snapshot.zone_requests,
-            "edge": edge_totals,
-        }
+        expected = expected_totals(snapshot.zone_visits, snapshot.zone_requests, edge_totals)
         mismatched = sorted(
             {
                 kind
@@ -169,7 +177,7 @@ def main():
                 1 for (_, kind), ok in snapshot.available.items() if kind == "edge" and not ok
             ),
             "totals_match": not mismatched,
-            "source_filter_valid": source_filter_valid,
+            "source_filter_valid": sources_valid,
             "mismatched_datasets": mismatched,
             "metrics_bytes": len(body),
             "samples": sum(1 for line in io.BytesIO(body) if not line.startswith(b"#")),
@@ -182,7 +190,7 @@ def main():
         # and the later validation, so only a completed day must match exactly.
         if (
             snapshot.cycle_success != 1
-            or not source_filter_valid
+            or not sources_valid
             or (args.day and mismatched)
             or report["truncated_selections"]
         ):

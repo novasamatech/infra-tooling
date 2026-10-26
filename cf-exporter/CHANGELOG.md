@@ -64,6 +64,12 @@ baseline reserve grows from 5 to 6 selections. No runtime dependencies are added
 
 ### Changed
 
+- Make dimension validation table-driven and dataset-scoped, preserving existing
+  label conversion for older families. Validate each fetched group once before
+  splitting or capping instead of repeating checks during aggregation.
+- Historical profiling inherits the production collection path and overrides
+  only UTC-day visibility. Share independent total/source validation helpers
+  between profiling and live checks, and name the smoke-check contract constants.
 - Document the consumer-independent window contract and replace the misleading
   generic `increase()` recipe. Daily estimates are not process counters;
   downward revisions are preserved. Missing history, overlapping windows, late

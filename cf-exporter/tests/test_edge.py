@@ -6,11 +6,21 @@
 import json
 from datetime import timedelta
 
+import image_smoke
 import profile_live
 import pytest
-from conftest import ALL_FIELDS, DAY, SELECTION, exposition, publish, requests_group, samples
+from conftest import (
+    ALL_FIELDS,
+    DAY,
+    SELECTION,
+    exposition,
+    publish,
+    requests_group,
+    samples,
+    visits_group,
+)
 from image_smoke import checked_edge_family
-from profile_live import request_sources
+from profile_live import expected_totals, request_sources, source_filter_valid
 
 import script
 
@@ -218,6 +228,97 @@ def test_malformed_origin_status_in_edge_data_fails_the_zone(cloudflare, api, cl
     collector = publish(api, clock, clock.value)
     assert samples(collector, "cf_exporter_zone_scrape_success")[0].value == 0
     assert not samples(collector, EDGE)
+
+
+def test_strict_edge_types_do_not_change_legacy_label_conversion(cloudflare, api, clock):
+    dimensions = {
+        "clientRequestHTTPHost": 42,
+        "clientRequestHTTPMethodName": True,
+        "clientRequestPath": False,
+        "originResponseStatus": "200",
+    }
+    cloudflare.add_zone(
+        "z",
+        "example.org",
+        visits=[visits_group(1, **dimensions)],
+        requests=[requests_group(2, **dimensions)],
+        cache=[requests_group(3, **dimensions)],
+    )
+    collector = publish(api, clock, clock.value)
+    assert samples(collector, "cf_exporter_zone_scrape_success")[0].value == 1
+    for name in ("cf_visits", "cf_requests", "cf_cache_requests"):
+        (sample,) = samples(collector, name)
+        assert sample.labels["host_name"] == "42"
+        assert sample.labels["path"] == "False"
+        if name != "cf_visits":
+            assert sample.labels["method_name"] == "True"
+            assert sample.labels["origin_response_status"] == "200"
+
+
+@pytest.mark.parametrize("defect", ["missing", "type"])
+def test_dimension_validation_uses_the_dataset_policy(cloudflare, api, clock, monkeypatch, defect):
+    monkeypatch.setitem(script.DIMENSION_TYPES, "cache", {"originResponseStatus": int})
+    monkeypatch.setitem(
+        script.DATASET_FIELDS, "cache", frozenset({"dimensions_originResponseStatus"})
+    )
+    group = requests_group(3, **({} if defect == "missing" else {"originResponseStatus": "200"}))
+    cloudflare.add_zone("z", "example.org", cache=[group])
+    collector = publish(api, clock, clock.value)
+    assert samples(collector, "cf_exporter_zone_scrape_success")[0].value == 0
+    assert not samples(collector, "cf_cache_requests")
+
+
+@pytest.mark.parametrize("cap", [0, 1])
+def test_edge_groups_are_validated_once_before_aggregation(
+    cloudflare, api, clock, monkeypatch, cap
+):
+    cloudflare.add_zone("z", "example.org", edge=[edge_group(3), edge_group(2, 404, 0)])
+    api.group_limit = cap
+    value_checks, dimension_checks = [], []
+    original_value, original_dimensions = script.checked_value, script._group_dimensions
+
+    def checked_value(kind, group, value_of):
+        value_checks.append(kind)
+        return original_value(kind, group, value_of)
+
+    def checked_dimensions(kind, group, available):
+        dimension_checks.append(kind)
+        return original_dimensions(kind, group, available)
+
+    monkeypatch.setattr(script, "checked_value", checked_value)
+    monkeypatch.setattr(script, "_group_dimensions", checked_dimensions)
+    collector = publish(api, clock, clock.value)
+    assert len(samples(collector, EDGE)) == (cap or 2)
+    assert value_checks.count("edge") == dimension_checks.count("edge") == 2
+
+
+def test_uint16_upper_bound_is_preserved_in_rendering_and_smoke(cloudflare, api, clock):
+    cloudflare.add_zone("z", "example.org", edge=[edge_group(3, edge=65535, origin=65535)])
+    collector = publish(api, clock, clock.value)
+    (sample,) = samples(collector, EDGE)
+    assert (
+        sample.labels["edge_response_status"] == sample.labels["origin_response_status"] == "65535"
+    )
+    assert script.UINT16_MAX == image_smoke.UINT16_MAX == 65535
+    assert checked_edge_family(exposition(collector)) == {"example.org": 1}
+
+
+def test_always_collected_dataset_validation_survives_reordering(
+    cloudflare, api, clock, monkeypatch
+):
+    cloudflare.add_zone("z", "example.org", fields=ALL_FIELDS - {"dimensions_requestSource"})
+    collector = publish(api, clock, clock.value)
+    monkeypatch.setattr(image_smoke, "DATASET_NAMES", tuple(reversed(image_smoke.DATASET_NAMES)))
+    assert checked_edge_family(exposition(collector)) == {}
+    body = exposition(collector)
+    flag = next(
+        line
+        for line in body.splitlines()
+        if line.startswith(AVAILABLE + "{") and 'dataset="visits"' in line
+    )
+    body = body.replace(flag, flag.rsplit(" ", 1)[0] + " 0.0")
+    with pytest.raises(ValueError, match="always collected"):
+        checked_edge_family(body)
 
 
 @pytest.mark.parametrize(
@@ -486,6 +587,42 @@ def test_reference_source_validation_rejects_malformed_responses(node):
         request_sources(
             lambda *args: {"viewer": {"zones": [node]}}, "z", DAY, DAY + timedelta(hours=1)
         )
+
+
+@pytest.mark.parametrize(
+    "visits,requests,eyeball",
+    [
+        (2, 7, 5),
+        ({"example.org": 2}, {"example.org": 7}, {"example.org": 5}),
+    ],
+)
+def test_expected_totals_keep_each_dataset_traffic_scope(visits, requests, eyeball):
+    assert expected_totals(visits, requests, eyeball) == {
+        "visits": visits,
+        "requests": requests,
+        "cache": requests,
+        "edge": eyeball,
+    }
+
+
+@pytest.mark.parametrize(
+    "eyeball,sources,requests,completed_day,expected",
+    [
+        (0, {}, 0, True, True),
+        (5, {"eyeball": 5, "edgeWorkerFetch": 2}, 7, True, True),
+        (0, {"edgeWorkerFetch": 7}, 7, True, False),
+        (5, {"renamed": 5}, 7, True, False),
+        (4, {"eyeball": 5}, 7, True, False),
+        (5, {"eyeball": 5}, 4, True, False),
+        (4, {"eyeball": 5}, 7, False, True),
+        (5, {"eyeball": 5}, 4, False, True),
+        (0, {"edgeWorkerFetch": 7}, 7, False, False),
+    ],
+)
+def test_source_validation_distinguishes_completed_days_from_ingestion_drift(
+    eyeball, sources, requests, completed_day, expected
+):
+    assert source_filter_valid(eyeball, sources, requests, completed_day=completed_day) is expected
 
 
 def test_profiler_tracks_new_zones_and_skips_unsupported_source_queries(

@@ -418,6 +418,32 @@ def test_failure_in_edge_only_slice_discards_the_zone_not_other_zones(traffic, a
     assert ("z", "edge") not in api.slice_hints
 
 
+@pytest.mark.parametrize("kind", script.DATASETS)
+@pytest.mark.parametrize("location", ["parent", "probe"])
+def test_malformed_dimensions_cannot_hide_in_discarded_pages(cloudflare, api, kind, location):
+    def respond(body):
+        node = {dataset: [] for dataset in script.DATASETS}
+        node["totals"] = []
+        window = body["variables"]
+        if window["since"] == script.rfc3339(START) and window["until"] == script.rfc3339(END):
+            good = (
+                visits_group(5) if kind == "visits" else requests_group(5, edgeResponseStatus=200)
+            )
+            bad = visits_group(1) if kind == "visits" else requests_group(1)
+            bad["dimensions"] = []
+            node[kind] = [good, bad]
+        return json_response(200, {"data": {"viewer": {"zones": [node]}}})
+
+    cloudflare.add_zone("z", "example.org", max_page_size=2, responder=respond)
+    if location == "probe":
+        api.group_limit = 1
+    snapshot = script.collect_once(api, now=END)
+    assert snapshot.zone_success == {"example.org": 0}
+    assert not snapshot.available
+    assert not snapshot.groups
+    assert len(cloudflare.data_calls()) == 1
+
+
 @pytest.mark.parametrize("origin_supported", [True, False])
 def test_cache_labels_unknown_dimensions_zero_filter_and_totals(cloudflare, api, origin_supported):
     fields = ALL_FIELDS if origin_supported else ALL_FIELDS - {"dimensions_originResponseStatus"}

@@ -19,6 +19,11 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+DAY_SECONDS = 24 * 60 * 60
+# Mirrors the API range checked in script.py; this driver stays stdlib-only.
+UINT16_MAX = (1 << 16) - 1
+WINDOW_TYPE_LINE = "# TYPE cf_exporter_snapshot_window_end_seconds gauge"
+
 DAY_FAMILIES = (
     "cf_exporter_snapshot_window_end_seconds",
     "cf_visits",
@@ -47,7 +52,12 @@ def _sample_values(body: str, name: str):
 
 
 def checked_snapshot_windows(body: str) -> dict[str, tuple[str, float]]:
-    """Validate window samples from one exposition, using only the stdlib."""
+    """Validate window samples from one exposition, using only the stdlib.
+
+    Raises:
+        ValueError: A sample has invalid values, labels or snapshot consistency.
+        KeyError: A successful-zone health sample lacks its zone label.
+    """
     expected = {
         labels["zone_name"]
         for labels, value in _sample_values(body, "cf_exporter_zone_scrape_success")
@@ -66,7 +76,9 @@ def checked_snapshot_windows(body: str) -> dict[str, tuple[str, float]]:
         start = datetime.strptime(labels["window_start"], "%Y-%m-%dT%H:%M:%S%z")
         if labels["window_start"] != start.strftime("%Y-%m-%dT00:00:00Z"):
             raise ValueError("snapshot window start is not midnight UTC")
-        if not start.timestamp() <= end <= start.timestamp() + 86400 or not end.is_integer():
+        # The end timestamp may equal next midnight for a full historical day;
+        # the API interval itself remains half-open [start, end).
+        if not start.timestamp() <= end <= start.timestamp() + DAY_SECONDS or not end.is_integer():
             raise ValueError("snapshot window end is outside its UTC day or has fractional seconds")
         result[labels["zone_name"]] = (labels["window_start"], end)
     if len(set(result.values())) > 1:
@@ -74,7 +86,8 @@ def checked_snapshot_windows(body: str) -> dict[str, tuple[str, float]]:
     return result
 
 
-DATASET_NAMES = ("visits", "requests", "cache", "edge")
+ALWAYS_COLLECTED = ("visits", "requests", "cache")
+DATASET_NAMES = (*ALWAYS_COLLECTED, "edge")
 EDGE_LABELS = frozenset(
     {
         "zone_name",
@@ -101,6 +114,10 @@ def checked_edge_family(body: str) -> dict[str, int]:
     """Validate cf_edge_requests and dataset health from one exposition.
 
     Returns the number of edge samples of every zone that collects the dataset.
+
+    Raises:
+        ValueError: Edge samples or dataset health are invalid or inconsistent.
+        KeyError: A successful-zone health sample lacks its zone label.
     """
     successful = {
         labels["zone_name"]
@@ -112,7 +129,7 @@ def checked_edge_family(body: str) -> dict[str, int]:
         raise ValueError("dataset availability does not match successful zones")
     if any(value not in (0, 1) for value in available.values()):
         raise ValueError("dataset availability is neither 0 nor 1")
-    if any(available[(zone, kind)] != 1 for zone in successful for kind in DATASET_NAMES[:3]):
+    if any(available[(zone, kind)] != 1 for zone in successful for kind in ALWAYS_COLLECTED):
         raise ValueError("an always collected dataset is reported unavailable")
     groups = _by_zone_and_dataset(body, "cf_exporter_groups")
     limited = _by_zone_and_dataset(body, "cf_exporter_group_limit_reached")
@@ -138,7 +155,11 @@ def checked_edge_family(body: str) -> dict[str, int]:
             status = labels[label]
             if label == "origin_response_status" and status == "unknown":
                 continue
-            if not re.fullmatch(r"[0-9]{1,5}", status) or int(status) > 65535:
+            if (
+                not re.fullmatch(r"[0-9]+", status)
+                or len(status) > len(str(UINT16_MAX))
+                or int(status) > UINT16_MAX
+            ):
                 raise ValueError("edge sample with an invalid status")
         if not math.isfinite(value) or value <= 0:
             raise ValueError("edge sample without requests")
@@ -222,10 +243,7 @@ def main() -> int:
                             metadata_checked
                             and "cf_exporter_last_cycle_success 1.0" in body.splitlines()
                         ):
-                            if (
-                                "# TYPE cf_exporter_snapshot_window_end_seconds gauge" in body
-                                or cycle_started_today(body)
-                            ):
+                            if WINDOW_TYPE_LINE in body or cycle_started_today(body):
                                 for name in DAY_FAMILIES:
                                     if f"# TYPE {name} gauge" not in body:
                                         print(f"image smoke test: FAILED - missing {name}")

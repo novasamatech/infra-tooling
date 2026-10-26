@@ -9,6 +9,7 @@ import pytest
 from conftest import DAY, exposition, json_response, publish, requests_group, samples
 from image_smoke import checked_snapshot_windows
 from profile_live import HistoricalCollector
+from prometheus_client.core import GaugeMetricFamily
 
 import script
 
@@ -276,6 +277,24 @@ def test_historical_profiling_preserves_the_real_window(cloudflare, api, clock, 
     assert not samples(production, WINDOW)
     assert not samples(production, "cf_cache_requests")
     assert samples(production, "cf_exporter_last_cycle_success")[0].value == 1
+
+
+def test_historical_profiling_inherits_the_production_collection_path(
+    cloudflare, api, clock, monkeypatch
+):
+    original = script.CloudflareCollector.collect
+
+    def with_extra_family(self):
+        yield from original(self)
+        yield GaugeMetricFamily("cf_test_collection_path", "Test additional family", value=1)
+
+    monkeypatch.setattr(script.CloudflareCollector, "collect", with_extra_family)
+    cloudflare.add_zone("z", "example.org", cache=[cache_group(3)])
+    historical = publish(api, clock, clock.value, HistoricalCollector())
+    clock.value += timedelta(days=2)
+    assert samples(historical, "cf_test_collection_path")[0].value == 1
+    assert samples(historical, "cf_cache_requests")[0].value == 3
+    assert samples(historical, "cf_exporter_last_cycle_success")[0].value == 1
 
 
 @pytest.mark.parametrize(

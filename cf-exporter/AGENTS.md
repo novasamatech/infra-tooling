@@ -96,6 +96,8 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
   an edge status is never `unknown`, and origin `0` never stands in for it.
   Validate edge dimensions even in zero-valued groups and discarded probe/parent
   pages; status values must match the API's unsigned 16-bit integer type.
+  Keep strict type policies dataset-scoped (`DIMENSION_TYPES`) so shared field
+  names do not silently change older families' label conversion.
   Validation totals must not reuse the production filter constant as their oracle.
 - Decide dataset support from `availableFields` (`DATASET_FIELDS`). An unsupported
   dataset is not queried, reports `cf_exporter_dataset_available` `0` without
@@ -106,13 +108,15 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
   decide cuts from the pages only (a zero visits tail is complete; a configured cap
   probes one extra group), never from the separately fetched zone totals.
 - Validate response structure. Missing or malformed data must report a failed
-  collection rather than a successful empty result.
+  collection rather than a successful empty result. Validate every fetched group
+  once before splitting or capping; aggregation consumes only validated groups.
 - Publish complete snapshots atomically after collection. Remove stale series;
   omit a failed zone's analytics for that cycle and preserve other zones' results.
 - Export `cf_exporter_snapshot_window_end_seconds` only for successful zones,
   with `zone_name` and RFC3339 `window_start` labels from that same snapshot.
   Its value is the exclusive API window end, not collection completion time.
-  Historical profiling must preserve these bounds when rendering a past day.
+  Historical profiling must preserve these bounds when rendering a past day and
+  override only the visibility gate, not the collector's family enumeration.
 - Omit all day-scoped families when a snapshot's window belongs to an earlier
   UTC day, including if collection crossed midnight. Always serve zone/cycle health.
 - Keep the process running after collection failures and expose failures through
