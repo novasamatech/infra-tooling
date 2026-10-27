@@ -8,6 +8,21 @@ SPDX-License-Identifier: Apache-2.0
 All notable changes to `cf-exporter` are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.1] — 2026-10-27
+
+### Fixed
+
+- Add `/readyz` on the metrics port to prevent routing to an exporter before
+  its first complete snapshot, after a collection failure, after UTC midnight
+  with only yesterday's snapshot, or with stale data. Readiness requires all
+  discovered zones to succeed and bounds both the API window age and cycle
+  completion age to three collection intervals. Successful empty windows and
+  unsupported datasets remain valid; truncation stays visible in its metrics.
+- Serve readiness without Cloudflare calls or metrics serialization, alongside
+  concurrent Prometheus scrapes. Preserve metrics rendering, content negotiation,
+  compression, filtering and health diagnostics when not ready. No dependencies,
+  metric schemas, collection intervals or API-query budgets change.
+
 ## [1.6.0] — 2026-10-26
 
 Existing metric names, labels, label order and traffic scope are unchanged.

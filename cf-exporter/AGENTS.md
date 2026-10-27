@@ -21,6 +21,7 @@ cloudflare-exporter; establish which service produced an error before fixing it.
 | [tests/test_slicing.py](tests/test_slicing.py) | Time-filtered slicing, caps, totals and midnight regressions |
 | [tests/test_windows.py](tests/test_windows.py) | Snapshot window contract and actual Prometheus rendering |
 | [tests/test_edge.py](tests/test_edge.py) | Client-facing edge dataset, its filter and dataset availability |
+| [tests/test_readiness.py](tests/test_readiness.py) | Readiness, startup/failure recovery, freshness, UTC rollover and concurrent metrics HTTP checks |
 | [tests/test_live.py](tests/test_live.py) | Real API, schema and process checks |
 | [tests/image_smoke.py](tests/image_smoke.py) | Container lifecycle and metrics smoke check |
 | [tests/profile_live.py](tests/profile_live.py) | Live resource measurements and completed-day sum validation |
@@ -121,6 +122,11 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
   UTC day, including if collection crossed midnight. Always serve zone/cycle health.
 - Keep the process running after collection failures and expose failures through
   health metrics. Imports must not install handlers or register global metrics.
+- Keep `/readyz` independent of metrics encoding and API calls. It requires a
+  successful snapshot for all discovered zones in the current UTC day, with
+  cycle and window ages below three collection intervals. Empty traffic is
+  valid, and unsupported datasets or truncation remain metric-level conditions.
+  `/metrics` must remain available while not ready.
 - Never wait longer than `MAX_RETRY_AFTER_SECONDS` for a `Retry-After`. After an
   HTTP 429 or a GraphQL budget error, skip the cycle's remaining zones and report
   them as failed.

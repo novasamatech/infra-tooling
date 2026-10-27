@@ -25,9 +25,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from itertools import pairwise
+from socketserver import ThreadingMixIn
+from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 import requests
-from prometheus_client import REGISTRY, start_http_server
+from prometheus_client import REGISTRY, make_wsgi_app
 from prometheus_client.core import GaugeMetricFamily, Metric
 from prometheus_client.registry import Collector
 from requests.adapters import HTTPAdapter
@@ -902,6 +904,27 @@ class CloudflareCollector(Collector):
         with self._lock:
             self._snapshot = snapshot
 
+    def readiness_error(self, max_age: float) -> str | None:
+        """Check one atomic snapshot without collecting or encoding metrics."""
+        snapshot = self.snapshot
+        if snapshot.cycle_success != 1 or not snapshot.zone_success:
+            return "no successful collection cycle"
+        if not all(snapshot.zone_success.values()):
+            return "a zone collection failed"
+        now = datetime.now(UTC)
+        if (
+            snapshot.window_start is None
+            or snapshot.window_end is None
+            or snapshot.window_start.date() != now.date()
+        ):
+            return "no snapshot for the current UTC day"
+        if snapshot.cycle_timestamp is None or not (
+            0 <= now.timestamp() - snapshot.cycle_timestamp < max_age
+            and 0 <= (now - snapshot.window_end).total_seconds() < max_age
+        ):
+            return "snapshot is stale or in the future"
+        return None
+
     def collect(self) -> Iterator[Metric]:
         snapshot = self.snapshot
         if self._day_visible(snapshot):
@@ -1014,6 +1037,45 @@ class CloudflareCollector(Collector):
             for labels, value in values.items():
                 metric.add_metric(labels, value)
             yield metric
+
+
+class MetricsHTTPServer(ThreadingMixIn, WSGIServer):
+    """Keep metrics and readiness responsive to concurrent requests."""
+
+    daemon_threads = True
+
+
+class MetricsRequestHandler(WSGIRequestHandler):
+    def log_message(self, message, *args):
+        # Match prometheus_client's quiet HTTP server.
+        pass
+
+
+def start_http_server(
+    port: int, collector: CloudflareCollector, max_age: float
+) -> tuple[WSGIServer, threading.Thread]:
+    """Serve readiness alongside the unchanged Prometheus WSGI application."""
+    metrics_app = make_wsgi_app(REGISTRY)
+
+    def app(environ, start_response):
+        if environ["PATH_INFO"] != "/readyz":
+            return metrics_app(environ, start_response)
+        headers = [("Content-Type", "text/plain; charset=utf-8"), ("Cache-Control", "no-store")]
+        if environ["REQUEST_METHOD"] not in ("GET", "HEAD"):
+            status, body = "405 Method Not Allowed", b"use GET or HEAD\n"
+            headers.append(("Allow", "GET, HEAD"))
+        else:
+            error = collector.readiness_error(max_age)
+            status = "503 Service Unavailable" if error else "200 OK"
+            body = ((error or "ready") + "\n").encode()
+        headers.append(("Content-Length", str(len(body))))
+        start_response(status, headers)
+        return [] if environ["REQUEST_METHOD"] == "HEAD" else [body]
+
+    server = make_server("", port, app, MetricsHTTPServer, handler_class=MetricsRequestHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
 
 
 def run(
@@ -1151,7 +1213,7 @@ def main() -> int:
 
     collector = CloudflareCollector()
     REGISTRY.register(collector)
-    start_http_server(config.metrics_port)
+    start_http_server(config.metrics_port, collector, 3 * config.scrape_interval)
     logging.info(
         "Exporter running on port %d, scrape interval %d seconds",
         config.metrics_port,

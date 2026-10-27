@@ -108,6 +108,29 @@ cf_exporter_dataset_available == 0
 cf_exporter_cycle_duration_seconds > 240
 ```
 
+### Readiness
+
+`GET /readyz` on the metrics port returns HTTP 200 only when the last published
+snapshot has a successful cycle and at least one zone, every discovered zone
+succeeded, and its window belongs to the current UTC day. Both the API window
+end and cycle completion must be less than three collection intervals old and
+not in the future. With the default 300-second interval, the freshness limit is
+900 seconds. Startup, collection failures, stale snapshots and previous-day
+snapshots return HTTP 503; a later successful collection restores readiness.
+
+An empty successful traffic window is ready. A plan's unsupported dataset or a
+reported group truncation does not fail readiness; the existing availability
+and truncation metrics describe those conditions. An account with no discovered
+zones is not ready. Readiness reads the atomic in-memory snapshot without API
+calls or metrics serialization. It can be checked concurrently with a large
+metrics scrape, and responses carry `Cache-Control: no-store`.
+
+`/metrics` keeps serving metrics and health diagnostics even when `/readyz`
+returns 503. Use `/readyz` for a Kubernetes readiness probe, rather than a TCP
+probe or a metrics HTTP status. A Cloudflare failure should not trigger liveness
+restarts. `HEAD /readyz` reports the same status without a body; other methods
+return 405. The endpoint introduces no external coordination between instances.
+
 ## Configuration
 
 Create an API token with **Zone / Zone / Read** and **Zone / Analytics / Read** permissions for the zones to export.

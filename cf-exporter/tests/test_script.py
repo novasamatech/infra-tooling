@@ -1013,14 +1013,14 @@ def test_main_wires_everything_together(monkeypatch, quiet_logging, registry):
     monkeypatch.setattr(
         script.signal, "signal", lambda sig, handler: handlers.update({sig: handler})
     )
-    monkeypatch.setattr(script, "start_http_server", servers.append)
+    monkeypatch.setattr(script, "start_http_server", lambda *args: servers.append(args))
     monkeypatch.setattr(script, "run", lambda *args: runs.append(args))
 
     assert script.main() == 0
 
-    assert servers == [9123]
     assert set(handlers) == {signal.SIGTERM, signal.SIGINT}
     api, collector, interval, event = runs[0]
+    assert servers == [(9123, collector, 3 * 42)]
     assert api.session.headers["Authorization"] == "Bearer abc"
     assert api.query_budget == script.cycle_query_budget(42) == 28
     assert isinstance(collector, script.CloudflareCollector)
