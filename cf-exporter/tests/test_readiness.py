@@ -18,7 +18,7 @@ from prometheus_client import CollectorRegistry
 import script
 
 MIDNIGHT = DAY + timedelta(days=1)
-NOT_TODAY = "no snapshot for the current UTC day\n"
+NO_WINDOW = "the last snapshot has no API window"
 
 
 @pytest.fixture
@@ -107,8 +107,8 @@ def test_real_cycles_drive_readiness_without_hiding_metrics(
             {"zone_success": {"good.example": 1, "bad.example": 0}},
             "1 of 2 zones failed in the last cycle",
         ),
-        ({"window_start": None}, NOT_TODAY.strip()),
-        ({"window_end": None}, NOT_TODAY.strip()),
+        ({"window_start": None}, NO_WINDOW),
+        ({"window_end": None}, NO_WINDOW),
     ],
 )
 def test_missing_or_partial_snapshot_is_not_ready(endpoint, clock, changes, reason):
@@ -133,30 +133,38 @@ def test_readiness_checks_both_collection_time_and_api_window(endpoint, clock, f
         assert text.endswith(", limit 900s\n")
 
 
-def test_midnight_expires_a_fresh_previous_day_and_accepts_an_empty_new_day(
+def test_midnight_refill_keeps_a_fresh_previous_day_snapshot_ready(
     endpoint, cloudflare, api, clock, fake_cycles
 ):
+    """Readiness ignores the UTC day: after midnight the previous day's families are
+    omitted, but a fresh snapshot stays ready while the new day is collected."""
     collector, url = endpoint
     cloudflare.add_zone("z", "example.org", requests=[requests_group(4)])
-    publish(api, clock, MIDNIGHT - timedelta(seconds=10), collector)
-    assert ready(url) == (200, "ready\n")
+    closing = MIDNIGHT - timedelta(seconds=30)
+    publish(api, clock, closing, collector)
 
-    clock.value = MIDNIGHT
-    assert ready(url) == (503, NOT_TODAY)
-    analytics_queries = len(cloudflare.data_calls())
-    publish(api, clock, MIDNIGHT + timedelta(seconds=script.NEW_DAY_START_SECONDS), collector)
-    # The empty new-day window sends no analytics query and is still ready.
-    assert len(cloudflare.data_calls()) == analytics_queries
+    clock.value = MIDNIGHT + timedelta(minutes=4)
     assert ready(url) == (200, "ready\n")
     metrics = requests.get(url + "/metrics", timeout=2).text
-    assert 'cf_zone_requests{zone_name="example.org"} 0.0' in metrics
+    assert "cf_zone_requests" not in metrics
+    assert "cf_exporter_snapshot_window_end_seconds" not in metrics
+    assert "cf_exporter_last_cycle_success 1.0" in metrics
+
+    # Freshness still applies across midnight.
+    clock.value = closing + timedelta(seconds=900)
+    status, text = ready(url)
+    assert status == 503 and text.startswith("snapshot is stale or in the future: ")
+
+    publish(api, clock, clock.value, collector)
+    assert ready(url) == (200, "ready\n")
     [window] = samples(collector, "cf_exporter_snapshot_window_end_seconds")
     assert window.labels == {"zone_name": "example.org", "window_start": script.rfc3339(MIDNIGHT)}
-    assert window.value == MIDNIGHT.timestamp()
 
 
-def test_run_restores_readiness_right_after_midnight(cloudflare, api, clock, fake_cycles):
-    """Regression: every UTC midnight made the exporter unready for up to an interval."""
+def test_readiness_stays_ready_across_midnight_with_the_unchanged_schedule(
+    cloudflare, api, clock, fake_cycles
+):
+    """Regression: the midnight refill must not make the exporter unready."""
     collector = script.CloudflareCollector()
     cloudflare.add_zone("z", "example.org", requests=[requests_group(4)])
     clock.value = MIDNIGHT - timedelta(minutes=3)
@@ -175,14 +183,11 @@ def test_run_restores_readiness_right_after_midnight(cloudflare, api, clock, fak
             self.remaining -= 1
 
     script.run(api, collector, 300, AdvancingStop())
-    # Ready before midnight, unready only until the new day's first cycle right
-    # after midnight has finished, then ready with that empty window.
-    assert [error for _, error in observed] == [None, NOT_TODAY.strip(), None]
-    assert MIDNIGHT < observed[1][0] < MIDNIGHT + timedelta(seconds=1)
-    assert (collector.snapshot.window_start, collector.snapshot.window_end) == (MIDNIGHT, MIDNIGHT)
-    assert all(
-        call["variables"]["since"] == script.rfc3339(DAY) for call in cloudflare.data_calls()
-    )
+    assert [error for _, error in observed] == [None, None, None]
+    # The day-close schedule is unchanged: the cycle closing the day starts 30 s
+    # before midnight, and the new day starts one regular interval after it.
+    assert MIDNIGHT + timedelta(seconds=269) < observed[1][0] <= MIDNIGHT + timedelta(seconds=270)
+    assert collector.snapshot.window_start == MIDNIGHT
 
 
 def test_unsupported_dataset_and_truncation_do_not_hide_a_healthy_snapshot(endpoint, clock):
@@ -253,7 +258,7 @@ def test_readiness_head_and_rejected_methods(endpoint, clock):
     [
         (False, {}, 200),
         (False, {"zone_success": {}}, 503),
-        (True, {}, 503),
+        (True, {}, 200),
     ],
 )
 def test_smoke_readiness_expectation_matches_the_endpoint(

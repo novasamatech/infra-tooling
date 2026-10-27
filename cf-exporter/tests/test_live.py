@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 from image_smoke import (
     WINDOW_TYPE_LINE,
+    checked_api_counters,
     checked_edge_family,
     checked_snapshot_windows,
     expected_readiness,
@@ -242,9 +243,11 @@ def test_full_cycle_renders_metrics(api, zones, registry):
     assert snapshot.cycle_success == 1
     collector = script.CloudflareCollector()
     registry.register(collector)
+    registry.register(api.stats)
     collector.update(snapshot)
     assert registry.get_sample_value("cf_exporter_last_cycle_success") == 1
     text = generate_latest(registry).decode()
+    checked_api_counters(text)
     assert_day_families(text, snapshot.window_start)
     if WINDOW_TYPE_LINE in text:
         assert checked_snapshot_windows(text) == {
@@ -322,6 +325,7 @@ def test_exporter_process_end_to_end(zones):
         for zone in zones:
             assert f'cf_exporter_zone_scrape_success{{zone_name="{zone["name"]}"}} 1.0' in body
         assert_day_families(body, scraped_cycle_start(body))
+        checked_api_counters(body)
         assert readiness(port) == expected_readiness(body)
 
         process.send_signal(signal.SIGTERM)

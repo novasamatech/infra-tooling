@@ -10,33 +10,31 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [1.7.0] — 2026-10-27
 
-Metric names, labels, label order, analytics queries and the per-cycle GraphQL
-budget are unchanged. No dependencies are added.
+Existing metric names, labels, label order, analytics queries, the collection
+schedule and the GraphQL budget are unchanged. No dependencies are added.
 
 ### Added
 
 - `GET`/`HEAD /readyz` on the metrics port. It returns 200 only for a successful
   snapshot of at least one zone, with every discovered zone collected, whose
-  window belongs to the current UTC day and whose window end and cycle
-  completion are less than three collection intervals old. Startup, failed
-  cycles, stale snapshots and the previous day's snapshot return 503 with a
-  one-line reason. Successful empty windows, unsupported datasets and reported
-  truncation remain ready; their metrics describe them.
+  window end and cycle completion are less than three collection intervals old.
+  Startup, failed cycles and stale snapshots return 503 with a one-line reason.
+  Readiness does not depend on the UTC day: during the midnight refill a fresh
+  previous-day snapshot stays ready. Successful empty windows, unsupported
+  datasets and reported truncation remain ready; their metrics describe them.
 - Readiness reads the published snapshot without Cloudflare calls or metrics
   serialization and answers during concurrent scrapes. `/metrics` keeps its
   rendering, content negotiation, compression, filtering and health diagnostics
   while not ready, and every other path still serves metrics.
+- `cf_exporter_api_responses_total{api, code}` and
+  `cf_exporter_api_errors_total{api, error}` process counters of Cloudflare API
+  attempts, including attempts retried by the transport, so rate limits and API
+  outages are visible even when a retry succeeds. Error kinds are a fixed set
+  exported from zero: `rate_limited`, `budget_depleted`, `server_error`,
+  `client_error`, `timeout`, `connection`, `invalid_response` and `graphql`.
 - Image smoke and live process checks require `/readyz` to stay unready before
-  the first cycle and to match a successful cycle's exposition afterwards.
-
-### Changed
-
-- A cycle due after UTC midnight starts 0.5 seconds after it instead of up to
-  one interval later. Its empty window sends only the zone listing and one
-  settings selection per zone, and publishes the new day's window with zero
-  zone totals. Day-scoped families and readiness return within that short cycle,
-  rather than leaving every instance unready for most of an interval each day;
-  the day's first traffic follows one interval later.
+  the first cycle and to be ready after a successful one, and validate the API
+  counters. The smoke test prints nonzero API error counts.
 
 ## [1.6.0] — 2026-10-26
 
