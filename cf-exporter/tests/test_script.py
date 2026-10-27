@@ -974,14 +974,41 @@ def test_run_sleeps_for_the_rest_of_the_interval(monkeypatch):
 
 
 def test_run_moves_the_last_cycle_of_the_day_before_midnight(monkeypatch):
-    """Regression: the traffic between the last cycle and midnight was never exported."""
-    fixed_clock(monkeypatch, datetime(2026, 10, 26, 23, 57, tzinfo=UTC))
-    monkeypatch.setattr(script, "collect_once", lambda api: snapshot())
-    stop = StopAfter(2)
-    script.run(None, script.CloudflareCollector(), 300, stop)
-    # 180 s to midnight minus the margin; then the regular interval, once a day.
-    assert 149 < stop.timeouts[0] <= 150
-    assert 299 < stop.timeouts[1] <= 300
+    """Regression: the traffic between the last cycle and midnight was never exported,
+    and the new day's first snapshot used to wait for up to a whole interval."""
+    midnight = datetime(2026, 10, 27, tzinfo=UTC)
+    moment = midnight - timedelta(minutes=3)
+    starts = []
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return moment
+
+    class AdvancingStop(StopAfter):
+        def wait(self, timeout):
+            nonlocal moment
+            super().wait(timeout)
+            moment += timedelta(seconds=timeout)
+
+    monkeypatch.setattr(script, "datetime", Clock)
+    monkeypatch.setattr(script, "collect_once", lambda api: starts.append(moment) or snapshot())
+    script.run(None, script.CloudflareCollector(), 300, AdvancingStop(4))
+    # 180 s to midnight minus the margin, then the empty new-day window right after
+    # midnight, then the regular interval; the day is closed only once.
+    expected = [
+        midnight - timedelta(minutes=3),
+        midnight - timedelta(seconds=script.DAY_CLOSE_MARGIN_SECONDS),
+        midnight + timedelta(seconds=script.NEW_DAY_START_SECONDS),
+        midnight + timedelta(seconds=300 + script.NEW_DAY_START_SECONDS),
+    ]
+    assert len(starts) == len(expected)
+    # Only the real (tiny) cycle durations shift the starts earlier.
+    assert all(
+        -0.5 < (start - want).total_seconds() < 0.001
+        for start, want in zip(starts, expected, strict=True)
+    )
+    assert script.day_window(starts[2]) == (midnight, midnight)
 
 
 def test_run_stops_when_event_is_set(monkeypatch):

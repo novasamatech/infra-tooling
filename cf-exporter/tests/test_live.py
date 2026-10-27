@@ -23,7 +23,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from image_smoke import WINDOW_TYPE_LINE, checked_edge_family, checked_snapshot_windows
+from image_smoke import (
+    WINDOW_TYPE_LINE,
+    checked_edge_family,
+    checked_snapshot_windows,
+    expected_readiness,
+    readiness_status,
+)
 from profile_live import expected_totals, request_sources, source_filter_valid
 from prometheus_client import generate_latest
 
@@ -270,8 +276,15 @@ def scrape(port):
         return None
 
 
+def readiness(port):
+    try:
+        return readiness_status(port)
+    except (urllib.error.URLError, ConnectionError):
+        return None
+
+
 def test_exporter_process_end_to_end(zones):
-    """Start script.py as a real process, scrape it, stop it with SIGTERM."""
+    """Start script.py as a real process, check readiness and metrics, stop it with SIGTERM."""
     port = free_port()
     env = {
         **os.environ,
@@ -299,14 +312,17 @@ def test_exporter_process_end_to_end(zones):
         deadline = time.monotonic() + 180
         while time.monotonic() < deadline:
             assert process.poll() is None, "exporter exited before completing a cycle"
-            body = scrape(port)
+            # Readiness first: a ready answer implies a cycle in the later scrape.
+            ready, body = readiness(port), scrape(port)
             if body and "cf_exporter_last_cycle_success" in body:
                 break
+            assert ready != 200, "ready before the first collection cycle"
             time.sleep(1)
         assert body and "cf_exporter_last_cycle_success 1.0" in body
         for zone in zones:
             assert f'cf_exporter_zone_scrape_success{{zone_name="{zone["name"]}"}} 1.0' in body
         assert_day_families(body, scraped_cycle_start(body))
+        assert readiness(port) == expected_readiness(body)
 
         process.send_signal(signal.SIGTERM)
         assert process.wait(timeout=15) == 0

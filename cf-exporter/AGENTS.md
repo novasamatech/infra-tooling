@@ -21,9 +21,9 @@ cloudflare-exporter; establish which service produced an error before fixing it.
 | [tests/test_slicing.py](tests/test_slicing.py) | Time-filtered slicing, caps, totals and midnight regressions |
 | [tests/test_windows.py](tests/test_windows.py) | Snapshot window contract and actual Prometheus rendering |
 | [tests/test_edge.py](tests/test_edge.py) | Client-facing edge dataset, its filter and dataset availability |
-| [tests/test_readiness.py](tests/test_readiness.py) | Readiness, startup/failure recovery, freshness, UTC rollover and concurrent metrics HTTP checks |
-| [tests/test_live.py](tests/test_live.py) | Real API, schema and process checks |
-| [tests/image_smoke.py](tests/image_smoke.py) | Container lifecycle and metrics smoke check |
+| [tests/test_readiness.py](tests/test_readiness.py) | Readiness reasons, failure recovery, freshness, midnight scheduling and concurrent HTTP checks |
+| [tests/test_live.py](tests/test_live.py) | Real API, schema, process and readiness checks |
+| [tests/image_smoke.py](tests/image_smoke.py) | Container lifecycle, readiness and metrics smoke check |
 | [tests/profile_live.py](tests/profile_live.py) | Live resource measurements and completed-day sum validation |
 | [Dockerfile](Dockerfile), [.dockerignore](.dockerignore) | Runtime image and build context |
 | [Dockerfile.dev](Dockerfile.dev) | Cached Python 3.13 development image |
@@ -126,12 +126,15 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
   successful snapshot for all discovered zones in the current UTC day, with
   cycle and window ages below three collection intervals. Empty traffic is
   valid, and unsupported datasets or truncation remain metric-level conditions.
-  `/metrics` must remain available while not ready.
+  `/metrics` and every other path must keep serving metrics while not ready.
+  Keep the image smoke and live process readiness checks aligned with it.
 - Never wait longer than `MAX_RETRY_AFTER_SECONDS` for a `Retry-After`. After an
   HTTP 429 or a GraphQL budget error, skip the cycle's remaining zones and report
   them as failed.
 - Move the last cycle before UTC midnight earlier when it would not finish
   `DAY_CLOSE_MARGIN_SECONDS` before midnight; never publish a finished day after it.
+  Start a cycle due after midnight `NEW_DAY_START_SECONDS` after it instead, with
+  an empty window, so the new day's snapshot and readiness do not wait an interval.
 - Use monotonic time for durations and scheduling. Preserve clean signal exits.
 
 ## Validation And Scope

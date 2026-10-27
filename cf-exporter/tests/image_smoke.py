@@ -184,6 +184,28 @@ def cycle_started_today(body: str) -> bool:
     return time.gmtime(started)[:3] == time.gmtime()[:3]
 
 
+def readiness_status(port: int) -> int:
+    """HTTP status of /readyz; 503 is an answer, not a transport error."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/readyz", timeout=5) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        error.close()
+        return error.code
+
+
+def expected_readiness(body: str) -> int:
+    """The /readyz status implied by the exposition of a successful cycle.
+
+    It is ready only if at least one zone was collected and the snapshot's
+    day-scoped families are visible, i.e. its window belongs to the current day.
+    """
+    collected = any(
+        value == 1 for _, value in _sample_values(body, "cf_exporter_zone_scrape_success")
+    )
+    return 200 if collected and WINDOW_TYPE_LINE in body else 503
+
+
 def main() -> int:
     engine, image, port, timeout = sys.argv[1:]
     token = os.environ["CF_EXPORTER_API_TOKEN"].strip()
@@ -235,14 +257,29 @@ def main() -> int:
                             json.loads(metadata.stdout)[0]["State"]["Running"] is True
                         )
                     try:
+                        # Read before the metrics: readiness seen first implies
+                        # a published cycle in the later metrics response.
+                        ready = readiness_status(port)
                         with urllib.request.urlopen(
                             f"http://127.0.0.1:{port}/metrics", timeout=5
                         ) as response:
                             body = response.read().decode()
+                        if ready not in (200, 503) or (
+                            ready == 200 and "cf_exporter_last_cycle_success" not in body
+                        ):
+                            print(f"image smoke test: FAILED - /readyz returned {ready} early")
+                            return 1
                         if (
                             metadata_checked
                             and "cf_exporter_last_cycle_success 1.0" in body.splitlines()
                         ):
+                            ready, expected = readiness_status(port), expected_readiness(body)
+                            if ready != expected:
+                                print(
+                                    f"image smoke test: FAILED - /readyz returned {ready} "
+                                    f"after a successful cycle, expected {expected}"
+                                )
+                                return 1
                             if WINDOW_TYPE_LINE in body or cycle_started_today(body):
                                 for name in DAY_FAMILIES:
                                     if f"# TYPE {name} gauge" not in body:

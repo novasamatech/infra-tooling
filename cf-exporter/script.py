@@ -56,6 +56,12 @@ BASELINE_SELECTIONS = 6
 # The cycle before UTC midnight is moved earlier when it would not finish this
 # many seconds before midnight, so the day's final minutes are still exported.
 DAY_CLOSE_MARGIN_SECONDS = 30
+# A cycle due after UTC midnight starts this long after it instead. Its window,
+# truncated to whole seconds, is still empty and needs no analytics query, and
+# a slightly early wake-up cannot repeat the finished day.
+NEW_DAY_START_SECONDS = 0.5
+# /readyz requires snapshot ages below this many collection intervals.
+READINESS_MAX_AGE_INTERVALS = 3
 # Longest Retry-After worth waiting for inside a cycle. Cloudflare's rate limits
 # reset over 5 minutes; waiting that long would stall every remaining zone, so
 # such a response fails at once and the next cycle tries again.
@@ -905,12 +911,17 @@ class CloudflareCollector(Collector):
             self._snapshot = snapshot
 
     def readiness_error(self, max_age: float) -> str | None:
-        """Check one atomic snapshot without collecting or encoding metrics."""
+        """Why one atomic snapshot is not ready, without collecting or encoding metrics."""
         snapshot = self.snapshot
-        if snapshot.cycle_success != 1 or not snapshot.zone_success:
-            return "no successful collection cycle"
-        if not all(snapshot.zone_success.values()):
-            return "a zone collection failed"
+        if snapshot.cycle_timestamp is None:
+            return "no collection cycle has finished"
+        failed = sum(not success for success in snapshot.zone_success.values())
+        if failed:
+            return f"{failed} of {len(snapshot.zone_success)} zones failed in the last cycle"
+        if snapshot.cycle_success != 1:
+            return "the last collection cycle failed"
+        if not snapshot.zone_success:
+            return "no zones were discovered"
         now = datetime.now(UTC)
         if (
             snapshot.window_start is None
@@ -918,11 +929,13 @@ class CloudflareCollector(Collector):
             or snapshot.window_start.date() != now.date()
         ):
             return "no snapshot for the current UTC day"
-        if snapshot.cycle_timestamp is None or not (
-            0 <= now.timestamp() - snapshot.cycle_timestamp < max_age
-            and 0 <= (now - snapshot.window_end).total_seconds() < max_age
-        ):
-            return "snapshot is stale or in the future"
+        cycle_age = now.timestamp() - snapshot.cycle_timestamp
+        window_age = (now - snapshot.window_end).total_seconds()
+        if not (0 <= cycle_age < max_age and 0 <= window_age < max_age):
+            return (
+                f"snapshot is stale or in the future: cycle finished {cycle_age:.0f}s and "
+                f"window ended {window_age:.0f}s ago, limit {max_age:.0f}s"
+            )
         return None
 
     def collect(self) -> Iterator[Metric]:
@@ -1058,6 +1071,7 @@ def start_http_server(
     metrics_app = make_wsgi_app(REGISTRY)
 
     def app(environ, start_response):
+        # Every other path keeps serving metrics, as prometheus_client's server does.
         if environ["PATH_INFO"] != "/readyz":
             return metrics_app(environ, start_response)
         headers = [("Content-Type", "text/plain; charset=utf-8"), ("Cache-Control", "no-store")]
@@ -1090,7 +1104,9 @@ def run(
     Once per UTC day the next cycle is moved earlier if it would not finish
     DAY_CLOSE_MARGIN_SECONDS before midnight. Otherwise the traffic between the
     last cycle and midnight would never be exported: after midnight the
-    previous day's series are omitted by design.
+    previous day's series are omitted by design. A cycle due after midnight
+    starts right after it instead, with an empty window, so the new day's
+    snapshot and readiness do not wait for a whole interval.
     """
     closed_day = None
     while not stop_event.is_set():
@@ -1112,9 +1128,12 @@ def run(
         now = datetime.now(UTC)
         midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), UTC)
         # Midnight is a wall-clock instant; the cycle durations stay monotonic.
-        close = (midnight - now).total_seconds() - elapsed - DAY_CLOSE_MARGIN_SECONDS
+        to_midnight = (midnight - now).total_seconds()
+        close = to_midnight - elapsed - DAY_CLOSE_MARGIN_SECONDS
         if closed_day != now.date() and 0 < close < delay:
             closed_day, delay = now.date(), close
+        else:
+            delay = min(delay, to_midnight + NEW_DAY_START_SECONDS)
         stop_event.wait(delay)
 
 
@@ -1213,7 +1232,9 @@ def main() -> int:
 
     collector = CloudflareCollector()
     REGISTRY.register(collector)
-    start_http_server(config.metrics_port, collector, 3 * config.scrape_interval)
+    start_http_server(
+        config.metrics_port, collector, READINESS_MAX_AGE_INTERVALS * config.scrape_interval
+    )
     logging.info(
         "Exporter running on port %d, scrape interval %d seconds",
         config.metrics_port,
