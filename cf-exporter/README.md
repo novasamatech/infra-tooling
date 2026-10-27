@@ -95,6 +95,8 @@ Late-ingested data for the current day can revise a later snapshot, including da
 | `cf_exporter_groups` | `zone_name`, `dataset` | Exported nonzero label sets; dataset is `visits`, `requests`, `cache` or `edge` |
 | `cf_exporter_group_limit_reached` | `zone_name`, `dataset` | 1 when the configured cap, a full smallest slice or the spent slicing budget cut data, otherwise 0 |
 | `cf_exporter_dataset_available` | `zone_name`, `dataset` | 1 if the zone's plan supports the dataset, 0 if it is not collected; only for successfully collected zones |
+| `cf_exporter_api_responses_total` | `api`, `code` | Counter of HTTP responses from the Cloudflare API by status code, including retried attempts |
+| `cf_exporter_api_errors_total` | `api`, `error` | Counter of failed Cloudflare API attempts by error kind, including retried attempts |
 
 Every successfully collected zone has all four availability samples: visits, requests and cache are always `1`; edge is `1` or `0`. Missing availability means there is no successful current-day snapshot for the zone (for example startup, collection failure or expiry at UTC midnight), not an unsupported plan. Availability is day-scoped and disappears with the analytics; zone and cycle health remain available.
 
@@ -107,6 +109,66 @@ max by (zone_name, dataset) (cf_exporter_group_limit_reached) == 1
 cf_exporter_dataset_available == 0
 cf_exporter_cycle_duration_seconds > 240
 ```
+
+### Cloudflare API errors
+
+`cf_exporter_api_responses_total` and `cf_exporter_api_errors_total` are process counters that start at zero with the exporter. `api` is `rest` for the zone listing and `graphql` for settings and analytics. Every request attempt is counted once, including attempts the transport retries before a request succeeds, so the counters also show rate limits and outages that a successful cycle hides. Every `error` series is exported from zero:
+
+| `error` | Meaning |
+| --- | --- |
+| `rate_limited` | HTTP 429 |
+| `budget_depleted` | A GraphQL error reporting a depleted rate-limit budget without HTTP 429 |
+| `server_error` | Another HTTP 5xx |
+| `client_error` | Another HTTP 4xx, for example an invalid token or missing permissions |
+| `timeout` | Connect or read timeout |
+| `connection` | DNS, TCP, TLS or HTTP protocol failure, including a refused connection |
+| `invalid_response` | A response that is not a JSON object, reports `success: false`, has no GraphQL data or an invalid zone listing |
+| `graphql` | Any other error in a GraphQL response, which usually has HTTP 200 |
+
+A response with an error status is counted in both counters; transport failures have no response code. After HTTP 429 or a depleted budget, the cycle's remaining zones are skipped without requests, so they appear as failed zones rather than as more errors. Analytics content that fails validation, such as a malformed group, fails the zone without being counted here. Labels never contain URLs, messages, zone names or credentials.
+
+```promql
+# Rate limiting, even when a retry later succeeded
+increase(cf_exporter_api_errors_total{error=~"rate_limited|budget_depleted"}[15m]) > 0
+# API unavailability
+increase(cf_exporter_api_errors_total{error=~"server_error|timeout|connection"}[15m]) > 0
+# Error rates by kind
+sum by (api, error) (rate(cf_exporter_api_errors_total[1h]))
+```
+
+### Readiness
+
+`GET /readyz` on the metrics port returns HTTP 200 with `ready` only when the
+last published snapshot comes from a successful cycle with at least one zone and
+every discovered zone succeeded. Both the API window end and the cycle
+completion must be less than three collection intervals old and not in the
+future; the window age includes the cycle's own duration. With the default
+300-second interval, the limit is 900 seconds. Otherwise it returns HTTP 503
+with a one-line reason: before the first cycle, after a failed zone listing or
+zone collection, without discovered zones, or with a stale snapshot. A later
+successful cycle restores readiness.
+
+Readiness does not depend on the UTC day. After midnight, scrapes omit the
+previous day's day-scoped families until the new day's first snapshot is
+published. This refill is normal operation: a fresh previous-day snapshot stays
+ready, and the freshness limit still applies.
+
+An empty successful traffic window is ready. A plan's unsupported dataset or a
+reported group truncation does not fail readiness; the existing availability
+and truncation metrics describe those conditions. Readiness reads the atomic
+in-memory snapshot without API calls or metrics serialization. It answers during
+a concurrent large metrics scrape, and responses carry `Cache-Control: no-store`.
+`HEAD /readyz` reports the same status without a body; other methods return 405.
+Every other path still serves metrics.
+
+`/metrics` keeps serving metrics and health diagnostics while `/readyz` returns
+503. Use `/readyz` for a Kubernetes readiness probe rather than a TCP probe or
+the metrics status, but not for liveness: a Cloudflare failure should not
+restart the exporter. A not-ready pod is removed from its Service endpoints, and
+instances sharing one Cloudflare account usually become unready together. Scrape
+the exporter through a target discovery that keeps not-ready pods; otherwise the
+health metrics disappear exactly when collection fails. The endpoint introduces
+no coordination between instances.
 
 ## Configuration
 
@@ -140,7 +202,7 @@ make image-run PORT=8000
 make test-image PORT=8000 SMOKE_TIMEOUT=180
 ```
 
-`image-run` runs in the foreground. `run`, `image-run` and live-test targets send the token to the container through stdin and export it inside the running process, so it is absent from container metadata and command-line arguments. The smoke test reads the complete `/metrics` response, checks container metadata and new metric families, waits for a successful cycle, validates the window sample of every successful zone, and removes the container on exit.
+`image-run` runs in the foreground. `run`, `image-run` and live-test targets send the token to the container through stdin and export it inside the running process, so it is absent from container metadata and command-line arguments. The smoke test reads the complete `/metrics` response, checks container metadata and new metric families, requires `/readyz` to stay unready until a cycle is published, waits for a successful cycle, validates the window sample of every successful zone, the matching readiness and the Cloudflare API counters, prints nonzero API error counts, and removes the container on exit.
 
 To run a published image with Docker:
 
@@ -175,7 +237,7 @@ make clean                # remove caches, coverage output and all dev images
 
 Direct dependencies are declared in `requirements.in` and `requirements-dev.in`. Regenerate the pinned files with `make lock`, which resolves in a throwaway `python:3.13-alpine` container. Runtime pins constrain development resolution. A trap removes temporary lock files on failure; the temporary resolver is removed with the container. `test-image` uses any host `python3` only for its stdlib smoke driver; the tested exporter runs in the Python 3.13 runtime image.
 
-Offline tests mock external HTTP requests, including time-filtered regression tests for slicing, caps and midnight. Window-contract tests inspect the actual Prometheus exposition across startup, independent instances, UTC boundaries, revisions, failures and recovery. Edge tests check the client-request filter in every selection and slice, the preserved client and origin statuses, plan support and dataset health. Retry tests use a local HTTP server to exercise actual transport and backoff. Live tests check every queried GraphQL dataset, setting, dimension and sort value for existence and deprecation, plus filter-field existence (Cloudflare does not expose input-field deprecation). They verify exact sums for a completed UTC day, comparing edge groups with an independently fetched client-request total and checking the filter value against requests grouped by source. They collect every accessible zone including Free zones, and run the exporter through SIGTERM. Process logs stay in memory. Pytest skips live tests without `CF_EXPORTER_API_TOKEN`; explicit Makefile live targets require it.
+Offline tests mock external HTTP requests, including time-filtered regression tests for slicing, caps and midnight. Window-contract tests inspect the actual Prometheus exposition across startup, independent instances, UTC boundaries, revisions, failures and recovery. Edge tests check the client-request filter in every selection and slice, the preserved client and origin statuses, plan support and dataset health. Retry tests use a local HTTP server to exercise actual transport and backoff. Readiness tests use the real metrics HTTP server with synthetic and fake-API snapshots, covering failure recovery, freshness limits, the midnight refill and concurrent scrapes. API counter tests count every attempt of real transport retries against a local server, including read timeouts and refused connections. Live tests check every queried GraphQL dataset, setting, dimension and sort value for existence and deprecation, plus filter-field existence (Cloudflare does not expose input-field deprecation). They verify exact sums for a completed UTC day, comparing edge groups with an independently fetched client-request total and checking the filter value against requests grouped by source. They collect every accessible zone including Free zones, and run the exporter process through readiness and SIGTERM. Process logs stay in memory. Pytest skips live tests without `CF_EXPORTER_API_TOKEN`; explicit Makefile live targets require it.
 
 `make profile-live` runs [tests/profile_live.py](tests/profile_live.py) in the dev image and prints one JSON line per cycle: cycle duration, GraphQL requests and analytics selections, groups per dataset, truncated selections, zones without the edge dataset, equality with the zone totals, `source_filter_valid`, exposition size, samples, in-process encoding time and peak RSS. It prints no label values or credentials. Pass `PROFILE_ARGS='--day YYYY-MM-DD --cycles 2'` to profile a completed UTC day, where every sum must equal its zone total, and edge groups an independently fetched client-request total that is not counted in the measured selections. The reference filter is independent of the production constant and is checked against raw requests grouped by source; it is queried only for zones supporting the edge dataset. For the current day, `mismatched_datasets` reports differences caused by ongoing ingestion without failing the run; only that profiling process renders the past day's snapshot, preserving its original window boundaries.
 

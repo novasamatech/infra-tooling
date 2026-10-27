@@ -25,13 +25,17 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from itertools import pairwise
+from socketserver import ThreadingMixIn
+from urllib.parse import urlsplit
+from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 import requests
-from prometheus_client import REGISTRY, start_http_server
-from prometheus_client.core import GaugeMetricFamily, Metric
+from prometheus_client import REGISTRY, make_wsgi_app
+from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
 from prometheus_client.registry import Collector
 from requests.adapters import HTTPAdapter
-from urllib3.exceptions import MaxRetryError, ResponseError
+from urllib3.exceptions import MaxRetryError, NewConnectionError, ResponseError
+from urllib3.exceptions import TimeoutError as TransportTimeoutError
 from urllib3.util.retry import Retry
 
 API_BASE_URL = "https://api.cloudflare.com/client/v4"
@@ -54,11 +58,26 @@ BASELINE_SELECTIONS = 6
 # The cycle before UTC midnight is moved earlier when it would not finish this
 # many seconds before midnight, so the day's final minutes are still exported.
 DAY_CLOSE_MARGIN_SECONDS = 30
+# /readyz requires snapshot ages below this many collection intervals.
+READINESS_MAX_AGE_INTERVALS = 3
 # Longest Retry-After worth waiting for inside a cycle. Cloudflare's rate limits
 # reset over 5 minutes; waiting that long would stall every remaining zone, so
 # such a response fails at once and the next cycle tries again.
 MAX_RETRY_AFTER_SECONDS = 30
 UNKNOWN = "unknown"
+# `api` labels of the API counters: REST (zone listing) and GraphQL (analytics).
+APIS = ("rest", "graphql")
+# `error` labels of cf_exporter_api_errors_total, a fixed set exported from zero.
+API_ERRORS = (
+    "rate_limited",  # HTTP 429
+    "budget_depleted",  # GraphQL rate-limiter budget error without HTTP 429
+    "server_error",  # other HTTP 5xx
+    "client_error",  # other HTTP 4xx, e.g. an invalid or insufficient token
+    "timeout",  # connect or read timeout
+    "connection",  # DNS, TCP, TLS or HTTP protocol failure
+    "invalid_response",  # not JSON, not an object, success: false or no data
+    "graphql",  # any other error in a GraphQL response
+)
 UINT16_MAX = (1 << 16) - 1
 
 # Prometheus label -> httpRequestsAdaptiveGroups dimension, in label order.
@@ -178,8 +197,92 @@ def _is_budget_error(errors) -> bool:
     return False
 
 
+def api_name(url: str) -> str:
+    """The `api` label of a request path or URL."""
+    return "graphql" if urlsplit(url).path.endswith("/graphql") else "rest"
+
+
+def status_error(status: int) -> str | None:
+    """The error kind of an HTTP status, or None for a non-error status."""
+    if status == 429:
+        return "rate_limited"
+    if status >= 500:
+        return "server_error"
+    if status >= 400:
+        return "client_error"
+    return None
+
+
+def transport_error(error: Exception) -> str:
+    """The error kind of a requests or urllib3 transport exception."""
+    # requests reports exhausted retries, e.g. of read timeouts, as a
+    # ConnectionError around urllib3's MaxRetryError and the last actual error.
+    cause = error.args[0] if error.args else None
+    if isinstance(cause, MaxRetryError) and cause.reason is not None:
+        error = cause.reason
+    # urllib3 derives a refused connection from its connect timeout error.
+    if not isinstance(error, NewConnectionError) and isinstance(
+        error, (requests.Timeout, TransportTimeoutError)
+    ):
+        return "timeout"
+    return "connection"
+
+
+class APIStats(Collector):
+    """Process counters of Cloudflare API attempts, including transport retries.
+
+    Every attempt is counted once: the transport reports the attempts it retries,
+    CloudflareAPI the final one. Labels never carry URLs, messages or zones.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._responses: dict[tuple[str, str], int] = {}
+        self._errors = dict.fromkeys(((api, error) for api in APIS for error in API_ERRORS), 0)
+
+    def record(self, api: str, status: int | None = None, error: str | None = None) -> None:
+        with self._lock:
+            if status is not None:
+                key = (api, str(status))
+                self._responses[key] = self._responses.get(key, 0) + 1
+            if error is not None:
+                self._errors[(api, error)] += 1
+
+    def collect(self) -> Iterator[Metric]:
+        with self._lock:
+            responses, errors = dict(self._responses), dict(self._errors)
+        for name, description, labels, values in (
+            (
+                "cf_exporter_api_responses",
+                "HTTP responses from the Cloudflare API by status code, including retried ones",
+                ("api", "code"),
+                responses,
+            ),
+            (
+                "cf_exporter_api_errors",
+                "Failed Cloudflare API attempts by error kind, including retried ones",
+                ("api", "error"),
+                errors,
+            ),
+        ):
+            metric = CounterMetricFamily(name, description, labels=labels)
+            for key, value in sorted(values.items()):
+                metric.add_metric(key, value)
+            yield metric
+
+
 class BoundedRetry(Retry):
-    """Retry that gives up at once when the server asks to wait too long."""
+    """Retry that gives up at once when the server asks to wait too long, and
+    reports every attempt it retries."""
+
+    # Called with (url, response, error) for each retried attempt.
+    on_retry: Callable[[str, object, Exception | None], None] | None = None
+
+    def new(self, **kw):
+        # urllib3 creates a Retry per attempt from its own parameters only.
+        retry = super().new(**kw)
+        retry.on_retry = self.on_retry
+        return retry
 
     def increment(
         self, method=None, url=None, response=None, error=None, _pool=None, _stacktrace=None
@@ -192,7 +295,12 @@ class BoundedRetry(Retry):
                 url,
                 ResponseError(f"Retry-After {retry_after:.0f}s exceeds {MAX_RETRY_AFTER_SECONDS}s"),
             )
-        return super().increment(method, url, response, error, _pool, _stacktrace)
+        retry = super().increment(method, url, response, error, _pool, _stacktrace)
+        # Only a retried attempt gets here. A final one raises above or returns
+        # its response, and CloudflareAPI._request reports it.
+        if self.on_retry is not None:
+            self.on_retry(url, response, error)
+        return retry
 
 
 @dataclass(frozen=True)
@@ -291,6 +399,7 @@ class CloudflareAPI:
         )
         # Extra slice selections still allowed in this cycle; see start_cycle().
         self.slice_allowance = self.query_budget
+        self.stats = APIStats()
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -309,6 +418,7 @@ class CloudflareAPI:
             allowed_methods=frozenset({"GET", "POST"}),
             raise_on_status=False,
         )
+        retry.on_retry = self._retried
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
         self.session.mount("http://", HTTPAdapter(max_retries=retry))
 
@@ -317,21 +427,39 @@ class CloudflareAPI:
         and slicing across all zones may use only what is left."""
         self.slice_allowance = max(0, self.query_budget - zones * BASELINE_SELECTIONS)
 
+    def _retried(self, url: str, response, error: Exception | None) -> None:
+        if response is not None:
+            self.stats.record(api_name(url), response.status, status_error(response.status))
+        else:
+            self.stats.record(api_name(url), error=transport_error(error))
+
+    def _invalid(self, api: str, message: str) -> CloudflareAPIError:
+        """Count a response without usable content and return its exception."""
+        self.stats.record(api, error="invalid_response")
+        return CloudflareAPIError(message)
+
     def _redact(self, message: str) -> str:
         token = self.session.headers["Authorization"].removeprefix("Bearer ")
         return message.replace(token, "[REDACTED]")
 
     def _request(self, method: str, path: str, **kwargs) -> dict:
+        api = api_name(path)
         try:
             response = self.session.request(
                 method, f"{self.base_url}{path}", timeout=self.request_timeout, **kwargs
             )
         except requests.RequestException as e:
+            self.stats.record(api, error=transport_error(e))
             raise CloudflareAPIError(self._redact(f"{method} {path}: {e}")) from None
         try:
             payload = response.json()
         except ValueError:
             payload = None
+        # Exactly the responses rejected below count as errors, each once.
+        error = status_error(response.status_code)
+        if error is None and (not isinstance(payload, dict) or payload.get("success") is False):
+            error = "invalid_response"
+        self.stats.record(api, response.status_code, error)
         if response.status_code == 429:
             errors = payload.get("errors") if isinstance(payload, dict) else None
             raise RateLimitedError(
@@ -372,9 +500,11 @@ class CloudflareAPI:
             )
             result, info = payload.get("result"), payload.get("result_info")
             if payload.get("success") is not True or not isinstance(result, list):
-                raise CloudflareAPIError("GET /zones: response contains no valid zone list")
+                raise self._invalid("rest", "GET /zones: response contains no valid zone list")
             if not isinstance(info, dict):
-                raise CloudflareAPIError("GET /zones: response contains no pagination information")
+                raise self._invalid(
+                    "rest", "GET /zones: response contains no pagination information"
+                )
             total_pages = info.get("total_pages")
             if (
                 type(total_pages) is not int
@@ -383,7 +513,7 @@ class CloudflareAPI:
                 or info.get("page", page) != page
                 or (page < total_pages and not result)
             ):
-                raise CloudflareAPIError("GET /zones: invalid pagination information")
+                raise self._invalid("rest", "GET /zones: invalid pagination information")
             if any(
                 not isinstance(zone, dict)
                 or not isinstance(zone.get("id"), str)
@@ -392,7 +522,7 @@ class CloudflareAPI:
                 or not zone["name"]
                 for zone in result
             ):
-                raise CloudflareAPIError("GET /zones: zone without a valid id or name")
+                raise self._invalid("rest", "GET /zones: zone without a valid id or name")
             zones.extend(result)
             if page >= total_pages:
                 return zones
@@ -405,12 +535,14 @@ class CloudflareAPI:
         )
         if payload.get("errors"):
             message = self._redact(f"GraphQL: {format_errors(payload['errors'])}")
-            if _is_budget_error(payload["errors"]):
+            budget = _is_budget_error(payload["errors"])
+            self.stats.record("graphql", error="budget_depleted" if budget else "graphql")
+            if budget:
                 raise RateLimitedError(message)
             raise CloudflareAPIError(message)
         data = payload.get("data")
         if not isinstance(data, dict):
-            raise CloudflareAPIError("GraphQL: response contains no data")
+            raise self._invalid("graphql", "GraphQL: response contains no data")
         return data
 
 
@@ -902,6 +1034,32 @@ class CloudflareCollector(Collector):
         with self._lock:
             self._snapshot = snapshot
 
+    def readiness_error(self, max_age: float) -> str | None:
+        """Why one atomic snapshot is not ready, without collecting or encoding metrics."""
+        snapshot = self.snapshot
+        if snapshot.cycle_timestamp is None:
+            return "no collection cycle has finished"
+        failed = sum(not success for success in snapshot.zone_success.values())
+        if failed:
+            return f"{failed} of {len(snapshot.zone_success)} zones failed in the last cycle"
+        if snapshot.cycle_success != 1:
+            return "the last collection cycle failed"
+        if not snapshot.zone_success:
+            return "no zones were discovered"
+        if snapshot.window_start is None or snapshot.window_end is None:
+            return "the last snapshot has no API window"
+        # Deliberately independent of the UTC day: after midnight a fresh snapshot
+        # of the previous day stays ready while the new day is collected.
+        now = datetime.now(UTC)
+        cycle_age = now.timestamp() - snapshot.cycle_timestamp
+        window_age = (now - snapshot.window_end).total_seconds()
+        if not (0 <= cycle_age < max_age and 0 <= window_age < max_age):
+            return (
+                f"snapshot is stale or in the future: cycle finished {cycle_age:.0f}s and "
+                f"window ended {window_age:.0f}s ago, limit {max_age:.0f}s"
+            )
+        return None
+
     def collect(self) -> Iterator[Metric]:
         snapshot = self.snapshot
         if self._day_visible(snapshot):
@@ -1014,6 +1172,46 @@ class CloudflareCollector(Collector):
             for labels, value in values.items():
                 metric.add_metric(labels, value)
             yield metric
+
+
+class MetricsHTTPServer(ThreadingMixIn, WSGIServer):
+    """Keep metrics and readiness responsive to concurrent requests."""
+
+    daemon_threads = True
+
+
+class MetricsRequestHandler(WSGIRequestHandler):
+    def log_message(self, message, *args):
+        # Match prometheus_client's quiet HTTP server.
+        pass
+
+
+def start_http_server(
+    port: int, collector: CloudflareCollector, max_age: float
+) -> tuple[WSGIServer, threading.Thread]:
+    """Serve readiness alongside the unchanged Prometheus WSGI application."""
+    metrics_app = make_wsgi_app(REGISTRY)
+
+    def app(environ, start_response):
+        # Every other path keeps serving metrics, as prometheus_client's server does.
+        if environ["PATH_INFO"] != "/readyz":
+            return metrics_app(environ, start_response)
+        headers = [("Content-Type", "text/plain; charset=utf-8"), ("Cache-Control", "no-store")]
+        if environ["REQUEST_METHOD"] not in ("GET", "HEAD"):
+            status, body = "405 Method Not Allowed", b"use GET or HEAD\n"
+            headers.append(("Allow", "GET, HEAD"))
+        else:
+            error = collector.readiness_error(max_age)
+            status = "503 Service Unavailable" if error else "200 OK"
+            body = ((error or "ready") + "\n").encode()
+        headers.append(("Content-Length", str(len(body))))
+        start_response(status, headers)
+        return [] if environ["REQUEST_METHOD"] == "HEAD" else [body]
+
+    server = make_server("", port, app, MetricsHTTPServer, handler_class=MetricsRequestHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
 
 
 def run(
@@ -1150,18 +1348,21 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle_signal)
 
     collector = CloudflareCollector()
-    REGISTRY.register(collector)
-    start_http_server(config.metrics_port)
-    logging.info(
-        "Exporter running on port %d, scrape interval %d seconds",
-        config.metrics_port,
-        config.scrape_interval,
-    )
     api = CloudflareAPI(
         config.api_token,
         config.request_timeout,
         group_limit=config.group_limit,
         query_budget=cycle_query_budget(config.scrape_interval),
+    )
+    REGISTRY.register(collector)
+    REGISTRY.register(api.stats)
+    start_http_server(
+        config.metrics_port, collector, READINESS_MAX_AGE_INTERVALS * config.scrape_interval
+    )
+    logging.info(
+        "Exporter running on port %d, scrape interval %d seconds",
+        config.metrics_port,
+        config.scrape_interval,
     )
     run(api, collector, config.scrape_interval, threading.Event())
     return 0

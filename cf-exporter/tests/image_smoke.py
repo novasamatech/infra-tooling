@@ -184,6 +184,79 @@ def cycle_started_today(body: str) -> bool:
     return time.gmtime(started)[:3] == time.gmtime()[:3]
 
 
+# Mirror script.APIS and script.API_ERRORS; this driver stays stdlib-only.
+API_NAMES = ("rest", "graphql")
+API_ERRORS = (
+    "rate_limited",
+    "budget_depleted",
+    "server_error",
+    "client_error",
+    "timeout",
+    "connection",
+    "invalid_response",
+    "graphql",
+)
+
+
+def checked_api_counters(body: str) -> dict[tuple[str, str], float]:
+    """Validate the Cloudflare API counters after a successful cycle.
+
+    Returns the error counters by (api, error), so callers can report them.
+
+    Raises:
+        ValueError: A counter family is missing, a sample is mislabeled, duplicate
+            or invalid, or a successful cycle lacks successful API responses.
+    """
+    for name in ("cf_exporter_api_responses_total", "cf_exporter_api_errors_total"):
+        if f"# TYPE {name} counter" not in body:
+            raise ValueError(f"missing {name}")
+    counters = {}
+    for name, label in (("errors", "error"), ("responses", "code")):
+        values = counters[name] = {}
+        for labels, value in _sample_values(body, f"cf_exporter_api_{name}_total"):
+            key = (labels.get("api"), labels.get(label))
+            if set(labels) != {"api", label} or key[0] not in API_NAMES or key in values:
+                raise ValueError(f"invalid or duplicate API {name} sample")
+            if not math.isfinite(value) or value < 0 or not value.is_integer():
+                raise ValueError(f"invalid API {name} counter value")
+            values[key] = value
+    errors, responses = counters["errors"], counters["responses"]
+    if set(errors) != {(api, error) for api in API_NAMES for error in API_ERRORS}:
+        raise ValueError("API error kinds differ from the fixed set")
+    if any(not re.fullmatch(r"[1-5][0-9]{2}", code) for _, code in responses):
+        raise ValueError("API response with an invalid status code")
+    collected = any(
+        value == 1 for _, value in _sample_values(body, "cf_exporter_zone_scrape_success")
+    )
+    if responses.get(("rest", "200"), 0) < 1 or (
+        collected and responses.get(("graphql", "200"), 0) < 1
+    ):
+        raise ValueError("successful cycle without successful API responses")
+    return errors
+
+
+def readiness_status(port: int) -> int:
+    """HTTP status of /readyz; 503 is an answer, not a transport error."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/readyz", timeout=5) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        error.close()
+        return error.code
+
+
+def expected_readiness(body: str) -> int:
+    """The /readyz status implied by the exposition of a fresh successful cycle.
+
+    It is ready if at least one zone was collected, also after UTC midnight,
+    when the snapshot's day-scoped families are already omitted.
+    """
+    collected = any(
+        value == 1 for _, value in _sample_values(body, "cf_exporter_zone_scrape_success")
+    )
+    return 200 if collected else 503
+
+
 def main() -> int:
     engine, image, port, timeout = sys.argv[1:]
     token = os.environ["CF_EXPORTER_API_TOKEN"].strip()
@@ -235,14 +308,36 @@ def main() -> int:
                             json.loads(metadata.stdout)[0]["State"]["Running"] is True
                         )
                     try:
+                        # Read before the metrics: readiness seen first implies
+                        # a published cycle in the later metrics response.
+                        ready = readiness_status(port)
                         with urllib.request.urlopen(
                             f"http://127.0.0.1:{port}/metrics", timeout=5
                         ) as response:
                             body = response.read().decode()
+                        if ready not in (200, 503) or (
+                            ready == 200 and "cf_exporter_last_cycle_success" not in body
+                        ):
+                            print(f"image smoke test: FAILED - /readyz returned {ready} early")
+                            return 1
                         if (
                             metadata_checked
                             and "cf_exporter_last_cycle_success 1.0" in body.splitlines()
                         ):
+                            ready, expected = readiness_status(port), expected_readiness(body)
+                            if ready != expected:
+                                print(
+                                    f"image smoke test: FAILED - /readyz returned {ready} "
+                                    f"after a successful cycle, expected {expected}"
+                                )
+                                return 1
+                            try:
+                                errors = checked_api_counters(body)
+                            except ValueError as error:
+                                print(f"image smoke test: FAILED - {error}")
+                                return 1
+                            failed = {f"{a}/{e}": int(v) for (a, e), v in errors.items() if v}
+                            print(f"image smoke test: API errors {failed or 'none'}")
                             if WINDOW_TYPE_LINE in body or cycle_started_today(body):
                                 for name in DAY_FAMILIES:
                                     if f"# TYPE {name} gauge" not in body:

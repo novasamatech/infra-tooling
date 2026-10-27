@@ -1013,20 +1013,22 @@ def test_main_wires_everything_together(monkeypatch, quiet_logging, registry):
     monkeypatch.setattr(
         script.signal, "signal", lambda sig, handler: handlers.update({sig: handler})
     )
-    monkeypatch.setattr(script, "start_http_server", servers.append)
+    monkeypatch.setattr(script, "start_http_server", lambda *args: servers.append(args))
     monkeypatch.setattr(script, "run", lambda *args: runs.append(args))
 
     assert script.main() == 0
 
-    assert servers == [9123]
     assert set(handlers) == {signal.SIGTERM, signal.SIGINT}
     api, collector, interval, event = runs[0]
+    assert servers == [(9123, collector, 3 * 42)]
     assert api.session.headers["Authorization"] == "Bearer abc"
     assert api.query_budget == script.cycle_query_budget(42) == 28
     assert isinstance(collector, script.CloudflareCollector)
     assert interval == 42
     assert not event.is_set()
-    assert "cf_visits" in generate_latest(registry).decode()
+    text = generate_latest(registry).decode()
+    assert "cf_visits" in text
+    assert 'cf_exporter_api_errors_total{api="rest",error="rate_limited"} 0.0' in text
 
 
 def test_signal_handler_exits_cleanly(caplog):

@@ -21,8 +21,10 @@ cloudflare-exporter; establish which service produced an error before fixing it.
 | [tests/test_slicing.py](tests/test_slicing.py) | Time-filtered slicing, caps, totals and midnight regressions |
 | [tests/test_windows.py](tests/test_windows.py) | Snapshot window contract and actual Prometheus rendering |
 | [tests/test_edge.py](tests/test_edge.py) | Client-facing edge dataset, its filter and dataset availability |
-| [tests/test_live.py](tests/test_live.py) | Real API, schema and process checks |
-| [tests/image_smoke.py](tests/image_smoke.py) | Container lifecycle and metrics smoke check |
+| [tests/test_readiness.py](tests/test_readiness.py) | Readiness reasons, failure recovery, freshness, midnight refill and concurrent HTTP checks |
+| [tests/test_api_errors.py](tests/test_api_errors.py) | Cloudflare API response/error counters, error kinds and real transport retries |
+| [tests/test_live.py](tests/test_live.py) | Real API, schema, process and readiness checks |
+| [tests/image_smoke.py](tests/image_smoke.py) | Container lifecycle, readiness and metrics smoke check |
 | [tests/profile_live.py](tests/profile_live.py) | Live resource measurements and completed-day sum validation |
 | [Dockerfile](Dockerfile), [.dockerignore](.dockerignore) | Runtime image and build context |
 | [Dockerfile.dev](Dockerfile.dev) | Cached Python 3.13 development image |
@@ -121,6 +123,19 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
   UTC day, including if collection crossed midnight. Always serve zone/cycle health.
 - Keep the process running after collection failures and expose failures through
   health metrics. Imports must not install handlers or register global metrics.
+- Keep `/readyz` independent of metrics encoding, API calls and the UTC day. It
+  requires a successful snapshot for all discovered zones, with cycle and window
+  ages below three collection intervals; a fresh previous-day snapshot stays
+  ready during the midnight refill. Empty traffic is valid, and unsupported
+  datasets or truncation remain metric-level conditions.
+  `/metrics` and every other path must keep serving metrics while not ready.
+  Keep the image smoke and live process readiness checks aligned with it.
+- Count every Cloudflare API attempt once in `cf_exporter_api_responses_total`
+  `{api, code}` and `cf_exporter_api_errors_total{api, error}`: retried attempts
+  through `BoundedRetry.on_retry`, the final one in `CloudflareAPI._request`.
+  Keep `API_ERRORS` fixed, exported from zero and mirrored in `image_smoke.py`.
+  Labels never carry URLs, messages, zone names or credentials. Only `main()`
+  registers `APIStats`.
 - Never wait longer than `MAX_RETRY_AFTER_SECONDS` for a `Retry-After`. After an
   HTTP 429 or a GraphQL budget error, skip the cycle's remaining zones and report
   them as failed.

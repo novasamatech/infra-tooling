@@ -29,7 +29,7 @@ COPY --chmod=755 script.py .
 # Switch to the non-privileged user
 USER pyuser
 
-# Prometheus scrape endpoint (CF_EXPORTER_METRICS_PORT, default 8000)
+# Prometheus metrics and /readyz (CF_EXPORTER_METRICS_PORT, default 8000)
 EXPOSE 8000
 
 # By default, run the script
