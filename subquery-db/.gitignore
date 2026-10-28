@@ -1,0 +1,7 @@
+# Operator configs, state, logs, reports and local dumps (contain secrets/data).
+/work/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/

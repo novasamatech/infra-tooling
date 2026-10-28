@@ -1,0 +1,128 @@
+# Copyright © 2025 Novasama Technologies GmbH
+# SPDX-License-Identifier: Apache-2.0
+#
+# The only CI workflow of the repository. It names no project:
+# .github/ci/discover.sh selects the projects a change touches and what each
+# one opts into, following the conventions in the repository AGENTS.md:
+#   `ci` / `ci-integration` make targets   checks on pull requests and main
+#   Dockerfile + .version                  image published when .version changes
+# Extend it with new conventions, never with project-specific jobs.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      checks: ${{ steps.discover.outputs.checks }}
+      images: ${{ steps.discover.outputs.images }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select projects
+        id: discover
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          PUBLISH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        run: .github/ci/discover.sh
+
+  checks:
+    needs: discover
+    if: needs.discover.outputs.checks != '[]'
+    name: checks (${{ matrix.project }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.discover.outputs.checks) }}
+    env:
+      PROJECT: ${{ matrix.project }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Project Makefiles run their tasks in containers through CONTAINER_ENGINE.
+      - name: make ci
+        if: matrix.ci
+        run: make -C "$PROJECT" ci CONTAINER_ENGINE=docker
+
+      - name: make ci-integration
+        if: matrix.integration
+        run: make -C "$PROJECT" ci-integration CONTAINER_ENGINE=docker
+
+  images:
+    needs: [discover, checks]
+    # Publish only when the selection succeeded and no check of this push failed.
+    if: >-
+      !cancelled() && needs.discover.result == 'success' &&
+      needs.discover.outputs.images != '[]' &&
+      contains(fromJSON('["success", "skipped"]'), needs.checks.result)
+    name: image (${{ matrix.project }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        project: ${{ fromJSON(needs.discover.outputs.images) }}
+    env:
+      PROJECT: ${{ matrix.project }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read version
+        id: read_version
+        run: |
+          # First non-empty line of .version, without surrounding whitespace.
+          VERSION=$(sed '/^[[:space:]]*$/d' "$PROJECT/.version" | head -n 1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building $PROJECT version $VERSION"
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/${{ matrix.project }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.project }}
+          push: true
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/${{ github.repository }}/${{ matrix.project }}:latest
+            ghcr.io/${{ github.repository }}/${{ matrix.project }}:${{ steps.read_version.outputs.version }}

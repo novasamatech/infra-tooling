@@ -38,7 +38,7 @@ TOKEN_ENTRY = /bin/sh -c 'IFS= read -r CF_EXPORTER_API_TOKEN; export CF_EXPORTER
 
 .DEFAULT_GOAL := help
 .PHONY: help dev-image run test test-live test-all coverage lint fmt lock outdated \
-        profile-live image image-run test-image clean check-token
+        profile-live image image-run test-image clean check-token ci
 
 help:
 	@echo "cf-exporter — Python 3.13 container tasks (no host virtualenvs):"
@@ -46,6 +46,7 @@ help:
 	@echo "  make test        offline tests with coverage"
 	@echo "  make test-live   real Cloudflare API and process tests (needs token)"
 	@echo "  make test-all    offline + live tests with coverage (needs token)"
+	@echo "  make ci          repository CI checks: lint + offline tests"
 	@echo "  make coverage    offline tests + HTML coverage in ./htmlcov"
 	@echo "  make lint        ruff lint + format check"
 	@echo "  make fmt         ruff auto-format + autofix"
@@ -73,6 +74,10 @@ run: dev-image check-token
 
 test: dev-image
 	$(DEV_RUN) "$(DEV_IMAGE)" python -m pytest -m "not live" --cov=script --cov-report=term-missing
+
+# Repository CI entry point (see the root AGENTS.md); live checks need a token
+# and stay out of CI.
+ci: lint test
 
 test-live: dev-image check-token
 	@$(TOKEN_RUN) "$(DEV_IMAGE)" $(TOKEN_ENTRY) python -m pytest -m live -v

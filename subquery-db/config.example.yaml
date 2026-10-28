@@ -1,0 +1,87 @@
+# sqdb migration config, format version 1.
+#
+# One file describes one migration. It holds plain-text credentials, so keep it
+# out of git: put it under work/ (ignored) or outside the repository, and
+# delete it when the migration is done. Quote passwords and database names
+# that YAML could read as numbers or booleans ('0123', 'yes').
+version: 1
+
+# Dump name. Dumps are stored as <prefix><source database>/<backup_name>.dump,
+# so several migrations of the same database do not overwrite each other.
+backup_name: 20261027-pg17
+
+source:
+  host: 10.0.0.10
+  port: 5432
+  sslmode: prefer          # disable | allow | prefer | require | verify-ca | verify-full
+  # connect_timeout: 15
+
+# Target databases and their users must exist (a managed database service
+# creates them through its API). A target with schema `app` is not empty: the
+# restore stops with an error instead of loading into it.
+destination:
+  host: 10.0.0.20
+  port: 5432
+  sslmode: prefer
+  # Only for the --create-databases flag, which creates missing targets: this
+  # user runs CREATE DATABASE ... OWNER <group user> (or grants ALL when OWNER
+  # is not permitted). Without it the group user creates its own databases.
+  # admin:
+  #   user: admin
+  #   password: "change-me"
+  # maintenance_db: postgres
+
+storage:
+  type: s3                 # s3 (streamed, no local disk) | local
+  s3:
+    bucket: sqdb-dumps
+    prefix: ""
+    endpoint_url: https://s3.example.com
+    region: example-region
+    access_key_id: "change-me"
+    secret_access_key: "change-me"
+    # force_path_style: false
+    # verify_ssl: true
+    # Part size of multipart uploads: auto sizes parts from the source database
+    # size, so the dump fits in max_parts; parts grow if a dump is larger.
+    chunk_size: auto
+    max_parts: 1000        # the provider's limit of parts per upload
+    # Memory use is about chunk_size x (upload_concurrency + 1) per database.
+    upload_concurrency: 2
+  # local:
+  #   path: dumps          # relative to the work directory
+  #   format: directory    # directory (parallel dump/restore) | custom
+
+# Databases processed at the same time (each one runs its steps in order).
+parallel: 1
+
+# Defaults for every database; a group or a single database can override them.
+options:
+  dump_compress: "0"       # pg_dump -Z: 0-9 or e.g. "zstd:3"
+  # dump_jobs: 1           # pg_dump -j, local directory format only
+  # restore_jobs: 1        # pg_restore -j, local storage only
+  restore_pgoptions: "-c statement_timeout=0 -c maintenance_work_mem=1GB -c max_parallel_maintenance_workers=1"
+  probe_ddl: true          # rehearse the DDL on the target in a rolled-back transaction
+  verify_rows: exact       # exact row counts after restore (source must be quiescent) | none
+
+# Groups share one user and password, the same on both servers unless the
+# group sets `destination: {user, password}`.
+groups:
+  accounts:
+    user: accounts
+    password: "change-me"
+    databases:
+      - chain-a-accounts
+      - chain-b-accounts
+
+  transfers:
+    user: transfers
+    password: "change-me-too"
+    options:
+      verify_rows: none
+    databases:
+      - chain-a-transfers
+      - name: chain-b-transfers
+        target: chain-b-transfers-v2     # restore under another name
+        options:
+          probe_ddl: false

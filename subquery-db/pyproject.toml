@@ -1,0 +1,33 @@
+# Tool configuration only: sqdb runs from the source tree or the container image.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers"
+markers = [
+    "e2e: runs the CLI against the PostgreSQL/S3 harness (make test-e2e)",
+]
+
+[tool.coverage.run]
+branch = true
+# The end-to-end tests run the CLI as a subprocess, as an operator does.
+patch = ["subprocess"]
+source = ["sqdb"]
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "S", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# sqdb runs PostgreSQL client tools with argument lists (never a shell) and
+# builds SQL only through psycopg.sql composition.
+"sqdb/*" = ["S603", "S608"]
+# assert is how pytest works; tests and the harness use throwaway credentials,
+# spawn the CLI and compose fixture SQL.
+"tests/*" = ["S101", "S105", "S106", "S603", "S608"]
