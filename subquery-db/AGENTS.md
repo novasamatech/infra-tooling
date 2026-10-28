@@ -94,6 +94,17 @@ changes on `main` and the checks pass: a release bumps `.version`,
   schemas. Keep existing local dumps until the replacement dump succeeds.
 - `--clean-target` fails closed: when the source cannot be reached to rule out
   that the target is a source database on the same server, refuse to clean.
+- Progress is kept per context (endpoints, users, archive): another context's
+  progress is set aside, never erased, so commands with an edited config,
+  read-only ones included, lose nothing.
+- Verify compares what the restore created. Target-only objects outside the
+  restored schemas, in `public` or without a schema are warnings; row counts and
+  sequence values are read only for restored objects (the target's own may not
+  be readable by the group user).
+- Remove config-owned libpq variables (`CONFIG_OWNED_LIBPQ_ENV`) once at start,
+  so psycopg and the client tools see the same environment.
+- S3 parts above `max_part_memory` are spooled to temporary files; part growth
+  stays switchable (`grow_part_size`) for stores that need equal parts.
 - Keep long-idle connections alive on PostgreSQL 14+: sqdb connections set
   `idle_session_timeout = 0`, and pg_restore gets `-c idle_session_timeout=0`
   (its `-j` leader waits idle while workers load data).

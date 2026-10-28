@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -105,6 +106,33 @@ def read_full(stream: BinaryIO, size: int) -> bytes:
     return chunks[0] if len(chunks) == 1 else b"".join(chunks)
 
 
+SPOOL_BLOCK = 8 * 1024**2
+
+
+def read_part(stream: BinaryIO, size: int, memory_limit: int) -> tuple[Any, int]:
+    """Read up to size bytes into memory, or into a temporary file above memory_limit.
+
+    Returns the body (bytes, or a file positioned at its start) and its length.
+    """
+    if size <= memory_limit:
+        data = read_full(stream, size)
+        return data, len(data)
+    spool = tempfile.TemporaryFile()  # noqa: SIM115 - the part upload closes it
+    length = 0
+    try:
+        while length < size:
+            chunk = stream.read(min(SPOOL_BLOCK, size - length))
+            if not chunk:
+                break
+            spool.write(chunk)
+            length += len(chunk)
+        spool.seek(0)
+    except BaseException:
+        spool.close()
+        raise
+    return spool, length
+
+
 # ------------------------------------------------------------------------ S3
 
 
@@ -156,6 +184,8 @@ class MultipartUpload:
         concurrency: int,
         log: logging.LoggerAdapter,
         progress: Progress | None = None,
+        grow_part_size: bool = True,
+        max_part_memory: int = 1024**3,
     ):
         self.client = client
         self.bucket = bucket
@@ -165,6 +195,8 @@ class MultipartUpload:
         self.concurrency = concurrency
         self.log = log
         self.progress = progress
+        self.grow_part_size = grow_part_size
+        self.max_part_memory = max_part_memory
         self.upload_id: str | None = None
 
     def run(self, stream: BinaryIO, should_complete: Callable[[], bool]) -> int:
@@ -213,22 +245,25 @@ class MultipartUpload:
         chunk_size = self.chunk_size
         # Parts may differ in size: double the part size whenever half of the
         # remaining part budget is used, so an underestimated dump still fits.
+        # Stores that need equal parts turn this off and fail at the part limit.
         threshold = self.max_parts // 2
         with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
             try:
                 while True:
-                    data = read_full(stream, chunk_size)
-                    if not data:
+                    body, length = read_part(stream, chunk_size, self.max_part_memory)
+                    if not length:
+                        _close_body(body)
                         break
                     number += 1
                     if number > self.max_parts:
+                        _close_body(body)
                         raise StorageError(
                             f"the dump needs more than {self.max_parts} parts; "
                             "raise storage.s3.chunk_size"
                         )
-                    total += len(data)
-                    pending.add(pool.submit(self._upload_part, number, data))
-                    if number >= threshold and chunk_size < MAX_PART_SIZE:
+                    total += length
+                    pending.add(pool.submit(self._upload_part, number, body, length))
+                    if self.grow_part_size and number >= threshold and chunk_size < MAX_PART_SIZE:
                         chunk_size = min(chunk_size * 2, MAX_PART_SIZE)
                         threshold += max((self.max_parts - threshold) // 2, 1)
                         self.log.warning(
@@ -250,17 +285,27 @@ class MultipartUpload:
         parts.sort(key=lambda part: part["PartNumber"])
         return parts, total
 
-    def _upload_part(self, number: int, data: bytes) -> dict:
-        response = self.client.upload_part(
-            Bucket=self.bucket,
-            Key=self.key,
-            UploadId=self.upload_id,
-            PartNumber=number,
-            Body=data,
-        )
+    def _upload_part(self, number: int, body: Any, length: int) -> dict:
+        try:
+            response = self.client.upload_part(
+                Bucket=self.bucket,
+                Key=self.key,
+                UploadId=self.upload_id,
+                PartNumber=number,
+                Body=body,
+                ContentLength=length,
+            )
+        finally:
+            _close_body(body)
         if self.progress:
-            self.progress.add(len(data))
+            self.progress.add(length)
         return {"PartNumber": number, "ETag": response["ETag"]}
+
+
+def _close_body(body: Any) -> None:
+    """Release a spooled part; in-memory parts need nothing."""
+    if not isinstance(body, bytes):
+        body.close()
 
 
 class S3Reader(io.RawIOBase):
@@ -285,7 +330,8 @@ class S3Reader(io.RawIOBase):
         self.max_resumes = max_resumes
         self.progress = progress
         self.position = 0
-        self.resumes = 0
+        self.resumes = 0  # all resumes of this stream
+        self.failures = 0  # consecutive failures since the last successful read
         self.body = None
         self._cancelled = threading.Event()
 
@@ -322,11 +368,14 @@ class S3Reader(io.RawIOBase):
             except (BotoCoreError, HTTPError, OSError) as exc:
                 self._close_body()
                 self.resumes += 1
-                if self.resumes > self.max_resumes:
+                self.failures += 1
+                # A long stream may break many times; only failures in a row,
+                # without progress in between, exhaust the budget.
+                if self.failures > self.max_resumes:
                     raise StorageError(
-                        f"reading {self.key} failed {self.resumes} times: {exc}"
+                        f"reading {self.key} failed {self.failures} times in a row: {exc}"
                     ) from exc
-                delay = min(2**self.resumes, 60)
+                delay = min(2**self.failures, 60)
                 self.log.warning(
                     "read of %s broke at byte %d (%s); resuming in %ds",
                     self.key,
@@ -337,8 +386,10 @@ class S3Reader(io.RawIOBase):
                 self._cancelled.wait(delay)
                 continue
             self.position += len(data)
-            if self.progress and data:
-                self.progress.add(len(data))
+            if data:
+                self.failures = 0
+                if self.progress:
+                    self.progress.add(len(data))
             return data
 
     def readinto(self, buffer) -> int:
@@ -433,6 +484,8 @@ class S3Store:
             concurrency=self.settings.upload_concurrency,
             log=log,
             progress=progress,
+            grow_part_size=self.settings.grow_part_size,
+            max_part_memory=self.settings.max_part_memory,
         )
         return upload.run(stream, should_complete)
 

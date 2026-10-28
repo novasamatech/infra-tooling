@@ -100,6 +100,8 @@ class FakeS3:
         self.get_calls: list[dict] = []
         self.fail_part: int | None = None
         self.fail_reads: list[int] = []  # byte offsets at which successive bodies break
+        self.part_bodies: list[str] = []  # bytes, or a spooled file
+        self.uploaded_parts: dict[str, list[bytes]] = {}
         self.counter = 0
 
     def head_bucket(self, Bucket):
@@ -111,16 +113,20 @@ class FakeS3:
         self.uploads[upload_id] = {"key": Key, "parts": {}}
         return {"UploadId": upload_id}
 
-    def upload_part(self, Bucket, Key, UploadId, PartNumber, Body):
+    def upload_part(self, Bucket, Key, UploadId, PartNumber, Body, ContentLength=None):
         if self.fail_part == PartNumber:
             raise client_error("InternalError", 500)
-        self.uploads[UploadId]["parts"][PartNumber] = Body
+        data = Body if isinstance(Body, bytes) else Body.read()
+        assert ContentLength in (None, len(data))
+        self.uploads[UploadId]["parts"][PartNumber] = data
+        self.part_bodies.append(type(Body).__name__)
         return {"ETag": f'"etag-{PartNumber}"'}
 
     def complete_multipart_upload(self, Bucket, Key, UploadId, MultipartUpload):
         upload = self.uploads.pop(UploadId)
         numbers = [part["PartNumber"] for part in MultipartUpload["Parts"]]
         assert numbers == sorted(upload["parts"])
+        self.uploaded_parts[Key] = [upload["parts"][n] for n in numbers]
         self.objects[Key] = b"".join(upload["parts"][n] for n in numbers)
 
     def abort_multipart_upload(self, Bucket, Key, UploadId):

@@ -78,3 +78,20 @@ def test_failed_verification_cannot_leave_a_previous_pass(job, monkeypatch):
     with pytest.raises(OSError):
         job.verify()
     assert job.ctx.state.get(job.db.name, "verify")["status"] == "failed"
+
+
+def test_tools_and_psycopg_share_one_libpq_environment(job, monkeypatch):
+    from sqdb.pg import isolate_libpq_environment
+
+    monkeypatch.setenv("PGHOST", "elsewhere")
+    monkeypatch.setenv("PGOPTIONS", "-c work_mem=1MB")
+    monkeypatch.setenv("PGCLIENTENCODING", "LATIN1")
+    monkeypatch.setenv("PGSSLROOTCERT", "/certs/root.pem")
+    isolate_libpq_environment()
+    # What the config defines is removed for everyone; TLS files apply to both.
+    assert "PGHOST" not in __import__("os").environ
+    env = job._env(job.db.target_credentials, "-c statement_timeout=0")
+    assert env["PGSSLROOTCERT"] == "/certs/root.pem"
+    assert env["PGOPTIONS"] == "-c statement_timeout=0"
+    assert "PGHOST" not in env and "PGCLIENTENCODING" not in env
+    assert env["PGPASSWORD"] == job.db.target_credentials.password

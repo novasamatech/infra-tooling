@@ -46,8 +46,11 @@ storage:
     # size, so the dump fits in max_parts; parts grow if a dump is larger.
     chunk_size: auto
     max_parts: 1000        # the provider's limit of parts per upload
-    # Memory use is about chunk_size x (upload_concurrency + 1) per database.
+    # grow_part_size: true # false for stores that require equal parts
+    # Up to upload_concurrency + 1 parts are buffered per database: in memory up
+    # to max_part_memory each, in temporary files above it.
     upload_concurrency: 2
+    # max_part_memory: 1GiB
   # local:
   #   path: dumps          # relative to the work directory
   #   format: directory    # directory (parallel dump/restore) | custom

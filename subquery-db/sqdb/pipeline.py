@@ -32,6 +32,7 @@ from . import __version__
 from .config import Config, Credentials, Database, format_size
 from .log import MASKER, db_logger
 from .pg import (
+    CONFIG_OWNED_LIBPQ_ENV,
     DatabaseMissing,
     clean_target,
     connect,
@@ -161,7 +162,8 @@ class DatabaseJob:
             storage["endpoint_url"] = self.config.s3.endpoint_url
         if ctx.state.bind(db.name, source, target, storage):
             self.log.warning(
-                "config context changed; discarded progress from other endpoints or archives"
+                "config context changed: progress recorded for other endpoints or archives "
+                "is set aside and returns when they are used again"
             )
 
     @staticmethod
@@ -234,9 +236,9 @@ class DatabaseJob:
     # ----------------------------------------------------------- plumbing
 
     def _env(self, creds: Credentials, pgoptions: str | None = None) -> dict[str, str]:
-        env = {key: value for key, value in os.environ.items() if not key.startswith("PG")}
-        if "PG_BINDIR" in os.environ:
-            env["PG_BINDIR"] = os.environ["PG_BINDIR"]
+        # The CLI removed config-owned libpq variables at start (see
+        # isolate_libpq_environment), so tools see what psycopg sees.
+        env = {key: value for key, value in os.environ.items() if key not in CONFIG_OWNED_LIBPQ_ENV}
         env["PGPASSWORD"] = creds.password
         if pgoptions:
             env["PGOPTIONS"] = pgoptions
@@ -641,6 +643,8 @@ class DatabaseJob:
                 "toc_counts": toc.counts(),
             }
             store.write_manifest(self.db, self.backup_name, manifest)
+            # One read after the manifest serves the state record and the result.
+            info = store.info(self.db, self.backup_name)
         except BaseException as exc:
             status = "interrupted" if isinstance(exc, Interrupted | KeyboardInterrupt) else "failed"
             state.update(self.db.name, "backup", status=status, error=_short(exc))
@@ -652,10 +656,10 @@ class DatabaseJob:
             size=size,
             finished_at=now(),
             toc_entries=len(toc.entries),
-            dump=self.dump_identity(store.info(self.db, self.backup_name)),
+            dump=self.dump_identity(info),
         )
         self.log.info("backup done: %s, %d TOC entries", format_size(size), len(toc.entries))
-        return store.info(self.db, self.backup_name)
+        return info
 
     # ------------------------------------------------------------ restore
 

@@ -75,6 +75,11 @@ class S3Settings:
     max_parts: int
     upload_concurrency: int
     max_attempts: int
+    # Double the part size before the part limit; off for stores that need
+    # equal parts (all but the last).
+    grow_part_size: bool = True
+    # Larger parts are buffered in temporary files instead of memory.
+    max_part_memory: int = 1024**3
 
     def __repr__(self) -> str:
         return f"S3Settings(bucket={self.bucket!r}, prefix={self.prefix!r}, secrets='***')"
@@ -328,6 +333,10 @@ def _s3(reader: _Reader) -> S3Settings:
     if prefix and not prefix.endswith("/"):
         prefix += "/"
     bucket = reader.str("bucket", required=True)
+    memory = reader._get("max_part_memory", False)
+    max_part_memory = (
+        1024**3 if memory is None else parse_size(memory, f"{reader.where}.max_part_memory")
+    )
     settings = S3Settings(
         bucket=bucket,
         prefix=prefix,
@@ -342,6 +351,8 @@ def _s3(reader: _Reader) -> S3Settings:
         max_parts=reader.int("max_parts", 1000, minimum=2, maximum=10000),
         upload_concurrency=reader.int("upload_concurrency", 2, maximum=16),
         max_attempts=reader.int("max_attempts", 10, maximum=50),
+        grow_part_size=reader.bool("grow_part_size", True),
+        max_part_memory=max_part_memory,
     )
     reader.finish()
     return settings

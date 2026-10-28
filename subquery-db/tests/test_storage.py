@@ -22,9 +22,11 @@ from sqdb.storage import (
 MiB = 1024**2
 
 
-def upload(s3, log, data: bytes, chunk=MIN_PART_SIZE, max_parts=1000, ok=True, concurrency=2):
+def upload(
+    s3, log, data: bytes, chunk=MIN_PART_SIZE, max_parts=1000, ok=True, concurrency=2, **options
+):
     progress = Progress()
-    up = MultipartUpload(s3, "b", "k", chunk, max_parts, concurrency, log, progress)
+    up = MultipartUpload(s3, "b", "k", chunk, max_parts, concurrency, log, progress, **options)
     return up.run(io.BytesIO(data), lambda: ok), progress
 
 
@@ -221,3 +223,34 @@ def test_read_full_handles_short_reads():
     assert read_full(Trickle(b"abcdefgh"), 5) == b"abcde"
     assert read_full(Trickle(b"ab"), 5) == b"ab"
     assert read_full(io.BytesIO(b""), 5) == b""
+
+
+def test_parts_above_the_memory_limit_are_spooled_to_files(s3, log):
+    data = bytes(range(256)) * (MIN_PART_SIZE * 2 // 256 + 99)
+    size, _ = upload(s3, log, data, max_part_memory=1024**2)
+    assert size == len(data) and s3.objects["k"] == data
+    assert s3.part_bodies and "bytes" not in s3.part_bodies
+    s3.part_bodies.clear()
+    upload(s3, log, data)  # default limit: parts stay in memory
+    assert set(s3.part_bodies) == {"bytes"}
+
+
+def test_part_growth_can_be_disabled_for_equal_part_stores(s3, log):
+    data = b"z" * (MIN_PART_SIZE * 7)
+    with pytest.raises(StorageError, match="more than 4 parts"):
+        upload(s3, log, data, max_parts=4, grow_part_size=False)
+    assert s3.aborted == ["k"] and "k" not in s3.objects
+    size, _ = upload(s3, log, b"y" * (MIN_PART_SIZE * 3 + 7), max_parts=4, grow_part_size=False)
+    sizes = [len(part) for part in s3.uploaded_parts["k"]]
+    assert size == MIN_PART_SIZE * 3 + 7 and sizes[:-1] == [MIN_PART_SIZE] * 3
+
+
+def test_reader_budget_counts_only_consecutive_failures(s3, log, monkeypatch):
+    monkeypatch.setattr("sqdb.storage.time.sleep", lambda _: None)
+    data = bytes(range(256)) * 4096
+    s3.objects["k"] = data
+    # Ten breaks, each after progress: more than the budget of three in total.
+    s3.fail_reads = [50_000] * 10
+    reader = S3Reader(s3, "b", "k", None, log, max_resumes=3)
+    out = b"".join(iter(lambda: reader.read(65536), b""))
+    assert out == data and reader.resumes == 10 and reader.failures == 0

@@ -29,9 +29,9 @@ def _not_ext(catalog: str, oid: str) -> str:
 
 CATALOG_QUERIES: dict[str, str] = {
     "schemas": f"""
-        SELECT n.nspname, '' FROM pg_catalog.pg_namespace n
+        SELECT n.nspname, '', n.nspname FROM pg_catalog.pg_namespace n
         WHERE {SYSTEM_SCHEMA_FILTER} AND {_not_ext("pg_namespace", "n.oid")}""",
-    "extensions": "SELECT e.extname, '' FROM pg_catalog.pg_extension e",
+    "extensions": "SELECT e.extname, '', NULL::text FROM pg_catalog.pg_extension e",
     "relations": f"""
         SELECT pg_catalog.format('%I.%I', n.nspname, c.relname),
                pg_catalog.json_build_array(c.relkind, c.relpersistence, c.relreplident,
@@ -39,7 +39,8 @@ CATALOG_QUERIES: dict[str, str] = {
                  c.reloptions, pg_catalog.pg_get_expr(c.relpartbound, c.oid),
                  CASE WHEN c.relkind = 'p' THEN pg_catalog.pg_get_partkeydef(c.oid) END,
                  (SELECT pg_catalog.string_agg(i.inhparent::regclass::text, ',' ORDER BY i.inhseqno)
-                  FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid))::text
+                  FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid))::text,
+               n.nspname
         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
         WHERE c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f', 'c', 'i', 'I')
           AND {SYSTEM_SCHEMA_FILTER} AND {_not_ext("pg_class", "c.oid")}""",
@@ -52,7 +53,8 @@ CATALOG_QUERIES: dict[str, str] = {
                  'default ' || pg_catalog.pg_get_expr(ad.adbin, ad.adrelid),
                  NULLIF(a.attidentity, '') , NULLIF(a.attgenerated, ''),
                  CASE WHEN co.oid IS NOT NULL THEN 'collate ' ||
-                   pg_catalog.format('%I.%I', cn.nspname, co.collname) END)
+                   pg_catalog.format('%I.%I', cn.nspname, co.collname) END),
+               n.nspname
         FROM pg_catalog.pg_attribute a
         JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -65,7 +67,8 @@ CATALOG_QUERIES: dict[str, str] = {
           AND {SYSTEM_SCHEMA_FILTER} AND {_not_ext("pg_class", "c.oid")}""",
     "indexes": f"""
         SELECT pg_catalog.format('%I.%I', n.nspname, c.relname),
-               pg_catalog.pg_get_indexdef(i.indexrelid)
+               pg_catalog.pg_get_indexdef(i.indexrelid),
+               n.nspname
         FROM pg_catalog.pg_index i
         JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -74,13 +77,15 @@ CATALOG_QUERIES: dict[str, str] = {
         SELECT pg_catalog.format('%I.%I', n.nspname, con.conname) || ' on '
                  || CASE WHEN con.conrelid <> 0 THEN con.conrelid::pg_catalog.regclass::text
                          ELSE con.contypid::pg_catalog.regtype::text END,
-               con.contype::text || ' ' || pg_catalog.pg_get_constraintdef(con.oid)
+               con.contype::text || ' ' || pg_catalog.pg_get_constraintdef(con.oid),
+               n.nspname
         FROM pg_catalog.pg_constraint con
         JOIN pg_catalog.pg_namespace n ON n.oid = con.connamespace
         WHERE {SYSTEM_SCHEMA_FILTER} AND {_not_ext("pg_constraint", "con.oid")}""",
     "triggers": f"""
         SELECT t.tgrelid::pg_catalog.regclass::text || ' ' || t.tgname,
-               pg_catalog.pg_get_triggerdef(t.oid) || ' enabled=' || t.tgenabled::text
+               pg_catalog.pg_get_triggerdef(t.oid) || ' enabled=' || t.tgenabled::text,
+               n.nspname
         FROM pg_catalog.pg_trigger t
         JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -88,7 +93,8 @@ CATALOG_QUERIES: dict[str, str] = {
           AND {_not_ext("pg_trigger", "t.oid")}""",
     "routines": f"""
         SELECT p.oid::pg_catalog.regprocedure::text,
-               pg_catalog.pg_get_functiondef(p.oid)
+               pg_catalog.pg_get_functiondef(p.oid),
+               n.nspname
         FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
         WHERE p.prokind <> 'a' AND {SYSTEM_SCHEMA_FILTER}
           AND {_not_ext("pg_proc", "p.oid")}""",
@@ -103,7 +109,8 @@ CATALOG_QUERIES: dict[str, str] = {
                  a.aggfinalextra, a.aggmfinalextra, a.aggfinalmodify, a.aggmfinalmodify,
                  a.aggsortop::regoperator::text, a.aggtranstype::regtype::text,
                  a.aggtransspace, a.aggmtranstype::regtype::text, a.aggmtransspace,
-                 a.agginitval, a.aggminitval)::text
+                 a.agginitval, a.aggminitval)::text,
+               n.nspname
         FROM pg_catalog.pg_aggregate a JOIN pg_catalog.pg_proc p ON p.oid = a.aggfnoid
         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
         WHERE {SYSTEM_SCHEMA_FILTER} AND {_not_ext("pg_proc", "p.oid")}""",
@@ -115,7 +122,8 @@ CATALOG_QUERIES: dict[str, str] = {
                                 FROM pg_catalog.pg_enum e WHERE e.enumtypid = t.oid)
                  WHEN 'd' THEN pg_catalog.format_type(t.typbasetype, t.typtypmod)
                     || ' notnull=' || t.typnotnull::text
-                    || ' default=' || COALESCE(t.typdefault, '') END, '')
+                    || ' default=' || COALESCE(t.typdefault, '') END, ''),
+               n.nspname
         FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
         WHERE t.typtype IN ('b', 'c', 'd', 'e', 'r', 'm')
           AND (t.typrelid = 0 OR (SELECT c.relkind FROM pg_catalog.pg_class c
@@ -124,7 +132,8 @@ CATALOG_QUERIES: dict[str, str] = {
           AND {SYSTEM_SCHEMA_FILTER} AND {_not_ext("pg_type", "t.oid")}""",
     "views": f"""
         SELECT pg_catalog.format('%I.%I', n.nspname, c.relname),
-               pg_catalog.pg_get_viewdef(c.oid, true)
+               pg_catalog.pg_get_viewdef(c.oid, true),
+               n.nspname
         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
         WHERE c.relkind IN ('v', 'm') AND {SYSTEM_SCHEMA_FILTER}
           AND {_not_ext("pg_class", "c.oid")}""",
@@ -137,7 +146,8 @@ CATALOG_QUERIES: dict[str, str] = {
                   JOIN pg_catalog.pg_attribute a ON a.attrelid = d.refobjid
                        AND a.attnum = d.refobjsubid
                   WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid
-                    AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i')))::text
+                    AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i')))::text,
+               n.nspname
         FROM pg_catalog.pg_sequence s JOIN pg_catalog.pg_class c ON c.oid = s.seqrelid
         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
         WHERE {SYSTEM_SCHEMA_FILTER} AND {_not_ext("pg_class", "c.oid")}""",
@@ -150,12 +160,16 @@ CATALOG_QUERIES: dict[str, str] = {
                               ELSE pg_catalog.pg_get_userbyid(r) END)
                   FROM pg_catalog.unnest(p.polroles) r),
                  pg_catalog.pg_get_expr(p.polqual, p.polrelid),
-                 pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid))::text
+                 pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid))::text,
+               n.nspname
         FROM pg_catalog.pg_policy p JOIN pg_catalog.pg_class c ON c.oid = p.polrelid
         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
         WHERE {SYSTEM_SCHEMA_FILTER} AND {_not_ext("pg_class", "c.oid")}""",
     "comments": """
-        SELECT pg_catalog.pg_describe_object(d.classoid, d.objoid, d.objsubid), d.description
+        SELECT pg_catalog.pg_describe_object(d.classoid, d.objoid, d.objsubid), d.description,
+               CASE WHEN d.classoid = 'pg_catalog.pg_namespace'::pg_catalog.regclass
+                    THEN (SELECT n.nspname FROM pg_catalog.pg_namespace n WHERE n.oid = d.objoid)
+                    ELSE (pg_catalog.pg_identify_object(d.classoid, d.objoid, 0)).schema END
         FROM pg_catalog.pg_description d
         WHERE d.objoid >= 16384
           AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend dep
@@ -180,12 +194,25 @@ INVALID_INDEXES = f"""
 """
 
 
-def catalog_snapshot(conn: psycopg.Connection) -> dict[str, dict[str, str]]:
-    snapshot: dict[str, dict[str, str]] = {}
+# name -> (definition, schema); the schema is None for objects outside schemas.
+Catalog = dict[str, tuple[str, str | None]]
+
+
+def catalog_snapshot(
+    conn: psycopg.Connection, sequences: set[str] | None = None
+) -> dict[str, Catalog]:
+    """Catalog maps; sequence values are read only for ``sequences`` when given.
+
+    Reading a value needs privileges on the sequence, which a target's own
+    objects (for example a service's) do not grant to the group user.
+    """
+    snapshot: dict[str, Catalog] = {}
     for name, query in CATALOG_QUERIES.items():
         SUPERVISOR.check()
-        snapshot[name] = {row[0]: row[1] for row in conn.execute(query).fetchall()}
-    for name in list(snapshot["sequences"]):
+        snapshot[name] = {row[0]: (row[1], row[2]) for row in conn.execute(query).fetchall()}
+    for name, (definition, schema) in list(snapshot["sequences"].items()):
+        if sequences is not None and name not in sequences:
+            continue
         SUPERVISOR.check()
         # is_called changes the next generated value even when last_value is
         # identical; pg_sequences hides it (and hides uncalled last_value).
@@ -194,7 +221,7 @@ def catalog_snapshot(conn: psycopg.Connection) -> dict[str, dict[str, str]]:
                 sql.Identifier(*_sequence_name(conn, name))
             )
         ).fetchone()
-        snapshot["sequences"][name] += f" value={value} called={called}"
+        snapshot["sequences"][name] = (f"{definition} value={value} called={called}", schema)
     return snapshot
 
 
@@ -206,15 +233,45 @@ def _sequence_name(conn: psycopg.Connection, name: str) -> tuple[str, str]:
     ).fetchone()
 
 
-def row_counts(conn: psycopg.Connection) -> dict[str, int]:
-    counts: dict[str, int] = {}
+def row_counts(
+    conn: psycopg.Connection, tables: set[str] | None = None
+) -> dict[str, tuple[int, str]]:
+    """Exact row counts, optionally only for the given tables (qualified names)."""
+    counts: dict[str, tuple[int, str]] = {}
     for schema, table, name in conn.execute(COUNT_TABLES).fetchall():
+        if tables is not None and name not in tables:
+            continue
         SUPERVISOR.check()
         query = sql.SQL("SELECT count(*) FROM ONLY {}.{}").format(
             sql.Identifier(schema), sql.Identifier(table)
         )
-        counts[name] = conn.execute(query).fetchone()[0]
+        counts[name] = (conn.execute(query).fetchone()[0], schema)
     return counts
+
+
+def split_foreign(
+    source: Catalog | dict, target: Catalog | dict, source_schemas: set[str]
+) -> tuple[dict, dict, list[str]]:
+    """Values to compare, plus target-only objects the restore cannot have created.
+
+    The target check leaves schemas the dump does not create alone, and the
+    restore never adds objects to public or outside schemas beyond the dump. So
+    an object only in the target, in such a schema, in public or without a
+    schema, predates the restore (for example one the database service
+    creates): it is reported, not counted as a difference. Missing or changed
+    objects always count.
+    """
+    src_values = {key: value for key, (value, _) in source.items()}
+    dst_values: dict = {}
+    foreign: list[str] = []
+    for key, (value, schema) in target.items():
+        if key not in src_values and (
+            schema is None or schema == "public" or schema not in source_schemas
+        ):
+            foreign.append(key)
+        else:
+            dst_values[key] = value
+    return src_values, dst_values, sorted(foreign)
 
 
 @dataclass
@@ -314,20 +371,40 @@ def compare_databases(
             )
 
     log.info("comparing catalogs")
-    src_catalog, dst_catalog = catalog_snapshot(source), catalog_snapshot(target)
+    src_catalog = catalog_snapshot(source)
+    dst_catalog = catalog_snapshot(target, sequences=set(src_catalog["sequences"]))
+    source_schemas = set(src_catalog["schemas"])
     for name in CATALOG_QUERIES:
         if name == "extensions":
             continue
-        report.differences[name] = compare_maps(src_catalog[name], dst_catalog[name])
+        src_values, dst_values, foreign = split_foreign(
+            src_catalog[name], dst_catalog[name], source_schemas
+        )
+        report.differences[name] = compare_maps(src_values, dst_values)
+        _warn_foreign(report, name, foreign)
     missing_ext = sorted(set(src_catalog["extensions"]) - set(dst_catalog["extensions"]))
     report.differences["extensions"] = Difference(missing=missing_ext)
     report.invalid_indexes = [row[0] for row in target.execute(INVALID_INDEXES).fetchall()]
 
     if rows:
         log.info("counting rows in source and target")
-        src_rows, dst_rows = row_counts(source), row_counts(target)
-        report.differences["row_counts"] = compare_maps(src_rows, dst_rows)
+        src_values = {name: count for name, (count, _) in row_counts(source).items()}
+        # Only the restored tables: the target's own tables may not even be
+        # readable by the group user; they are reported with the relations.
+        dst_values = {
+            name: count for name, (count, _) in row_counts(target, set(src_values)).items()
+        }
+        report.differences["row_counts"] = compare_maps(src_values, dst_values)
         report.rows_checked = True
-        report.tables = len(src_rows)
-        report.total_rows = sum(src_rows.values())
+        report.tables = len(src_values)
+        report.total_rows = sum(src_values.values())
     return report
+
+
+def _warn_foreign(report: "Report", category: str, names: list[str]) -> None:
+    if names:
+        sample = ", ".join(names[:5]) + (f" (+{len(names) - 5} more)" if len(names) > 5 else "")
+        report.warnings.append(
+            f"{category}: {len(names)} target-only object(s) the restore did not create "
+            f"were not compared: {sample}"
+        )

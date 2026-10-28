@@ -30,9 +30,10 @@ base=${BASE:-}
 
 if [[ -n $base && ! $base =~ ^0+$ ]] && git cat-file -e "$base^{commit}" 2>/dev/null; then
   # Three dots: changes on HEAD since the merge base, also after a force push.
-  changed=$(git diff --name-only "$base...$head")
+  # No rename detection: a moved file touches the project it left as well.
+  changed=$(git diff --no-renames --name-only "$base...$head")
 else
-  changed=$(git diff-tree --root --no-commit-id --name-only -r "$head")
+  changed=$(git diff-tree --no-renames --root --no-commit-id --name-only -r "$head")
 fi
 
 has_target() { # <project> <target>: the Makefile declares the target literally

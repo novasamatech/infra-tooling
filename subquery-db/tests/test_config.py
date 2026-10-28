@@ -175,3 +175,14 @@ def test_format_size():
     assert format_size(512) == "512 B"
     assert format_size(1536) == "1.5 KiB"
     assert format_size(3 * 1024**4) == "3.0 TiB"
+
+
+def test_s3_part_growth_and_memory_limit(raw_config):
+    s3 = parse_config(raw_config).s3
+    assert s3.grow_part_size is True and s3.max_part_memory == 1024**3
+    raw_config["storage"]["s3"].update(grow_part_size=False, max_part_memory="256MiB")
+    s3 = parse_config(raw_config).s3
+    assert s3.grow_part_size is False and s3.max_part_memory == 256 * 1024**2
+    raw_config["storage"]["s3"]["grow_part_size"] = "no"
+    with pytest.raises(ConfigError, match="true or false"):
+        parse_config(raw_config)

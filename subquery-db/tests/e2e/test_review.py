@@ -362,3 +362,29 @@ def test_server_idle_session_timeout_does_not_drop_idle_connections(e2e, review)
                     sql.Identifier(OWNER), sql.Identifier(review.target)
                 )
             )
+
+
+def test_verify_reports_but_ignores_objects_the_restore_did_not_create(e2e, review):
+    """A managed target may come with its own objects; verify must not fail on them."""
+    with e2e.connect("new", review.target) as conn:
+        conn.execute("CREATE SCHEMA service")
+        conn.execute("CREATE TABLE service.audit (id int)")
+        conn.execute("INSERT INTO service.audit VALUES (1)")
+        conn.execute("CREATE TABLE public.service_table (id int)")
+        conn.execute("COMMENT ON TABLE public.service_table IS 'created by the service'")
+    run = migrate(e2e, review)
+    assert "target-only object(s) the restore did not create were not compared" in run.output
+    assert "service.audit" in run.output and "public.service_table" in run.output
+    assert state(review)["verify"]["status"] == "passed"
+
+
+def test_clean_target_protects_schemas_whose_names_start_with_pg(e2e, review):
+    """LIKE 'pg_%' would also match pgx_*; only system schemas may be skipped."""
+    migrate(e2e, review)
+    with e2e.connect("new", review.target) as conn:
+        conn.execute("CREATE SCHEMA pgx_sidecar")
+        conn.execute(f'CREATE VIEW pgx_sidecar.events AS SELECT * FROM "{SCHEMA}".events')
+    run = e2e.sqdb(review.config, review.work, "restore", "--clean-target", "--yes")
+    assert run.returncode == 1 and "outside the selected schemas; rolled back" in run.output
+    with e2e.connect("new", review.target) as conn:
+        assert conn.execute("SELECT to_regclass('pgx_sidecar.events')").fetchone()[0]

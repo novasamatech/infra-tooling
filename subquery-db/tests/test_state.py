@@ -44,6 +44,12 @@ def test_state_is_bound_to_source_target_and_storage(tmp_path):
     assert not state.get("db", "restore") and not state.get("db", "verify")
     assert state.bind("db", {"host": "different"}, target, storage)
     assert not state.get("db", "backup")
+    # Switching back (e.g. after a check with an edited config) restores the progress,
+    # also from disk.
+    assert state.bind("db", source, target, storage)
+    reloaded = State(state.path)
+    for section in ("backup", "restore", "verify"):
+        assert reloaded.get("db", section)["status"] == "done"
 
 
 def test_work_directory_excludes_concurrent_writers(tmp_path):

@@ -96,7 +96,9 @@ Features:
 * **Verification.** After a restore, `verify` compares source and target
   catalogs (schemas, tables, columns, indexes, constraints, triggers, routines,
   types, views, sequences, comments), checks that all target indexes are valid
-  and compares exact row counts.
+  and compares exact row counts. Objects that only the target has outside the
+  restored schemas (for example ones the database service creates in `public`
+  or in its own schemas) are reported, not counted as differences.
 * **Restartable.** A state file records dumps, finished phases and checks.
   Reruns skip finished work, refuse to reuse unrecorded dumps or to restore into
   non-empty targets unless told to, and `--clean-target` drops what a failed
@@ -114,6 +116,9 @@ Features:
 * Writers to the source databases (for example indexers) should be stopped
   before the dump: the dump is a consistent snapshot, and `verify` compares row
   counts with the live source.
+* libpq environment variables that would override the config (`PGHOST`,
+  `PGUSER`, `PGOPTIONS`, `PGSERVICE`, `PGSSLMODE`, ...) are ignored; others, such
+  as `PGSSLROOTCERT`, apply to every connection, the client tools' included.
 
 ## Runtime image
 
@@ -176,15 +181,19 @@ example an unquoted numeric password) are rejected.
 | `destination.admin` | Only with `--create-databases`: `user`/`password` that creates missing targets with `OWNER <group user>`; when `OWNER` is not permitted it creates them and grants `ALL` on the database and schema `public`. Without it the group user runs `CREATE DATABASE` |
 | `destination.maintenance_db` | Only with `--create-databases`: database to connect to for `CREATE DATABASE` (default `postgres`) |
 | `storage.type` | `s3` or `local` |
-| `storage.s3` | `bucket`, `prefix`, `endpoint_url`, `region`, `access_key_id`, `secret_access_key`, `session_token`, `force_path_style`, `verify_ssl`, `chunk_size` (`auto` or e.g. `256MiB`; units are binary), `max_parts` (default 1000), `upload_concurrency` (default 2), `max_attempts` |
+| `storage.s3` | `bucket`, `prefix`, `endpoint_url`, `region`, `access_key_id`, `secret_access_key`, `session_token`, `force_path_style`, `verify_ssl`, `chunk_size` (`auto` or e.g. `256MiB`; units are binary), `max_parts` (default 1000), `upload_concurrency` (default 2), `max_attempts`, `grow_part_size` (default `true`), `max_part_memory` (default `1GiB`) |
 | `storage.local` | `path` (relative to the work directory), `format`: `directory` or `custom` |
 | `parallel` | Databases processed at the same time (default 1) |
 | `options` | `dump_compress` (`pg_dump -Z`, default `0`), `dump_jobs`, `restore_jobs`, `restore_pgoptions`, `probe_ddl`, `verify_rows` (`exact`/`none`) |
 | `groups.<name>` | `user`, `password`, optional `destination: {user, password}`, `options`, `databases` |
 | `groups.<name>.databases[]` | A name, or `{name, target, options}` |
 
-An S3 upload buffers about `chunk_size × (upload_concurrency + 1)` bytes per
-database. `restore_jobs > 1` needs local storage: a streamed archive is restored
+An S3 upload buffers up to `upload_concurrency + 1` parts per database: in
+memory up to `max_part_memory` per part, in temporary files (the container's
+`/tmp`) above it, so very large dumps do not exhaust memory. When a dump outgrows
+the part estimate, the part size doubles before `max_parts` is reached; set
+`grow_part_size: false` for object stores that require equal parts (all but the
+last), where an oversized dump then fails at the part limit instead. `restore_jobs > 1` needs local storage: a streamed archive is restored
 with one job. `dump_jobs > 1` needs the local `directory` format.
 
 ## Commands
@@ -297,7 +306,8 @@ the rehearsal work directory.
 The repository CI runs `make ci` (lint, unit tests) and `make ci-integration`
 (unit and e2e tests with combined coverage, runtime image build and a rehearsal
 of `config.example.yaml`) for every change to this directory; both run locally
-the same way.
+the same way. `ci-integration` removes the harness whether it passes or fails;
+`KEEP_HARNESS=1` leaves it up for debugging.
 
 | Command | Purpose |
 | --- | --- |

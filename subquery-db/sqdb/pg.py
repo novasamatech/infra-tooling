@@ -8,6 +8,7 @@ them through PGPASSWORD in their own environment.
 """
 
 import logging
+import os
 import re
 import uuid
 from collections.abc import Iterable
@@ -28,6 +29,38 @@ KEEPALIVES = {
     "keepalives_count": "6",
 }
 MISSING_DB_RE = re.compile(r'database ".*" does not exist')
+# libpq variables that would override or bypass what the config defines (where
+# and as whom to connect, credentials, session options). Removed once at start,
+# so psycopg and the client tools see the same environment; others, such as the
+# PGSSL* certificate files, apply to both.
+CONFIG_OWNED_LIBPQ_ENV = frozenset(
+    {
+        "PGHOST",
+        "PGHOSTADDR",
+        "PGPORT",
+        "PGDATABASE",
+        "PGUSER",
+        "PGPASSWORD",
+        "PGPASSFILE",
+        "PGSERVICE",
+        "PGSERVICEFILE",
+        "PGOPTIONS",
+        "PGAPPNAME",
+        "PGSSLMODE",
+        "PGREQUIRESSL",
+        "PGCONNECT_TIMEOUT",
+        "PGTARGETSESSIONATTRS",
+        "PGLOADBALANCEHOSTS",
+        "PGCLIENTENCODING",
+    }
+)
+
+
+def isolate_libpq_environment() -> None:
+    for name in CONFIG_OWNED_LIBPQ_ENV:
+        os.environ.pop(name, None)
+
+
 SYSTEM_SCHEMA_FILTER = """
     n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
     AND n.nspname NOT LIKE 'pg\\_temp\\_%' AND n.nspname NOT LIKE 'pg\\_toast\\_temp\\_%'
@@ -218,7 +251,7 @@ def _outside_dependencies(conn: psycopg.Connection, schemas: set[str]) -> set[tu
              d.classid, d.objid, d.objsubid) i
            WHERE COALESCE(o.schema, pg_catalog.quote_ident(i.object_names[1])) <>
              ALL(ARRAY(SELECT pg_catalog.quote_ident(s) FROM pg_catalog.unnest(%s::text[]) s))
-             AND i.object_names[1] NOT LIKE 'pg_%%'
+             AND i.object_names[1] NOT LIKE 'pg\\_%%'
              AND i.object_names[1] <> 'information_schema'""",
             (sorted(schemas),),
         ).fetchall()

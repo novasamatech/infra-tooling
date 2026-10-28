@@ -18,7 +18,7 @@ import psycopg
 from . import __version__
 from .config import Config, ConfigError, Database, format_size, load_config
 from .log import MASKER, db_logger, setup_logging
-from .pg import CleanupError
+from .pg import CleanupError, isolate_libpq_environment
 from .pipeline import CheckResult, Context, DatabaseJob, JobError, RunOptions, client_version
 from .proc import SUPERVISOR, Interrupted, ToolError
 from .state import State
@@ -303,6 +303,7 @@ def run_checks(ctx: Context, dbs: list[Database], parallel: int, fail_fast: bool
 
 
 def main(argv: list[str] | None = None) -> int:
+    isolate_libpq_environment()
     previous_umask = os.umask(0o077)
     try:
         return _main(argv)

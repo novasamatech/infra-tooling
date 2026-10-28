@@ -49,3 +49,15 @@ Initial implementation review (2026-10-28):
   `idle_session_timeout` (the target lock, verify and the `pg_restore -j` leader
   stay idle for long periods), and refuse `--clean-target` when the source
   cannot be reached to rule out that the target is the source.
+- Verify reports, instead of failing on, objects that only the target has
+  outside the restored schemas, and reads row counts and sequence values only
+  for restored objects.
+- Keep state progress per config context instead of discarding it; read-only
+  commands with an edited config no longer lose recorded work.
+- Spool S3 parts above `max_part_memory` to temporary files and make part-size
+  growth switchable (`grow_part_size`) for stores that need equal parts.
+- Count only consecutive S3 read failures against the resume budget.
+- Exclude only system schemas (`pg\_%`) from the cleanup cascade check.
+- Give psycopg and the client tools the same libpq environment.
+- `ci-integration` removes the harness also when a step fails (`KEEP_HARNESS=1`
+  keeps it).

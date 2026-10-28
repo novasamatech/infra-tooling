@@ -8,6 +8,7 @@ written atomically after every change, so a crash leaves the last good state.
 """
 
 import fcntl
+import hashlib
 import json
 import threading
 from collections.abc import Iterator
@@ -20,6 +21,12 @@ from typing import Any
 from .log import MASKER
 
 STATE_VERSION = 1
+# Per-database key holding the progress of contexts that are not active.
+CONTEXTS = "other_contexts"
+
+
+def _context_key(context: dict) -> str:
+    return hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def now() -> str:
@@ -73,21 +80,40 @@ class State:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
     def bind(self, db: str, source: dict, target: dict, storage: dict) -> bool:
-        """Discard progress that belongs to other endpoints, users or archives."""
+        """Make the progress of this context (endpoints, users, archive) the active one.
+
+        Progress of another context is set aside under that context, not
+        discarded, and comes back when a command uses that context again; so a
+        command run with an edited config, even a read-only one, loses nothing.
+        Returns True when the active context changed.
+        """
         context = {"source": source, "target": target, "storage": storage}
         with self._lock:
             entry = self.data["databases"].setdefault(db, {})
-            previous = entry.get("context", {})
-            changed = bool(entry) and previous != context
-            if previous.get("source") != source or previous.get("storage") != storage:
-                entry.clear()
-            elif previous.get("target") != target:
-                for section in ("restore", "verify"):
-                    entry.pop(section, None)
+            previous = entry.get("context")
+            if previous == context:
+                return False
+            stash = entry.pop(CONTEXTS, {})
+            sections = {key: value for key, value in entry.items() if key != "context"}
+            if previous is not None and sections:
+                stash[_context_key(previous)] = {"context": previous, **sections}
+            restored = stash.pop(_context_key(context), None)
+            entry.clear()
             entry["context"] = context
-            if changed:
-                self._save()
-            return changed
+            if restored is not None:
+                entry.update({key: value for key, value in restored.items() if key != "context"})
+            elif (
+                previous is not None
+                and "backup" in sections
+                and previous.get("source") == source
+                and previous.get("storage") == storage
+            ):
+                # The same dump serves a different target.
+                entry["backup"] = deepcopy(sections["backup"])
+            if stash:
+                entry[CONTEXTS] = stash
+            self._save()
+            return previous is not None
 
     def get(self, db: str, section: str) -> dict[str, Any]:
         with self._lock:

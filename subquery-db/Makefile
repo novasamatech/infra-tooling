@@ -263,11 +263,15 @@ rehearse: image-ready dev-image harness-up work-dir check-config
 # ------------------------------------------------------------------------- CI
 
 # Repository CI entry points (see the root AGENTS.md). ci-integration uses the
-# local harness only: PostgreSQL 16 -> 17, versitygw and the runtime image.
+# local harness only: PostgreSQL 16 -> 17, versitygw and the runtime image. It
+# removes the harness whether the steps pass or fail; KEEP_HARNESS=1 leaves it
+# up for debugging.
+KEEP_HARNESS ?=
 ci: lint test
 
 ci-integration:
-	$(MAKE) test-all
-	$(MAKE) image
-	$(MAKE) rehearse CONFIG=config.example.yaml IMAGE_TAG=local
-	$(MAKE) harness-down
+	@rc=0; \
+	$(MAKE) test-all && $(MAKE) image && \
+	  $(MAKE) rehearse CONFIG=config.example.yaml IMAGE_TAG=local || rc=$$?; \
+	$(if $(KEEP_HARNESS),echo "KEEP_HARNESS set: harness left running";,$(MAKE) harness-down;) \
+	exit $$rc
