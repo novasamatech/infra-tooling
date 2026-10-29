@@ -4,17 +4,22 @@
 """Adaptive fetching against a fake API with actual half-open time filtering."""
 
 import json
-import re
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 
 import pytest
 from conftest import (
     ALL_FIELDS,
     SELECTION,
+    aggregating_responder,
+    event,
     eyeball_only,
     graphql_error,
     json_response,
+    page_calls,
+    reads,
     requests_group,
+    selections,
     visits_group,
 )
 from prometheus_client import generate_latest
@@ -49,13 +54,12 @@ def traffic(cloudflare):
                 visits = sum(counts.values()) if cloudflare.zones["z"].get("visits_enabled") else 0
                 node[kind] = [{"count": sum(counts.values()), "sum": {"visits": visits}}]
             elif kind == "visits":
-                node[kind] = (
-                    [visits_group(count, clientRequestPath=path) for path, count in ranked][
-                        : body["variables"]["limit"]
-                    ]
-                    if cloudflare.zones["z"].get("visits_enabled")
-                    else []
-                )
+                # Like the API, requests without visits are groups with zero visits.
+                visits = cloudflare.zones["z"].get("visits_enabled")
+                node[kind] = [
+                    visits_group(count if visits else 0, clientRequestPath=path)
+                    for path, count in ranked
+                ][: body["variables"]["limit"]]
             else:
                 status = {"edgeResponseStatus": 200} if kind == "edge" else {}
                 node[kind] = [
@@ -71,6 +75,12 @@ def traffic(cloudflare):
 
 def paths(samples, label_names):
     return {key[label_names.index("path")]: value for key, value in samples.items()}
+
+
+def hinted_leaves(api, zone_id, kind):
+    """Leaf slices of the last successful collection, remembered for the next cycle."""
+    _, starts = api.slice_hints[(zone_id, kind)]
+    return len(starts) + 1
 
 
 def test_split_merge_and_half_open_boundaries(traffic, api):
@@ -93,8 +103,8 @@ def test_split_merge_and_half_open_boundaries(traffic, api):
 
 def test_hint_avoids_full_day_retry_and_resets_at_midnight(traffic, api):
     script.collect_zone(api, "z", "example.org", START, END)
-    assert api.slice_hints[("z", "requests")] == 4
-    assert api.slice_hints[("z", "edge")] == 4
+    assert hinted_leaves(api, "z", "requests") == 4
+    assert hinted_leaves(api, "z", "edge") == 4
     traffic.graphql_calls.clear()
     script.collect_zone(api, "z", "example.org", START, END)
     assert len(traffic.data_calls()) == 5
@@ -104,8 +114,8 @@ def test_hint_avoids_full_day_retry_and_resets_at_midnight(traffic, api):
     traffic.graphql_calls.clear()
     script.collect_zone(api, "z", "example.org", START + timedelta(days=1), END + timedelta(days=1))
     assert len(traffic.data_calls()) == 1
-    assert api.slice_hints[("z", "requests")] == 1
-    assert api.slice_hints[("z", "edge")] == 1
+    assert hinted_leaves(api, "z", "requests") == 1
+    assert hinted_leaves(api, "z", "edge") == 1
 
 
 def test_eyeball_filter_is_applied_to_every_edge_slice(traffic, api):
@@ -131,7 +141,7 @@ def test_eyeball_filter_is_applied_to_every_edge_slice(traffic, api):
     ]
     assert len({since for since, _ in edge}) > 1
     assert all('requestSource: "eyeball"' in filters for _, filters in edge)
-    assert api.slice_hints[("z", "edge")] > 1
+    assert hinted_leaves(api, "z", "edge") > 1
     # A hinted cycle starts with slices that keep the filter as well.
     traffic.graphql_calls.clear()
     assert script.collect_zone(api, "z", "example.org", START, END).edge == result.edge
@@ -151,7 +161,8 @@ def test_positive_visits_are_split_and_summed(traffic, api):
     assert result.limited["visits"] == 0
 
 
-def test_recursive_full_slice_stops_at_one_minute(traffic, api):
+def test_configured_minimum_slice_stops_splitting(traffic, api, caplog):
+    api.min_slice_seconds = 60
     traffic.zones["z"]["events"] = [(0, "/a", 5), (10, "/b", 3), (20, "/c", 1)]
     result = script.collect_zone(api, "z", "example.org", START, END)
     assert paths(result.requests, script.REQUESTS_LABELS) == {"/a": 5, "/b": 3}
@@ -159,6 +170,7 @@ def test_recursive_full_slice_stops_at_one_minute(traffic, api):
     assert result.limited["requests"] == result.limited["cache"] == 1
     assert paths(result.edge, script.EDGE_LABELS) == {"/a": 5, "/b": 3}
     assert result.limited["edge"] == 1
+    assert "configured minimum slice of 60s" in caplog.text
     durations = [
         (
             datetime.fromisoformat(call["variables"]["until"])
@@ -174,9 +186,9 @@ def requests_calls(cloudflare):
     return [call for call in cloudflare.data_calls() if "requests:" in call["query"]]
 
 
-def test_slice_budget_bounds_requests_and_reports_truncation(traffic, api, monkeypatch, caplog):
+def test_slice_budget_bounds_requests_and_reports_truncation(traffic, api, caplog):
     # /x is lost once the budget forbids splitting the full first half.
-    monkeypatch.setattr(script, "MAX_SLICE_REQUESTS", 3)
+    api.max_slice_requests = 3
     traffic.zones["z"]["events"] = [
         (0, "/a", 2),
         (10, "/x", 1),
@@ -191,17 +203,26 @@ def test_slice_budget_bounds_requests_and_reports_truncation(traffic, api, monke
     assert result.total_requests == 15
     assert result.limited["requests"] == result.limited["cache"] == 1
     assert result.limited["edge"] == 1
-    assert "slice budget" in caplog.text
-    assert api.slice_hints[("z", "requests")] == 2
-    assert api.slice_hints[("z", "edge")] == 2
+    assert "dataset slice budget; dataset reads left: 0" in caplog.text
+    assert hinted_leaves(api, "z", "requests") == 2
+    assert hinted_leaves(api, "z", "edge") == 2
 
 
-def test_slice_hint_is_capped_by_budget(traffic, api, monkeypatch):
-    monkeypatch.setattr(script, "MAX_SLICE_REQUESTS", 3)
-    api.hint_day = START
-    api.slice_hints[("z", "requests")] = 100
+def test_slice_hint_is_capped_by_budget_keeping_its_boundaries(traffic, api):
+    traffic.zones["z"]["events"] = [(second, f"/{second}", 1) for second in range(0, 240, 10)]
     script.collect_zone(api, "z", "example.org", START, END)
-    assert len(requests_calls(traffic)) == 3
+    _, starts = api.slice_hints[("z", "requests")]
+    assert len(starts) > 3
+    traffic.graphql_calls.clear()
+    api.max_slice_requests = 3
+    script.collect_zone(api, "z", "example.org", START, END)
+    calls = requests_calls(traffic)
+    assert len(calls) == 3
+    # Coarser slices merge neighbouring leaves rather than cutting anew.
+    bounds = {START, END, *starts}
+    for call in calls:
+        assert datetime.fromisoformat(call["variables"]["since"]) in bounds
+        assert datetime.fromisoformat(call["variables"]["until"]) in bounds
 
 
 def test_partial_minute_tail_is_not_lost(traffic, api):
@@ -213,12 +234,41 @@ def test_partial_minute_tail_is_not_lost(traffic, api):
     assert result.limited["edge"] == 0
 
 
+@pytest.mark.parametrize("field, name", script.LIMITS.items())
 @pytest.mark.parametrize("value", [None, "", "0", " 0 ", "15000"])
-def test_group_limit_configuration(value):
+def test_limit_configuration(field, name, value):
     env = {"CF_EXPORTER_API_TOKEN": "dummy"}
     if value is not None:
-        env["CF_EXPORTER_GROUP_LIMIT"] = value
-    assert script.parse_env(env).group_limit == (15000 if value == "15000" else 0)
+        env[name] = value
+    config = script.parse_env(env)
+    expected = 15000 if value == "15000" else 0
+    assert getattr(config, field) == expected
+    # Only the configured option is set; zero is no limit, not a small one.
+    assert all(getattr(config, other) == 0 for other in script.LIMITS if other != field)
+    api = script.create_api(config)
+    if field == "max_retry_after_seconds":
+        retry = api.session.get_adapter("https://api.cloudflare.com").max_retries
+        assert retry.max_retry_after == (expected or None)
+        assert retry.new().max_retry_after == (expected or None)
+    else:
+        assert getattr(api, field) == expected
+    shared = expected or None if field == "max_extra_selections" else None
+    assert api.slice_allowance == shared
+
+
+def test_defaults_impose_no_limit_of_the_exporter():
+    api = script.create_api(script.parse_env({"CF_EXPORTER_API_TOKEN": "dummy"}))
+    retry = api.session.get_adapter("https://api.cloudflare.com").max_retries
+    assert retry.max_retry_after is None
+    assert api.slice_allowance is None
+    assert (api.group_limit, api.max_slice_requests, api.min_slice_seconds, api.page_size) == (
+        0,
+        0,
+        0,
+        0,
+    )
+    api.start_cycle()
+    assert api.slice_allowance is None
 
 
 def test_limit_below_page_size_uses_one_query(traffic, api, caplog):
@@ -271,7 +321,8 @@ def test_zero_visits_tail_is_complete_and_not_split(cloudflare, api, caplog):
     assert not caplog.text
 
 
-def test_full_minute_retains_page_and_reports_truncation(cloudflare, api, caplog):
+def test_full_minimum_slice_retains_page_and_reports_truncation(cloudflare, api, caplog):
+    api.min_slice_seconds = 60
     cloudflare.add_zone(
         "z",
         "example.org",
@@ -285,8 +336,8 @@ def test_full_minute_retains_page_and_reports_truncation(cloudflare, api, caplog
     result = script.collect_zone(api, "z", "example.org", START, START + timedelta(seconds=60))
     assert paths(result.requests, script.REQUESTS_LABELS) == {"/a": 5, "/b": 3}
     assert result.limited["requests"] == 1
-    assert len(cloudflare.data_calls()) == 1
-    assert "60s slice" in caplog.text
+    assert len(page_calls(cloudflare)) == 1
+    assert "configured minimum slice of 60s" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -332,9 +383,9 @@ def test_cap_equal_to_the_page_size_is_reported_conservatively(cloudflare, api, 
     assert "configured cap" in caplog.text
 
 
-def test_current_day_total_drift_does_not_clear_a_real_cut(traffic, api, monkeypatch):
+def test_current_day_total_drift_does_not_clear_a_real_cut(traffic, api):
     # A later total that happens to equal the cut sum must not hide the cut.
-    monkeypatch.setattr(script, "MAX_SLICE_REQUESTS", 3)
+    api.max_slice_requests = 3
     traffic.zones["z"]["events"] = [(0, "/a", 2), (10, "/x", 1), (60, "/b", 3), (120, "/a", 5)]
     original = traffic.zones["z"]["responder"]
 
@@ -352,27 +403,40 @@ def test_current_day_total_drift_does_not_clear_a_real_cut(traffic, api, monkeyp
     assert result.limited["requests"] == 1
 
 
-def test_cycle_budget_is_shared_by_all_zones(traffic, api, caplog):
+def extra_selections(cloudflare):
+    """Dataset selections beyond one per zone and dataset; settings and totals excluded."""
+    reads = [
+        (call["variables"]["zoneTag"], kind)
+        for call in cloudflare.data_calls()
+        for kind, _ in SELECTION.findall(call["query"])
+        if kind != "totals"
+    ]
+    return len(reads) - len(set(reads))
+
+
+def test_shared_extra_selections_are_a_per_cycle_budget_of_all_zones(traffic, api, caplog):
     traffic.add_zone("y", "example.net", max_page_size=2, responder=traffic.zones["z"]["responder"])
-    api.query_budget = 2 * script.BASELINE_SELECTIONS + 2
+    # Exactly what the first zone needs: three splits of requests, cache and edge.
+    api.max_extra_selections = 18
     snapshot = script.collect_once(api, now=END)
-    selections = sum(
-        len(re.findall(r"httpRequestsAdaptiveGroups\(", call["query"]))
-        + ("settings" in call["query"])
-        for call in traffic.graphql_calls
-    )
-    assert selections <= api.query_budget
+    assert extra_selections(traffic) == 18
     assert snapshot.zone_success == {"example.org": 1, "example.net": 1}
+    assert {kind: snapshot.limited[("example.org", kind)] for kind in script.DATASETS} == {
+        kind: 0 for kind in script.DATASETS
+    }
     # The second zone found no budget left for slicing and reports the cut.
     assert snapshot.limited[("example.net", "requests")] == 1
     assert snapshot.limited[("example.net", "edge")] == 1
-    assert "slice budget" in caplog.text
-
-
-def test_cycle_query_budget_scales_with_the_interval():
-    assert script.cycle_query_budget(300) == 200
-    assert script.cycle_query_budget(3600) == 200
-    assert script.cycle_query_budget(60) == 40
+    assert snapshot.limited[("example.net", "visits")] == 0
+    assert (
+        "shared slice budget; dataset reads left: unlimited, shared extra selections left: 0"
+        in (caplog.text)
+    )
+    # The budget is renewed every cycle; hinted slices use less of it than splits.
+    traffic.graphql_calls.clear()
+    snapshot = script.collect_once(api, now=END)
+    assert extra_selections(traffic) <= 18
+    assert snapshot.limited[("example.org", "requests")] == 0
 
 
 def test_failure_in_child_discards_entire_zone(traffic, api):
@@ -569,7 +633,331 @@ def test_new_metrics_and_midnight_omission(traffic, api, registry, monkeypatch):
 
 
 def test_totals_only_query_has_no_unused_limit():
-    query = script.build_analytics_query([], [], [], datasets=("totals",))
+    query = script.build_analytics_query({}, datasets=("totals",))
     assert "$limit" not in query
     assert "limit: 1" in query
     assert "dimensions" not in query
+
+
+# ------------------------------------------- slices, budgets and hints ------
+
+
+@pytest.mark.parametrize("seconds", [1, 2, 3, 59, 60, 61, 119, 3601, 86400])
+@pytest.mark.parametrize("count", [1, 2, 3, 7, 1000, 100000])
+@pytest.mark.parametrize("step", [1, 60])
+def test_windows_are_disjoint_whole_seconds_covering_the_window(seconds, count, step):
+    windows = script._windows(START, START + timedelta(seconds=seconds), count, step)
+    assert 1 <= len(windows) <= min(count, -(-seconds // step))
+    assert windows[0][0] == START
+    assert windows[-1][1] == START + timedelta(seconds=seconds)
+    for (start, end), following in zip(windows, [*windows[1:], None], strict=True):
+        assert start < end
+        assert (end - start).total_seconds().is_integer()
+        if following is not None:
+            assert following[0] == end
+            # Only the trailing slice may be shorter than the step.
+            assert (end - START).total_seconds() % step == 0
+
+
+def test_empty_window_has_no_slices():
+    assert script._windows(START, START, 5) == []
+
+
+def test_coarsened_slices_keep_existing_boundaries():
+    edges = [START + timedelta(seconds=second) for second in (0, 10, 20, 30, 40, 50)]
+    assert script._coarsen(edges, 2) == [(edges[0], edges[2]), (edges[2], edges[5])]
+    assert script._coarsen(edges, 9) == list(pairwise(edges))
+    assert script._coarsen(edges, 1) == [(edges[0], edges[5])]
+
+
+def test_default_slices_reach_one_second_without_truncation(cloudflare, api, caplog):
+    # Four groups within four seconds, two per page: the old 60s minimum cut them.
+    events = [event(second, 1, clientRequestPath=f"/{second}") for second in range(4)]
+    cloudflare.add_zone(
+        "z", "example.org", max_page_size=2, responder=aggregating_responder(events, START)
+    )
+    result = script.collect_zone(api, "z", "example.org", START, START + timedelta(minutes=4))
+    assert len(result.requests) == 4
+    assert sum(result.requests.values()) == result.total_requests == 4
+    assert result.limited == dict.fromkeys(script.DATASETS, 0)
+    assert "full page" not in caplog.text
+
+
+def test_full_one_second_slice_is_reported_and_not_split_again(cloudflare, api, caplog):
+    # Three query strings in one second; only the requests dataset groups by them.
+    events = [event(5, 1, clientRequestQuery=f"?{query}") for query in range(3)]
+    cloudflare.add_zone(
+        "z", "example.org", max_page_size=2, responder=aggregating_responder(events, START)
+    )
+    result = script.collect_zone(api, "z", "example.org", START, START + timedelta(minutes=4))
+    assert result.limited == {"visits": 0, "requests": 1, "cache": 0, "edge": 0}
+    assert len(result.requests) == 2
+    # Halving 240 s reaches one second after eight levels: two reads per level,
+    # and one check of the empty half.
+    assert reads(cloudflare, "requests") <= 1 + 2 * 8
+    assert reads(cloudflare, "requests", checks=True) <= 8
+    assert "returned a full page of 2 groups that was not split" in caplog.text
+    assert "(1s slice at the time resolution; dataset reads left: unlimited" in caplog.text
+
+
+# A burst of distinct paths in ten minutes of an otherwise quiet day.
+BURST = [event(3600 + second, 1, clientRequestPath=f"/{second}") for second in range(0, 600, 3)]
+BURST_END = START + timedelta(hours=2)
+
+
+@pytest.fixture
+def burst(cloudflare):
+    cloudflare.add_zone(
+        "z", "example.org", max_page_size=4, responder=aggregating_responder(BURST, START)
+    )
+    return cloudflare
+
+
+def test_burst_needing_many_reads_is_complete_without_own_limits(burst, api, caplog):
+    result = script.collect_zone(api, "z", "example.org", START, BURST_END)
+    assert reads(burst, "requests") > 32
+    assert len(result.requests) == len(BURST)
+    assert sum(result.requests.values()) == result.total_requests == len(BURST)
+    assert result.limited == dict.fromkeys(script.DATASETS, 0)
+    assert "group limit" not in caplog.text and "full page" not in caplog.text
+
+
+@pytest.mark.parametrize("budgeted", [False, True])
+def test_repeated_burst_window_reuses_its_partition(burst, api, caplog, budgeted):
+    """Regression: hints kept only the number of leaves and re-cut the day evenly,
+    so an unchanged burst window first completed and then became truncated."""
+    script.collect_zone(api, "z", "example.org", START, BURST_END)
+    first = reads(burst, "requests")
+    if budgeted:
+        # Exactly what the cold cycle needed, parent pages included.
+        api.max_slice_requests = first
+    counts = []
+    for _ in range(3):
+        burst.graphql_calls.clear()
+        result = script.collect_zone(api, "z", "example.org", START, BURST_END)
+        counts.append(reads(burst, "requests"))
+        assert result.limited == dict.fromkeys(script.DATASETS, 0)
+        assert len(result.requests) == len(BURST)
+    # Warm cycles read each remembered leaf once, without parents or new splits.
+    assert counts == [hinted_leaves(api, "z", "requests")] * 3
+    assert reads(burst, "requests", checks=True) == reads(burst, "cache", checks=True)
+    assert counts[0] < first
+    assert "full page" not in caplog.text
+
+
+def test_growing_window_extends_the_last_slice_and_refetches_old_ones(burst, api):
+    script.collect_zone(api, "z", "example.org", START, BURST_END)
+    _, starts = api.slice_hints[("z", "requests")]
+    for minutes in (5, 10, 15):
+        burst.graphql_calls.clear()
+        result = script.collect_zone(
+            api, "z", "example.org", START, BURST_END + timedelta(minutes=minutes)
+        )
+        assert result.limited == dict.fromkeys(script.DATASETS, 0)
+        # The same leaves, with only the last one longer: no extra tail slice.
+        assert api.slice_hints[("z", "requests")][1] == starts
+        assert reads(burst, "requests") == len(starts) + 1
+        windows = {
+            (call["variables"]["since"], call["variables"]["until"])
+            for call in burst.data_calls()
+            if "requests:" in call["query"]
+        }
+        assert (script.rfc3339(START), script.rfc3339(starts[0])) in windows
+        assert max(until for _, until in windows) == script.rfc3339(
+            BURST_END + timedelta(minutes=minutes)
+        )
+
+
+def test_partition_is_not_reused_for_other_dimensions(burst, api):
+    script.collect_zone(api, "z", "example.org", START, BURST_END)
+    burst.graphql_calls.clear()
+    api.schema = script.Schema({"cf_requests": frozenset({"path"})})
+    result = script.collect_zone(api, "z", "example.org", START, BURST_END)
+    assert reads(burst, "requests") == 1
+    assert sum(result.requests.values()) == len(BURST)
+    assert api.slice_hints[("z", "requests")][1] == ()
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "reason"),
+    [
+        ("max_slice_requests", 3, "dataset slice budget; dataset reads left: 0"),
+        ("max_extra_selections", 2, "shared slice budget; dataset reads left: unlimited"),
+        ("min_slice_seconds", 3600, "configured minimum slice of 3600s"),
+        ("group_limit", 3, "hit the 3 group limit (configured cap)"),
+    ],
+)
+def test_explicit_limits_report_their_reason_only_for_the_cut_dataset(
+    cloudflare, api, caplog, option, value, reason
+):
+    # Only the requests dataset groups by query, so only it has many groups.
+    events = [event(3600 + second, 1, clientRequestQuery=f"?{second}") for second in range(20)]
+    cloudflare.add_zone(
+        "z", "example.org", max_page_size=4, responder=aggregating_responder(events, START)
+    )
+    setattr(api, option, value)
+    api.start_cycle()
+    result = script.collect_zone(api, "z", "example.org", START, BURST_END)
+    assert result.limited == {"visits": 0, "requests": 1, "cache": 0, "edge": 0}
+    assert sum(result.cache.values()) == result.total_requests == 20
+    assert sum(result.requests.values()) < 20
+    assert reason in caplog.text
+    assert caplog.text.count("Zone example.org:") == 1
+
+
+@pytest.mark.parametrize(("configured", "expected"), [(0, 4), (3, 3), (50, 4)])
+def test_page_size_option_never_exceeds_the_plan(burst, api, configured, expected):
+    api.page_size = configured
+    script.collect_zone(api, "z", "example.org", START, BURST_END)
+    assert {call["variables"]["limit"] for call in page_calls(burst)} == {expected}
+
+
+def blind(events, windows, kind="requests"):
+    """Like the API at times: an empty page for a window with traffic, repeated
+    for that window and the dataset's dimensions, while the dimensionless read
+    of the same window and its halves are correct."""
+    respond = aggregating_responder(events, START)
+
+    def blinded(body):
+        status, headers, payload = respond(body)
+        data = json.loads(payload)
+        window = (body["variables"]["since"], body["variables"]["until"])
+        for alias, _, dimensions in selections(body["query"]):
+            if alias == kind and dimensions and window in windows:
+                data["data"]["viewer"]["zones"][0][alias] = []
+        return status, headers, json.dumps(data)
+
+    return blinded
+
+
+def dimensionless_reads(cloudflare, kind="requests"):
+    return [
+        (call["variables"]["since"], call["variables"]["until"])
+        for call in cloudflare.data_calls()
+        for alias, _, dimensions in selections(call["query"])
+        if alias == kind and not dimensions
+    ]
+
+
+def window(start, end):
+    return script.rfc3339(START + timedelta(seconds=start)), script.rfc3339(
+        START + timedelta(seconds=end)
+    )
+
+
+EVENTS = [event(second, 1, clientRequestPath=f"/{second % 7}") for second in range(0, 240, 5)]
+
+
+def test_empty_page_hiding_traffic_is_split_and_recovered(cloudflare, api, caplog):
+    cloudflare.add_zone("z", "example.org", responder=blind(EVENTS, {window(0, 240)}))
+    result = script.collect_zone(api, "z", "example.org", START, END)
+    assert sum(result.requests.values()) == result.total_requests == len(EVENTS)
+    assert paths(result.requests, script.REQUESTS_LABELS) == paths(
+        result.cache, script.CACHE_LABELS
+    )
+    assert result.limited == dict.fromkeys(script.DATASETS, 0)
+    # Check this same window independently: the day total can differ from pages.
+    assert dimensionless_reads(cloudflare) == [window(0, 240)]
+    assert hinted_leaves(api, "z", "requests") == 2
+    # The next cycle reads the halves directly: the blind window is not reused.
+    cloudflare.graphql_calls.clear()
+    result = script.collect_zone(api, "z", "example.org", START, END)
+    assert sum(result.requests.values()) == len(EVENTS)
+    assert not dimensionless_reads(cloudflare)
+    assert "empty page" not in caplog.text
+
+
+def test_unsplittable_empty_page_with_traffic_is_reported(cloudflare, api, caplog):
+    events = [event(5, 3)]
+    blinded = {window(0, 240), window(0, 120), window(0, 60), window(0, 30), window(0, 15)}
+    blinded |= {window(0, 7), window(3, 7), window(5, 7), window(5, 6)}
+    cloudflare.add_zone("z", "example.org", responder=blind(events, blinded))
+    result = script.collect_zone(api, "z", "example.org", START, END)
+    assert result.requests == {}
+    assert result.limited == {"visits": 0, "requests": 1, "cache": 0, "edge": 0}
+    assert sum(result.cache.values()) == result.total_requests == 3
+    assert (
+        "requests returned an empty page for a window with traffic that was not split "
+        "(1s slice at the time resolution" in caplog.text
+    )
+
+
+def test_empty_page_under_a_configured_cap_is_reported(cloudflare, api, caplog):
+    cloudflare.add_zone("z", "example.org", responder=blind(EVENTS, {window(0, 240)}))
+    api.group_limit = 100
+    result = script.collect_zone(api, "z", "example.org", START, END)
+    assert result.limited["requests"] == 1
+    assert "returned an empty page for a window with traffic (configured cap, one query)" in (
+        caplog.text
+    )
+
+
+def test_genuinely_empty_slices_cost_one_dimensionless_request_each(cloudflare, api):
+    # Traffic only in three seconds: every split leaves an empty half.
+    events = [event(120 + second, 1, clientRequestPath=f"/{second}") for second in range(3)]
+    cloudflare.add_zone(
+        "z", "example.org", max_page_size=2, responder=aggregating_responder(events, START)
+    )
+    result = script.collect_zone(api, "z", "example.org", START, END)
+    assert result.limited == dict.fromkeys(script.DATASETS, 0)
+    assert sum(result.requests.values()) == 3
+    checks = [call for call in cloudflare.data_calls() if call not in page_calls(cloudflare)]
+    windows = [(call["variables"]["since"], call["variables"]["until"]) for call in checks]
+    assert checks and len(set(windows)) == len(windows)
+    # The datasets of an empty window are checked together in one request.
+    for call in checks:
+        assert {alias for alias, _, _ in selections(call["query"])} == set(script.DATASETS)
+    _, starts = api.slice_hints[("z", "requests")]
+    assert len(windows) < len(starts) + 1
+
+
+def test_zone_without_traffic_needs_no_check(cloudflare, api):
+    cloudflare.add_zone("z", "example.org", responder=aggregating_responder([], START))
+    result = script.collect_zone(api, "z", "example.org", START, END)
+    assert result.limited == dict.fromkeys(script.DATASETS, 0)
+    assert len(cloudflare.data_calls()) == 1
+
+
+def test_check_of_empty_pages_counts_against_explicit_budgets(cloudflare, api):
+    # The edge filter's scope differs from the already-fetched unfiltered totals.
+    cloudflare.add_zone("z", "example.org", responder=blind(EVENTS, {window(0, 240)}, "edge"))
+    api.max_slice_requests = 1
+    result = script.collect_zone(api, "z", "example.org", START, END)
+    # Without budget for the check, completeness cannot be established.
+    assert not dimensionless_reads(cloudflare, "edge")
+    assert result.edge == {}
+    assert result.limited["edge"] == 1
+    cloudflare.graphql_calls.clear()
+    api.max_slice_requests = 2
+    result = script.collect_zone(api, "z", "example.org", START, END)
+    # The check fits, the split does not: the hidden traffic is reported.
+    assert dimensionless_reads(cloudflare, "edge") == [window(0, 240)]
+    assert result.limited["edge"] == 1
+
+
+def test_exhausted_shared_budget_cannot_certify_an_empty_page(cloudflare, api, caplog):
+    cloudflare.add_zone("z", "example.org", responder=blind(EVENTS, {window(0, 240)}, "edge"))
+    # A previous dataset or zone spent this cycle's optional extra budget.
+    api.slice_allowance = 0
+    result = script.collect_zone(api, "z", "example.org", START, END)
+    assert not dimensionless_reads(cloudflare, "edge")
+    assert result.edge == {}
+    assert result.limited == {"visits": 0, "requests": 0, "cache": 0, "edge": 1}
+    assert "empty page" in caplog.text
+    assert "shared" in caplog.text
+
+
+def test_zero_visits_total_does_not_need_a_check_or_report_a_cut(cloudflare, api):
+    cloudflare.add_zone(
+        "z",
+        "example.org",
+        requests=[requests_group(7)],
+        cache=[requests_group(7)],
+        edge=[requests_group(7, edgeResponseStatus=200)],
+        totals=[{"count": 7, "sum": {"visits": 0}}],
+    )
+    api.max_slice_requests = 1
+    result = script.collect_zone(api, "z", "example.org", START, END)
+    assert result.visits == {}
+    assert not dimensionless_reads(cloudflare, "visits")
+    assert result.limited == dict.fromkeys(script.DATASETS, 0)

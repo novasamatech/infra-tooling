@@ -18,7 +18,9 @@ cloudflare-exporter; establish which service produced an error before fixing it.
 | [pyproject.toml](pyproject.toml) | Pytest, coverage and Ruff configuration |
 | [tests/conftest.py](tests/conftest.py) | Fake Cloudflare responses and shared fixtures |
 | [tests/test_script.py](tests/test_script.py) | Offline regression tests, including localhost transport checks |
-| [tests/test_slicing.py](tests/test_slicing.py) | Time-filtered slicing, caps, totals and midnight regressions |
+| [tests/test_slicing.py](tests/test_slicing.py) | Time-filtered slicing, optional limits, slice hints, totals and midnight regressions |
+| [tests/test_labels.py](tests/test_labels.py) | Per-metric label configuration in queries, aggregation and the exposition |
+| [tests/test_profile.py](tests/test_profile.py) | Profiling argument validation, historical sum checks and validation memory |
 | [tests/test_windows.py](tests/test_windows.py) | Snapshot window contract and actual Prometheus rendering |
 | [tests/test_edge.py](tests/test_edge.py) | Client-facing edge dataset, its filter and dataset availability |
 | [tests/test_readiness.py](tests/test_readiness.py) | Readiness reasons, failure recovery, freshness, midnight refill and concurrent HTTP checks |
@@ -66,7 +68,10 @@ repository root. All development commands run in a Python 3.13 Alpine container.
 | `make profile-live` | Live cycle, memory and exposition measurements (`PROFILE_ARGS`) |
 | `make clean` | Remove caches, test output and all local dev images |
 
-For live checks, ask the operator to provide any missing execution configuration.
+Settings such as limits and disabled labels reach `run`, live, profiling and
+image targets from the environment by name; live tests and the profiler build
+the client with `script.create_api(script.parse_env())`. For live checks, ask the
+operator to provide any missing execution configuration.
 If a required check cannot run, report that explicitly. Override `PORT` when the
 default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
 
@@ -74,6 +79,14 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
 
 - Preserve public metric names and label names/order unless the operator requests
   a breaking change. `cf_visits` and `cf_requests` are gauges, not counters.
+- Export every label by default. `CF_EXPORTER_DISABLED_LABELS` disables labels
+  per analytics metric: a disabled label is absent from the exposition and its
+  dimension from that metric's query, so Cloudflare aggregates before paging.
+  Keep the catalog (`METRIC_LABELS`, `DATASETS`) separate from an instance's
+  `Schema`, render a snapshot with its own schema, and reject unknown metrics,
+  labels and malformed JSON at startup. Without `zone_name`, zones are still
+  collected and capped separately and their identical label sets are summed.
+  Never disable labels automatically or ship deployment-specific choices.
 - Use one UTC window per cycle, from midnight to the cycle start, formatted as
   RFC3339 with `Z`. Handle an empty window at midnight without an invalid query.
 - Use current, non-deprecated Cloudflare APIs. Keep the live schema checks aligned
@@ -83,26 +96,39 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
 - Use GraphQL variables and aliased analytics selections for visits, requests,
   cache, edge and dimensionless totals. Settings use a separate HTTP request. Sliced
   retries use additional requests for only the full selections.
-- Export all nonzero groups by default with disjoint, half-open time slices.
-  Reuse slice-count hints per zone/selection until UTC midnight; a failed slice
-  fails that zone. Stop at 60s (a trailing partial minute can be shorter) or when
-  slicing would exceed the cycle's GraphQL budget: `cycle_query_budget()`, shared
-  by all zones after each zone's `BASELINE_SELECTIONS`, plus `MAX_SLICE_REQUESTS`
-  per selection and zone. Count selections, not HTTP requests, as Cloudflare does.
-  Expose residual truncation and support the optional `CF_EXPORTER_GROUP_LIMIT`.
+- Export all nonzero groups by default with disjoint, half-open, whole-second
+  time slices, down to one second, using the plan's `maxPageSize`. The exporter
+  has no own limit by default; every limit in `LIMITS` is optional, `0` meaning
+  none, and is never derived from a quota, replica count or interval. Represent
+  unlimited as `None` internally, never as a large number. Budgets count
+  selections, not HTTP requests; they do not measure the token's external quota.
+- Remember the successful leaf slice boundaries per zone/dataset with the query
+  signature until UTC midnight. Reuse them in the next cycle, extend the last
+  slice for a grown window and fetch every slice again; never re-cut the day
+  evenly. A failed slice fails that zone and publishes no hints. Expose residual
+  truncation per dataset with its reason and the remaining budgets.
+- Never take an empty page as proof of no traffic while the matching whole-window
+  total has traffic: check it with one dimensionless read of the same window and
+  filter (budgeted like other reads) and split a window that has traffic. If an
+  explicit budget prevents the check, mark that dataset incomplete. Visits use
+  the visits total, not the request total, to decide whether checks are needed.
+  A dimensionless selection has at most one group: a page size of one cannot
+  truncate it and must not trigger slicing by itself.
 - Keep cache metrics dynamic across all hosts, including `origin_response_status`.
   Keep dimensionless zone totals and per-dataset group/truncation metrics aligned.
 - Restrict only the edge dataset (`cf_edge_requests`) to client requests with
   `EYEBALL_FILTER`, in its first selection and every slice; the other datasets and
   zone totals keep every request source. Never compare edge sums with unfiltered
-  totals, and fetch no production client total. Keep both edge and origin status;
+  totals, and fetch no unconditional production client total. Dimensionless checks
+  of empty edge pages keep the same client filter. Keep both edge and origin status;
   an edge status is never `unknown`, and origin `0` never stands in for it.
   Validate edge dimensions even in zero-valued groups and discarded probe/parent
   pages; status values must match the API's unsigned 16-bit integer type.
   Keep strict type policies dataset-scoped (`DIMENSION_TYPES`) so shared field
   names do not silently change older families' label conversion.
   Validation totals must not reuse the production filter constant as their oracle.
-- Decide dataset support from `availableFields` (`DATASET_FIELDS`). An unsupported
+- Decide dataset support from `availableFields`: the filter's `FILTER_FIELDS`
+  always, `REQUIRED_DIMENSIONS` only while their label is exported. An unsupported
   dataset is not queried, reports `cf_exporter_dataset_available` `0` without
   group or truncation series, logs a warning and leaves the zone successful. An
   API error is never taken as missing support.
@@ -137,9 +163,10 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
   Keep `API_ERRORS` fixed, exported from zero and mirrored in `image_smoke.py`.
   Labels never carry URLs, messages, zone names or credentials. Only `main()`
   registers `APIStats`.
-- Never wait longer than `MAX_RETRY_AFTER_SECONDS` for a `Retry-After`. After an
-  HTTP 429 or a GraphQL budget error, skip the cycle's remaining zones and report
-  them as failed.
+- Wait for any `Retry-After` unless `CF_EXPORTER_MAX_RETRY_AFTER_SECONDS` is set;
+  `BoundedRetry.new()` must carry the maximum to every attempt. After an HTTP 429
+  or a GraphQL budget error, skip the cycle's remaining zones and report them as
+  failed. Cycles never overlap.
 - Move the last cycle before UTC midnight earlier when it would not finish
   `DAY_CLOSE_MARGIN_SECONDS` before midnight; never publish a finished day after it.
 - Use monotonic time for durations and scheduling. Preserve clean signal exits.

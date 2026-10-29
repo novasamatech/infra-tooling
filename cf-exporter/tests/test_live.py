@@ -9,6 +9,7 @@ Run with `make test-live`. They need CF_EXPORTER_API_TOKEN in the environment
 token is only ever read from the environment; tests never print it.
 """
 
+import dataclasses
 import os
 import re
 import signal
@@ -25,13 +26,19 @@ from pathlib import Path
 import pytest
 from image_smoke import (
     WINDOW_TYPE_LINE,
+    checked_analytics_labels,
     checked_api_counters,
     checked_edge_family,
     checked_snapshot_windows,
     expected_readiness,
     readiness_status,
 )
-from profile_live import expected_totals, request_sources, source_filter_valid
+from profile_live import (
+    expected_totals,
+    request_sources,
+    source_filter_valid,
+    source_value_present,
+)
 from prometheus_client import generate_latest
 
 import script
@@ -66,8 +73,18 @@ fragment TypeRef on __Type {
 
 
 @pytest.fixture(scope="module")
-def api():
-    return script.CloudflareAPI(API_TOKEN, request_timeout=60)
+def config():
+    """The configuration the exporter process would use, including its options."""
+    return script.parse_env()
+
+
+@pytest.fixture(scope="module")
+def api(config):
+    client = script.create_api(config)
+    try:
+        yield client
+    finally:
+        client.session.close()
 
 
 @pytest.fixture(scope="module")
@@ -103,7 +120,11 @@ DAY_FAMILIES = (
 )
 
 
-def assert_day_families(text, cycle_start):
+def expected_labels(schema):
+    return {name: frozenset(schema.labels(name)) for name in script.METRIC_LABELS}
+
+
+def assert_day_families(text, cycle_start, schema):
     """Require the day-scoped families unless the UTC day changed after the cycle
     started; the exporter omits them then by design."""
     window_present = WINDOW_TYPE_LINE in text
@@ -111,7 +132,9 @@ def assert_day_families(text, cycle_start):
         for name in DAY_FAMILIES:
             assert f"# TYPE {name} gauge" in text
         checked_snapshot_windows(text)
-        checked_edge_family(text)
+        labels = expected_labels(schema)
+        checked_edge_family(text, labels["cf_edge_requests"])
+        checked_analytics_labels(text, labels)
     else:
         assert all(f"# TYPE {name} gauge" not in text for name in DAY_FAMILIES)
 
@@ -184,43 +207,107 @@ def test_queried_graphql_schema_is_current(api):
         assert type_name(current(dimensions, status)["type"]) == "uint16"
 
 
-def test_every_zone_is_collected(api, zones):
+def completed_day():
     # Use a completed day for exact sums: fresh analytics can still be ingested
     # while separate slice requests are being served.
     until = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-    since = until - timedelta(days=1)
+    return until - timedelta(days=1), until
+
+
+def assert_sums_match_totals(api, zone, result, since, until):
+    """Every complete dataset sums to its zone total; edge to the eyeball total.
+
+    Returns the zone's request total and raw sources for the cross-zone check, if
+    the zone supports the edge dataset.
+    """
+    eyeball, checked = 0, None
+    if result.available["edge"]:
+        eyeball, sources = request_sources(api.graphql, zone["id"], since, until)
+        # Validate against independently grouped sources, including worker-only zones.
+        assert source_filter_valid(eyeball, sources, result.total_requests, completed_day=True), (
+            zone["name"],
+            eyeball,
+            sources,
+        )
+        checked = result.total_requests, sources
+    else:
+        assert not result.edge
+    # Edge groups are compared with the eyeball total, never the unfiltered one.
+    expected = expected_totals(result.total_visits, result.total_requests, eyeball)
+    for kind in script.DATASETS:
+        if result.available[kind] and not result.limited[kind]:
+            actual = sum(getattr(result, kind).values())
+            assert actual == expected[kind], (zone["name"], kind, actual, expected[kind])
+    return checked
+
+
+def test_every_zone_is_collected(api, zones):
+    since, until = completed_day()
     failures = {}
+    checked = []
     for zone in zones:
         try:
             result = script.collect_zone(api, zone["id"], zone["name"], since, until)
         except script.CloudflareAPIError as e:
             failures[zone["name"]] = str(e)
             continue
-        for kind, label_names in (
-            ("visits", script.VISITS_LABELS),
-            ("requests", script.REQUESTS_LABELS),
-            ("cache", script.CACHE_LABELS),
-            ("edge", script.EDGE_LABELS),
-        ):
+        for kind in script.DATASETS:
+            label_names = api.schema.labels(script.METRICS[kind])
             for labels, value in getattr(result, kind).items():
                 assert len(labels) == len(label_names)
                 assert value > 0
-        eyeball = 0
-        if result.available["edge"]:
-            eyeball, sources = request_sources(api.graphql, zone["id"], since, until)
-            # A wrong filter value would look like a zone without client traffic.
-            assert source_filter_valid(
-                eyeball, sources, result.total_requests, completed_day=True
-            ), (zone["name"], eyeball, sources)
-        else:
-            assert not result.edge
-        # Edge groups are compared with the eyeball total, never the unfiltered one.
-        expected = expected_totals(result.total_visits, result.total_requests, eyeball)
-        for kind in script.DATASETS:
-            if result.available[kind] and not result.limited[kind]:
-                actual = sum(getattr(result, kind).values())
-                assert actual == expected[kind], (zone["name"], kind, actual, expected[kind])
+        if source := assert_sums_match_totals(api, zone, result, since, until):
+            checked.append(source)
     assert not failures
+    # A renamed filter value would leave every zone without client requests.
+    assert source_value_present(checked), checked
+
+
+def test_disabled_labels_are_aggregated_by_the_api(config, zones):
+    """Disabled dimensions are left out of the queries, including an aggregate-only
+    selection and an edge selection without its status; sums stay exact."""
+    schema = script.Schema(
+        {
+            "cf_requests": frozenset({"query", "client_request_referer"}),
+            "cf_cache_requests": frozenset(script.CACHE_LABELS),
+            "cf_edge_requests": frozenset({"edge_response_status"}),
+        }
+    )
+    api = script.create_api(dataclasses.replace(config, schema=schema))
+    since, until = completed_day()
+    zone = next(
+        (
+            zone
+            for zone in zones
+            if "dimensions_clientRequestQuery" in script.fetch_available_fields(api, zone["id"])
+        ),
+        zones[0],
+    )
+    result = script.collect_zone(api, zone["id"], zone["name"], since, until)
+    assert len(result.cache) <= 1
+    assert all(labels == () for labels in result.cache)
+    assert all(len(labels) == len(schema.labels("cf_requests")) for labels in result.requests)
+    assert all(len(labels) == len(schema.labels("cf_edge_requests")) for labels in result.edge)
+    assert_sums_match_totals(api, zone, result, since, until)
+
+
+def test_dimensionless_page_size_one_is_complete(config, zones):
+    """An aggregate-only response cannot hide a second grouping key."""
+    schema = script.Schema(
+        {name: frozenset(labels) for name, labels in script.METRIC_LABELS.items()}
+    )
+    api = script.create_api(dataclasses.replace(config, schema=schema, page_size=1))
+    zone = zones[0]
+    since, until = completed_day()
+    try:
+        result = script.collect_zone(api, zone["id"], zone["name"], since, until)
+        assert not any(result.limited.values())
+        for kind in script.DATASETS:
+            assert len(getattr(result, kind)) <= 1
+            assert all(labels == () for labels in getattr(result, kind))
+        assert_sums_match_totals(api, zone, result, since, until)
+    finally:
+        api.session.close()
 
 
 def test_free_plan_zones_are_collected(api, zones):
@@ -232,9 +319,10 @@ def test_free_plan_zones_are_collected(api, zones):
     for zone in free:
         fields = script.fetch_available_fields(api, zone["id"])
         result = script.collect_zone(api, zone["id"], zone["name"], since, until)
-        if "dimensions_clientRequestQuery" not in fields:
-            query_index = script.REQUESTS_LABELS.index("query")
-            assert all(labels[query_index] == "unknown" for labels in result.requests)
+        labels = api.schema.labels("cf_requests")
+        if "dimensions_clientRequestQuery" not in fields and "query" in labels:
+            query_index = labels.index("query")
+            assert all(values[query_index] == "unknown" for values in result.requests)
 
 
 def test_full_cycle_renders_metrics(api, zones, registry):
@@ -248,7 +336,7 @@ def test_full_cycle_renders_metrics(api, zones, registry):
     assert registry.get_sample_value("cf_exporter_last_cycle_success") == 1
     text = generate_latest(registry).decode()
     checked_api_counters(text)
-    assert_day_families(text, snapshot.window_start)
+    assert_day_families(text, snapshot.window_start, api.schema)
     if WINDOW_TYPE_LINE in text:
         assert checked_snapshot_windows(text) == {
             zone["name"]: (script.rfc3339(snapshot.window_start), snapshot.window_end.timestamp())
@@ -286,7 +374,7 @@ def readiness(port):
         return None
 
 
-def test_exporter_process_end_to_end(zones):
+def test_exporter_process_end_to_end(zones, config):
     """Start script.py as a real process, check readiness and metrics, stop it with SIGTERM."""
     port = free_port()
     env = {
@@ -324,7 +412,7 @@ def test_exporter_process_end_to_end(zones):
         assert body and "cf_exporter_last_cycle_success 1.0" in body
         for zone in zones:
             assert f'cf_exporter_zone_scrape_success{{zone_name="{zone["name"]}"}} 1.0' in body
-        assert_day_families(body, scraped_cycle_start(body))
+        assert_day_families(body, scraped_cycle_start(body), config.schema)
         checked_api_counters(body)
         assert readiness(port) == expected_readiness(body)
 

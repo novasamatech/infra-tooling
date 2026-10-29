@@ -30,8 +30,13 @@ else
 USER_FLAGS := --user $(shell id -u):$(shell id -g)
 endif
 DEV_RUN = $(CONTAINER_ENGINE) run --rm $(USER_FLAGS) -v "$(ROOT):/src" -w /src
+# Settings are passed by name: a variable unset on the host stays unset.
 CONFIG_ENV = --env CF_EXPORTER_REQUEST_TIMEOUT --env CF_EXPORTER_SCRAPE_INTERVAL \
-             --env CF_EXPORTER_METRICS_PORT --env CF_EXPORTER_LOGLEVEL --env CF_EXPORTER_GROUP_LIMIT
+             --env CF_EXPORTER_METRICS_PORT --env CF_EXPORTER_LOGLEVEL \
+             --env CF_EXPORTER_GROUP_LIMIT --env CF_EXPORTER_MAX_SLICE_REQUESTS \
+             --env CF_EXPORTER_MAX_EXTRA_SELECTIONS --env CF_EXPORTER_MIN_SLICE_SECONDS \
+             --env CF_EXPORTER_MAX_RETRY_AFTER_SECONDS --env CF_EXPORTER_PAGE_SIZE \
+             --env CF_EXPORTER_DISABLED_LABELS
 # Only stdin carries the token; it never enters container arguments or metadata.
 TOKEN_RUN = printf '%s\n' "$$CF_EXPORTER_API_TOKEN" | $(DEV_RUN) -i $(CONFIG_ENV)
 TOKEN_ENTRY = /bin/sh -c 'IFS= read -r CF_EXPORTER_API_TOKEN; export CF_EXPORTER_API_TOKEN; exec "$$@"' sh
@@ -99,7 +104,8 @@ fmt: dev-image
 outdated: dev-image
 	$(DEV_RUN) "$(DEV_IMAGE)" python -m pip list --outdated
 
-# For example PROFILE_ARGS='--day 2026-10-25 --cycles 2' for a completed UTC day.
+# For example PROFILE_ARGS='--day 2026-10-25 --cycles 2' for a completed UTC day,
+# or PROFILE_ARGS='--until 2026-10-25T12:00:00Z' for a fixed window of a day.
 profile-live: dev-image check-token
 	@$(TOKEN_RUN) "$(DEV_IMAGE)" $(TOKEN_ENTRY) python tests/profile_live.py $(PROFILE_ARGS)
 
@@ -126,7 +132,8 @@ image-run: check-token
 	@printf '%s\n' "$$CF_EXPORTER_API_TOKEN" | $(CONTAINER_ENGINE) run --rm -i \
 	  $(CONFIG_ENV) --env CF_EXPORTER_METRICS_PORT=8000 -p "$(PORT):8000" "$(IMAGE):$(VERSION)" $(TOKEN_ENTRY) python script.py
 
-# Host driver uses only stdlib; the exporter itself runs in Python 3.13.
+# Host driver uses only stdlib; the exporter itself runs in Python 3.13. It
+# forwards the exporter settings set here, except the port, to the container.
 test-image: image check-token
 	cd "$(ROOT)" && python3 tests/image_smoke.py \
 	  "$(CONTAINER_ENGINE)" "$(IMAGE):$(VERSION)" "$(PORT)" "$(SMOKE_TIMEOUT)"

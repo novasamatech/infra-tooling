@@ -20,7 +20,12 @@ from conftest import (
     visits_group,
 )
 from image_smoke import checked_edge_family
-from profile_live import expected_totals, request_sources, source_filter_valid
+from profile_live import (
+    expected_totals,
+    request_sources,
+    source_filter_valid,
+    source_value_present,
+)
 
 import script
 
@@ -258,9 +263,7 @@ def test_strict_edge_types_do_not_change_legacy_label_conversion(cloudflare, api
 @pytest.mark.parametrize("defect", ["missing", "type"])
 def test_dimension_validation_uses_the_dataset_policy(cloudflare, api, clock, monkeypatch, defect):
     monkeypatch.setitem(script.DIMENSION_TYPES, "cache", {"originResponseStatus": int})
-    monkeypatch.setitem(
-        script.DATASET_FIELDS, "cache", frozenset({"dimensions_originResponseStatus"})
-    )
+    monkeypatch.setitem(script.REQUIRED_DIMENSIONS, "cache", frozenset({"originResponseStatus"}))
     group = requests_group(3, **({} if defect == "missing" else {"originResponseStatus": "200"}))
     cloudflare.add_zone("z", "example.org", cache=[group])
     collector = publish(api, clock, clock.value)
@@ -610,19 +613,41 @@ def test_expected_totals_keep_each_dataset_traffic_scope(visits, requests, eyeba
     [
         (0, {}, 0, True, True),
         (5, {"eyeball": 5, "edgeWorkerFetch": 2}, 7, True, True),
-        (0, {"edgeWorkerFetch": 7}, 7, True, False),
+        (0, {"edgeWorkerFetch": 7}, 7, True, True),
+        (0, {}, 7, True, False),
         (5, {"renamed": 5}, 7, True, False),
+        # Valid for one zone; a renamed value is caught across zones below.
+        (0, {"renamed": 7}, 7, True, True),
         (4, {"eyeball": 5}, 7, True, False),
         (5, {"eyeball": 5}, 4, True, False),
         (4, {"eyeball": 5}, 7, False, True),
         (5, {"eyeball": 5}, 4, False, True),
-        (0, {"edgeWorkerFetch": 7}, 7, False, False),
+        (0, {"edgeWorkerFetch": 7}, 7, False, True),
+        (0, {}, 7, False, False),
     ],
 )
 def test_source_validation_distinguishes_completed_days_from_ingestion_drift(
     eyeball, sources, requests, completed_day, expected
 ):
     assert source_filter_valid(eyeball, sources, requests, completed_day=completed_day) is expected
+
+
+@pytest.mark.parametrize(
+    "checked,expected",
+    [
+        ([], True),
+        ([(0, {})], True),
+        ([(7, {"eyeball": 5, "edgeWorkerFetch": 2})], True),
+        # One zone with only subrequests among zones with client requests.
+        ([(7, {"edgeWorkerFetch": 7}), (5, {"eyeball": 5})], True),
+        ([(7, {"edgeWorkerFetch": 7}), (0, {})], False),
+        # A renamed value leaves the filter and its reference empty everywhere.
+        ([(7, {"renamed": 7}), (5, {"renamed": 5})], False),
+    ],
+)
+def test_source_value_must_occur_in_some_zone_with_traffic(checked, expected):
+    assert source_value_present(checked) is expected
+    assert source_value_present(iter(checked)) is expected
 
 
 def test_profiler_tracks_new_zones_and_skips_unsupported_source_queries(

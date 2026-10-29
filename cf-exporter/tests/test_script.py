@@ -19,6 +19,7 @@ from conftest import (
     ALL_FIELDS,
     BASE_URL,
     FREE_FIELDS,
+    MAX_PAGE_SIZE,
     NOW,
     json_response,
     requests_group,
@@ -109,8 +110,11 @@ def test_parse_env_empty_values_use_defaults():
         ("CF_EXPORTER_SCRAPE_INTERVAL", "-5", "must be >= 1"),
         ("CF_EXPORTER_METRICS_PORT", "0", "must be between 1 and 65535"),
         ("CF_EXPORTER_METRICS_PORT", "70000", "must be between 1 and 65535"),
-        ("CF_EXPORTER_GROUP_LIMIT", "-1", "must be >= 0"),
-        ("CF_EXPORTER_GROUP_LIMIT", "1.5", "must be an integer"),
+        *(
+            case
+            for name in script.LIMITS.values()
+            for case in ((name, "-1", "must be >= 0"), (name, "1.5", "must be an integer"))
+        ),
     ],
 )
 def test_parse_env_rejects_invalid_values(name, value, message):
@@ -313,11 +317,15 @@ def test_transient_http_errors_are_retried_with_backoff(monkeypatch, status, met
             worker.join()
 
 
-@pytest.mark.parametrize("retry_after, attempts, sleeps_expected", [("300", 1, []), ("2", 2, [2])])
-def test_retry_after_is_waited_for_only_when_short(
-    monkeypatch, retry_after, attempts, sleeps_expected
+@pytest.mark.parametrize(
+    "maximum, retry_after, attempts, sleeps_expected",
+    [(0, "300", 2, [300]), (30, "300", 1, []), (30, "2", 2, [2])],
+)
+def test_retry_after_is_waited_for_up_to_a_configured_maximum(
+    monkeypatch, maximum, retry_after, attempts, sleeps_expected
 ):
-    """Regression: a 5-minute Retry-After used to stall the whole cycle per request."""
+    """Without a configured maximum any Retry-After is waited for; with one, a longer
+    Retry-After fails the request at once instead of stalling the cycle."""
     sleeps = []
     monkeypatch.setattr("urllib3.util.retry.time.sleep", sleeps.append)
     calls = []
@@ -341,7 +349,9 @@ def test_retry_after_is_waited_for_only_when_short(
         worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
         worker.start()
         client = script.CloudflareAPI(
-            "dummy-credential", base_url=f"http://127.0.0.1:{server.server_port}"
+            "dummy-credential",
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            max_retry_after_seconds=maximum,
         )
         client.session.trust_env = False
         try:
@@ -464,7 +474,9 @@ def test_day_window_converts_other_timezones_to_utc():
 
 
 def test_build_analytics_query_uses_variables_order_and_given_dimensions():
-    query = script.build_analytics_query(["clientRequestPath"], ["cacheStatus", "userAgentOS"])
+    query = script.build_analytics_query(
+        {"visits": ["clientRequestPath"], "requests": ["cacheStatus", "userAgentOS"]}
+    )
     assert "$zoneTag: string!" in query
     assert "zoneTag: $zoneTag" in query
     assert "datetime_geq: $since, datetime_lt: $until" in query
@@ -648,7 +660,7 @@ def test_collect_zone_maps_dimensions_to_labels(cloudflare, api):
         "zoneTag": "z1",
         "since": "2026-10-13T00:00:00Z",
         "until": "2026-10-13T07:40:12Z",
-        "limit": script.GROUPS_LIMIT,
+        "limit": MAX_PAGE_SIZE,
     }
 
 
@@ -1008,6 +1020,8 @@ def test_main_wires_everything_together(monkeypatch, quiet_logging, registry):
     monkeypatch.setenv("CF_EXPORTER_API_TOKEN", "abc\n")
     monkeypatch.setenv("CF_EXPORTER_METRICS_PORT", "9123")
     monkeypatch.setenv("CF_EXPORTER_SCRAPE_INTERVAL", "42")
+    monkeypatch.setenv("CF_EXPORTER_MAX_EXTRA_SELECTIONS", "152")
+    monkeypatch.setenv("CF_EXPORTER_DISABLED_LABELS", '{"cf_requests": ["query"]}')
     handlers, servers, runs = {}, [], []
     monkeypatch.setattr(script, "REGISTRY", registry)
     monkeypatch.setattr(
@@ -1022,7 +1036,15 @@ def test_main_wires_everything_together(monkeypatch, quiet_logging, registry):
     api, collector, interval, event = runs[0]
     assert servers == [(9123, collector, 3 * 42)]
     assert api.session.headers["Authorization"] == "Bearer abc"
-    assert api.query_budget == script.cycle_query_budget(42) == 28
+    # Configured options reach the client; nothing is derived from the interval.
+    assert (api.max_extra_selections, api.slice_allowance) == (152, 152)
+    assert (api.group_limit, api.max_slice_requests, api.min_slice_seconds, api.page_size) == (
+        0,
+        0,
+        0,
+        0,
+    )
+    assert "query" not in api.schema.labels("cf_requests")
     assert isinstance(collector, script.CloudflareCollector)
     assert interval == 42
     assert not event.is_set()

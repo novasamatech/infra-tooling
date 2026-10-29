@@ -136,7 +136,16 @@ def test_transport_failure_counts_without_a_response(rsps, api, exception, error
 
 
 def test_cycle_counts_listing_settings_and_a_failed_zone(cloudflare, api):
-    cloudflare.add_zone("a", "good.example", requests=[requests_group(4)])
+    # Consistent datasets of the same requests: no empty page needs a check.
+    group = requests_group(4, edgeResponseStatus=200)
+    cloudflare.add_zone(
+        "a",
+        "good.example",
+        visits=[{"sum": {"visits": 0}}],
+        requests=[group],
+        cache=[group],
+        edge=[group],
+    )
     cloudflare.add_zone("b", "bad.example", error="not authorized")
     snapshot = script.collect_once(api, now=NOW)
     assert snapshot.zone_success == {"good.example": 1, "bad.example": 0}
@@ -156,8 +165,9 @@ def no_backoff(monkeypatch):
 
 
 @pytest.fixture
-def server():
-    """A local API whose responses tests script; transport retries are real."""
+def server(request):
+    """A local API whose responses tests script; transport retries are real.
+    Indirect parameters are client options."""
     replies, release = [], threading.Event()
 
     class Handler(BaseHTTPRequestHandler):
@@ -184,6 +194,7 @@ def server():
             "dummy-credential",
             request_timeout=0.5,
             base_url=f"http://127.0.0.1:{httpd.server_port}",
+            **getattr(request, "param", {}),
         )
         client.session.trust_env = False
         try:
@@ -209,7 +220,20 @@ def test_retried_attempts_are_counted_with_the_final_one(server, no_backoff):
     }
 
 
-def test_long_retry_after_counts_its_single_rate_limited_attempt(server, no_backoff):
+def test_long_retry_after_is_waited_for_by_default_and_counted(server, no_backoff):
+    client, replies = server
+    replies.extend([(429, {"Retry-After": "300"}), (200, {})])
+    assert client.graphql("q", {}) == {"viewer": {}}
+    assert no_backoff == [300]
+    assert counters(client) == {
+        ("responses", "graphql", "429"): 1,
+        ("responses", "graphql", "200"): 1,
+        ("errors", "graphql", "rate_limited"): 1,
+    }
+
+
+@pytest.mark.parametrize("server", [{"max_retry_after_seconds": 30}], indirect=True)
+def test_retry_after_above_the_maximum_counts_its_single_rate_limited_attempt(server, no_backoff):
     client, replies = server
     replies.append((429, {"Retry-After": "300"}))
     with pytest.raises(script.RateLimitedError):
