@@ -15,6 +15,8 @@ from prometheus_client.parser import text_string_to_metric_families
 import script
 
 BASE_URL = "https://cf.test/client/v4"
+# The fake API's default settings.maxPageSize, as Cloudflare currently reports.
+MAX_PAGE_SIZE = 10000
 NOW = datetime(2026, 10, 13, 7, 40, 12, 345678, tzinfo=UTC)
 # The UTC day of the exposition tests; their clock starts at its noon.
 DAY = datetime(2026, 10, 26, tzinfo=UTC)
@@ -60,6 +62,92 @@ def eyeball_only(filters, group):
     return selected is None or source == selected[1]
 
 
+def selections(query):
+    """(alias, filter, dimensions) of every aliased selection of an analytics query."""
+    parts = re.split(r"(\w+): httpRequestsAdaptiveGroups\(", query)[1:]
+    for alias, body in zip(parts[::2], parts[1::2], strict=True):
+        dimensions = re.search(r"dimensions \{ ([^}]*) \}", body)
+        filters = re.search(r"filter: \{([^}]*)\}", body)[1]
+        yield alias, filters, dimensions[1].split() if dimensions else []
+
+
+def is_check(call, dimensions):
+    """A dimensionless read of one group: the check of an empty page."""
+    return not dimensions and call["variables"].get("limit") == 1
+
+
+def reads(cloudflare, kind, checks=False):
+    """Page reads of one dataset in all analytics requests so far, or its checks."""
+    return sum(
+        alias == kind and is_check(call, dimensions) == checks
+        for call in cloudflare.data_calls()
+        for alias, _, dimensions in selections(call["query"])
+    )
+
+
+def page_calls(cloudflare):
+    """Analytics requests other than checks of empty pages."""
+    return [
+        call
+        for call in cloudflare.data_calls()
+        if not all(is_check(call, dimensions) for _, _, dimensions in selections(call["query"]))
+    ]
+
+
+# Dimensions of an event that sets no others; every dataset groups by some of them.
+EVENT_DIMENSIONS = {
+    "clientRequestHTTPHost": "example.org",
+    "clientRequestHTTPMethodName": "GET",
+    "clientRequestPath": "/",
+    "clientRequestQuery": "",
+    "clientCountryName": "DE",
+    "clientRequestReferer": "",
+    "userAgentBrowser": "Firefox",
+    "userAgentOS": "Linux",
+    "cacheStatus": "hit",
+    "originResponseStatus": 200,
+    "edgeResponseStatus": 200,
+}
+
+
+def event(second, count=1, **dimensions):
+    """Requests at `second` after the origin; each one is also a visit."""
+    return second, count, EVENT_DIMENSIONS | dimensions
+
+
+def aggregating_responder(events, origin):
+    """Analytics as Cloudflare computes them: events of the half-open window that
+    pass the selection's filter are grouped by the requested dimensions only,
+    ordered largest first, and only then cut to the page size."""
+
+    def respond(body):
+        variables = body["variables"]
+        start = datetime.fromisoformat(variables["since"])
+        end = datetime.fromisoformat(variables["until"])
+        node = {}
+        for kind, filters, dimensions in selections(body["query"]):
+            groups = {}
+            for second, count, values in events:
+                if start <= origin + timedelta(seconds=second) < end and eyeball_only(
+                    filters, {"dimensions": values}
+                ):
+                    key = tuple(values.get(dimension) for dimension in dimensions)
+                    groups[key] = groups.get(key, 0) + count
+            if kind == "totals":
+                total = sum(groups.values())
+                node[kind] = [{"count": total, "sum": {"visits": total}}] if total else []
+                continue
+            make = visits_group if kind == "visits" else requests_group
+            ranked = sorted(groups.items(), key=lambda item: item[1], reverse=True)
+            node[kind] = [
+                make(value, **dict(zip(dimensions, key, strict=True)))
+                for key, value in ranked[: variables["limit"]]
+            ]
+        return json_response(200, {"data": {"viewer": {"zones": [node]}}})
+
+    return respond
+
+
 def without_source(group):
     """The exporter never selects requestSource, so the API would not return it."""
     dimensions = {k: v for k, v in group.get("dimensions", {}).items() if k != "requestSource"}
@@ -85,7 +173,7 @@ class FakeCloudflare:
         requests=(),
         error=None,
         enabled=True,
-        max_page_size=script.GROUPS_LIMIT,
+        max_page_size=MAX_PAGE_SIZE,
         cache=(),
         totals=None,
         responder=None,
