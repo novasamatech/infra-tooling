@@ -1,0 +1,7 @@
+# Shared allowlist for runtime and development builds.
+*
+!sqdb/
+sqdb/**/__pycache__/
+sqdb/**/*.pyc
+!requirements.txt
+!requirements-dev.txt

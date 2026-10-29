@@ -1,0 +1,6 @@
+# Direct development dependencies (tests, coverage, lint). Resolved against the
+# runtime pins; the result lives in requirements-dev.txt — regenerate with
+# `make lock`.
+pytest
+pytest-cov
+ruff

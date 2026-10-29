@@ -1,0 +1,5 @@
+# Direct runtime dependencies. Pinned versions (incl. transitive) live in
+# requirements.txt — regenerate it with `make lock`.
+boto3
+psycopg
+PyYAML

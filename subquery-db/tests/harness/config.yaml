@@ -1,0 +1,54 @@
+# Harness topology for the end-to-end tests: three groups with their own users
+# and passwords (quotes, spaces and symbols on purpose), a renamed target, a
+# mixed-case user and a numeric-looking database name. As with a managed
+# database service, the seeder creates the target databases and users; there is
+# no admin. Throwaway credentials of the local harness only.
+version: 1
+backup_name: e2e
+
+source:
+  host: sqdb-harness-old
+  port: 5432
+  sslmode: disable
+
+destination:
+  host: sqdb-harness-new
+  port: 5432
+  sslmode: disable
+
+storage:
+  type: s3
+  s3:
+    bucket: sqdb-dumps
+    endpoint_url: http://sqdb-harness-s3:7070
+    region: us-east-1
+    access_key_id: harness-access-key
+    secret_access_key: harness-secret-key
+    force_path_style: true
+    # Smallest legal part size, so the larger fixture dump spans several parts.
+    chunk_size: 5MiB
+
+parallel: 2
+
+groups:
+  accounts:
+    user: accounts_user
+    password: "acc'pass\"1"
+    databases:
+      - chain-a-accounts
+      - chain-b-accounts
+  transfers:
+    user: transfers_user
+    password: "tr@ns #2 with space"
+    databases:
+      - chain-a-transfers
+      - name: chain-b-transfers
+        target: chain-b-transfers-v2
+  nfts:
+    user: NftUser
+    password: "n%f$t:3\\x"
+    options:
+      verify_rows: exact
+    databases:
+      - chain-c-nfts
+      - "123"

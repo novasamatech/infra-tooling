@@ -1,0 +1,103 @@
+;
+; Archive created at 2026-10-27 13:14:31 UTC
+;     dbname: chain-a-accounts
+;     TOC Entries: 92
+;     Compression: none
+;     Dump Version: 1.16-0
+;     Format: CUSTOM
+;     Integer: 4 bytes
+;     Offset: 8 bytes
+;     Dumped from database version: 16.15 (Debian 16.15-1.pgdg13+2)
+;     Dumped by pg_dump version: 17.11 (Debian 17.11-1.pgdg13+2)
+;
+;
+; Selected TOC Entries:
+;
+8; 2615 55998 SCHEMA - app accounts_user
+3872; 0 0 COMMENT - SCHEMA app accounts_user
+2; 3079 55267 EXTENSION - btree_gist 
+3873; 0 0 COMMENT - EXTENSION btree_gist 
+3; 3079 55917 EXTENSION - pg_trgm 
+3874; 0 0 COMMENT - EXTENSION pg_trgm 
+1100; 1247 56000 TYPE app 6f1a2b3c4d accounts_user
+1107; 1247 56012 TYPE app call_args accounts_user
+1103; 1247 56008 DOMAIN app positive_amount accounts_user
+351; 1255 56127 FUNCTION app send_notification() accounts_user
+312; 1255 56128 FUNCTION app touch_updated() accounts_user
+219; 1259 56013 TABLE app _metadata accounts_user
+220; 1259 56020 TABLE app _poi accounts_user
+221; 1259 56032 TABLE app accounts accounts_user
+3875; 0 0 COMMENT app TABLE accounts accounts_user
+231; 1259 56126 SEQUENCE app batch_seq accounts_user
+223; 1259 56062 TABLE app blocks accounts_user
+222; 1259 56042 TABLE app transfers accounts_user
+3876; 0 0 COMMENT app TABLE transfers accounts_user
+3877; 0 0 COMMENT app COLUMN transfers.amount accounts_user
+233; 1259 56135 MATERIALIZED VIEW app daily_volume accounts_user
+227; 1259 56089 TABLE app events accounts_user
+226; 1259 56088 SEQUENCE app events_id_seq accounts_user
+3878; 0 0 SEQUENCE OWNED BY app events_id_seq accounts_user
+225; 1259 56073 TABLE app extrinsics accounts_user
+224; 1259 56072 SEQUENCE app extrinsics_seq_seq accounts_user
+228; 1259 56104 TABLE app rewards accounts_user
+229; 1259 56109 TABLE app rewards_early accounts_user
+230; 1259 56116 TABLE app rewards_late accounts_user
+232; 1259 56131 VIEW app transfer_totals accounts_user
+3644; 0 0 TABLE ATTACH app rewards_early accounts_user
+3645; 0 0 TABLE ATTACH app rewards_late accounts_user
+3650; 2604 56092 DEFAULT app events id accounts_user
+3853; 0 56013 TABLE DATA app _metadata accounts_user
+3854; 0 56020 TABLE DATA app _poi accounts_user
+3855; 0 56032 TABLE DATA app accounts accounts_user
+3857; 0 56062 TABLE DATA app blocks accounts_user
+3861; 0 56089 TABLE DATA app events accounts_user
+3859; 0 56073 TABLE DATA app extrinsics accounts_user
+3862; 0 56109 TABLE DATA app rewards_early accounts_user
+3863; 0 56116 TABLE DATA app rewards_late accounts_user
+3856; 0 56042 TABLE DATA app transfers accounts_user
+3879; 0 0 SEQUENCE SET app batch_seq accounts_user
+3880; 0 0 SEQUENCE SET app events_id_seq accounts_user
+3881; 0 0 SEQUENCE SET app extrinsics_seq_seq accounts_user
+3653; 2606 56019 CONSTRAINT app _metadata _metadata_pkey accounts_user
+3655; 2606 56029 CONSTRAINT app _poi _poi_chain_block_hash_key accounts_user
+3657; 2606 56031 CONSTRAINT app _poi _poi_hash_key accounts_user
+3659; 2606 56027 CONSTRAINT app _poi _poi_pkey accounts_user
+3663; 2606 56039 CONSTRAINT app accounts accounts_pkey accounts_user
+3680; 2606 56071 CONSTRAINT app blocks blocks_number_key accounts_user
+3682; 2606 56069 CONSTRAINT app blocks blocks_pkey accounts_user
+3688; 2606 56097 CONSTRAINT app events events_pkey accounts_user
+3684; 2606 56082 CONSTRAINT app extrinsics extrinsics_block_idx accounts_user
+3686; 2606 56080 CONSTRAINT app extrinsics extrinsics_pkey accounts_user
+3692; 2606 56108 CONSTRAINT app rewards rewards_pkey accounts_user
+3695; 2606 56113 CONSTRAINT app rewards_early rewards_early_pkey accounts_user
+3698; 2606 56120 CONSTRAINT app rewards_late rewards_late_pkey accounts_user
+3672; 2606 56050 CONSTRAINT app transfers transfers_no_overlap accounts_user
+3676; 2606 56048 CONSTRAINT app transfers transfers_pkey accounts_user
+3664; 1259 56051 INDEX app 0x1f2e3d4c5b6a7980 accounts_user
+3660; 1259 56040 INDEX app 0x2a1e3c4b5d6f7a8b accounts_user
+3665; 1259 56052 INDEX app 0x5a4b3c2d1e0f9a8b accounts_user
+3882; 0 0 COMMENT app INDEX "0x5a4b3c2d1e0f9a8b" accounts_user
+3666; 1259 56053 INDEX app 0x6b5a4c3d2e1f0a9b accounts_user
+3661; 1259 56041 INDEX app 0x9c8b7a6f5e4d3c2b accounts_user
+3699; 1259 56141 INDEX app daily_volume_day accounts_user
+3689; 1259 56103 INDEX app events_section_method accounts_user
+3690; 1259 56123 INDEX app rewards_amount accounts_user
+3693; 1259 56124 INDEX app rewards_early_amount_idx accounts_user
+3696; 1259 56125 INDEX app rewards_late_amount_idx accounts_user
+3667; 1259 56054 INDEX app transfers_block_include accounts_user
+3668; 1259 56057 INDEX app transfers_hash_eq accounts_user
+3669; 1259 56056 INDEX app transfers_hash_lower accounts_user
+3670; 1259 56061 INDEX app transfers_hash_trgm accounts_user
+3673; 1259 56055 INDEX app transfers_open_status accounts_user
+3674; 1259 56060 INDEX app transfers_payload accounts_user
+3677; 1259 56059 INDEX app transfers_tags accounts_user
+3678; 1259 56058 INDEX app transfers_time_brin accounts_user
+3700; 0 0 INDEX ATTACH app rewards_early_amount_idx accounts_user
+3701; 0 0 INDEX ATTACH app rewards_early_pkey accounts_user
+3702; 0 0 INDEX ATTACH app rewards_late_amount_idx accounts_user
+3703; 0 0 INDEX ATTACH app rewards_late_pkey accounts_user
+3707; 2620 56129 TRIGGER app transfers 0x7e6d5c4b_notify_trigger accounts_user
+3706; 2620 56130 TRIGGER app _metadata metadata_touch accounts_user
+3705; 2606 56098 FK CONSTRAINT app events events_extrinsicId_fkey accounts_user
+3704; 2606 56083 FK CONSTRAINT app extrinsics extrinsics_blockId_fkey accounts_user
+3865; 0 56135 MATERIALIZED VIEW DATA app daily_volume accounts_user

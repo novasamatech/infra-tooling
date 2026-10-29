@@ -53,6 +53,7 @@ repository root. All development commands run in a Python 3.13 Alpine container.
 | `make lint` | Ruff lint and formatting checks |
 | `make fmt` | Format and apply lint fixes |
 | `make test` | Offline tests with coverage |
+| `make ci` | Repository CI checks (lint + offline tests, see `../AGENTS.md`) |
 | `make coverage` | Offline tests and HTML coverage report |
 | `make test-live` | Live API and process checks |
 | `make test-all` | Offline and live checks |
