@@ -310,7 +310,7 @@ def test_transient_http_errors_are_retried_with_backoff(monkeypatch, status, met
         try:
             assert client._request(method, "/probe") == {"success": True}
             assert calls == [method] * 3
-            assert sleeps == [4.0]
+            assert sleeps == ([300, 300] if status == 429 else [4.0])
         finally:
             client.session.close()
             server.shutdown()
@@ -368,6 +368,7 @@ def test_retry_after_is_waited_for_up_to_a_configured_maximum(
             worker.join()
 
 
+@pytest.mark.parametrize("api", [{"max_retry_after_seconds": 30}], indirect=True)
 def test_rate_limit_without_json_body_is_reported(rsps, api):
     rsps.add(responses.GET, f"{BASE_URL}/zones", status=429, body="Too Many Requests")
     with pytest.raises(script.RateLimitedError, match="GET /zones: HTTP 429: rate limited"):
@@ -426,6 +427,7 @@ def test_graphql_errors_raise_with_messages(rsps, api):
         {"message": "limit reached", "extensions": {"code": "budget"}},
     ],
 )
+@pytest.mark.parametrize("api", [{"max_retry_after_seconds": 30}], indirect=True)
 def test_graphql_budget_errors_without_http_429_are_rate_limits(rsps, api, error):
     rsps.add(responses.POST, f"{BASE_URL}/graphql", json={"data": None, "errors": [error]})
     with pytest.raises(script.RateLimitedError):
@@ -755,7 +757,8 @@ def test_collect_once_isolates_failing_zones(cloudflare, api, caplog):
     assert "Zone bad.example: collection failed: GraphQL: quota exceeded" in caplog.text
 
 
-def test_rate_limit_skips_remaining_zones_until_next_cycle(cloudflare, api, caplog):
+@pytest.mark.parametrize("api", [{"max_retry_after_seconds": 30}], indirect=True)
+def test_explicit_retry_limit_skips_remaining_zones_until_next_cycle(cloudflare, api, caplog):
     cloudflare.add_zone(
         "a",
         "a.example",

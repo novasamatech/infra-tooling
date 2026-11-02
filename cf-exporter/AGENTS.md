@@ -77,6 +77,12 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
 
 ## Behavior To Preserve
 
+- Hard default contract: completeness takes priority over memory consumption,
+  request count and collection duration. Never add automatic caps, quotas,
+  deadlines, label removal or top-N selection to make collection cheaper. Only
+  explicit operator settings may enable lossy limits. Tests and implementation
+  must enforce this contract; documenting or testing truncation does not justify
+  introducing it into the default behavior.
 - Preserve public metric names and label names/order unless the operator requests
   a breaking change. `cf_visits` and `cf_requests` are gauges, not counters.
 - Export every label by default. `CF_EXPORTER_DISABLED_LABELS` disables labels
@@ -85,7 +91,8 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
   Keep the catalog (`METRIC_LABELS`, `DATASETS`) separate from an instance's
   `Schema`, render a snapshot with its own schema, and reject unknown metrics,
   labels and malformed JSON at startup. Without `zone_name`, zones are still
-  collected and capped separately and their identical label sets are summed.
+  collected separately and their identical label sets are summed. Any explicitly
+  enabled group cap still applies per zone before summation.
   Never disable labels automatically or ship deployment-specific choices.
 - Use one UTC window per cycle, from midnight to the cycle start, formatted as
   RFC3339 with `Z`. Handle an empty window at midnight without an invalid query.
@@ -97,7 +104,14 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
   cache, edge and dimensionless totals. Settings use a separate HTTP request. Sliced
   retries use additional requests for only the full selections.
 - Export all nonzero groups by default with disjoint, half-open, whole-second
-  time slices, down to one second, using the plan's `maxPageSize`. The exporter
+  time slices, down to one second, using the plan's `maxPageSize`. A full second
+  is paginated by the complete ordered tuple of queried dimensions with a
+  lexicographic filter in GraphQL variables, preserving the time and source
+  filters. Counts are never pagination keys. Check an empty remaining range with
+  a dimensionless read of that same filtered range. Missing cursor dimensions,
+  nonadvancing pages or an unverifiable empty remainder fail the zone, never
+  publish successful truncated analytics. Keep the live schema and pagination
+  checks aligned. The exporter
   has no own limit by default; every limit in `LIMITS` is optional, `0` meaning
   none, and is never derived from a quota, replica count or interval. Represent
   unlimited as `None` internally, never as a large number. Budgets count
@@ -105,8 +119,8 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
 - Remember the successful leaf slice boundaries per zone/dataset with the query
   signature until UTC midnight. Reuse them in the next cycle, extend the last
   slice for a grown window and fetch every slice again; never re-cut the day
-  evenly. A failed slice fails that zone and publishes no hints. Expose residual
-  truncation per dataset with its reason and the remaining budgets.
+  evenly. A failed slice fails that zone and publishes no hints. Expose truncation
+  caused by explicit limits per dataset with its reason and remaining budgets.
 - Never take an empty page as proof of no traffic while the matching whole-window
   total has traffic: check it with one dimensionless read of the same window and
   filter (budgeted like other reads) and split a window that has traffic. If an
@@ -141,6 +155,9 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
   once before splitting or capping; aggregation consumes only validated groups.
 - Publish complete snapshots atomically after collection. Remove stale series;
   omit a failed zone's analytics for that cycle and preserve other zones' results.
+  On a failed cycle, omit families whose `zone_name` was disabled, including zone
+  totals: never publish a sum over only the surviving zones or mix old and new
+  windows. Keep independent families with `zone_name` and all health diagnostics.
 - Export `cf_exporter_snapshot_window_end_seconds` only for successful zones,
   with `zone_name` and RFC3339 `window_start` labels from that same snapshot.
   Its value is the exclusive API window end, not collection completion time.
@@ -164,9 +181,14 @@ default container port is occupied; `SMOKE_TIMEOUT` controls the smoke deadline.
   Labels never carry URLs, messages, zone names or credentials. Only `main()`
   registers `APIStats`.
 - Wait for any `Retry-After` unless `CF_EXPORTER_MAX_RETRY_AFTER_SECONDS` is set;
-  `BoundedRetry.new()` must carry the maximum to every attempt. After an HTTP 429
-  or a GraphQL budget error, skip the cycle's remaining zones and report them as
-  failed. Cycles never overlap.
+  `BoundedRetry.new()` must carry the maximum to every attempt. Do not inherit
+  urllib3's implicit six-hour cap. By default HTTP 429 retries are unlimited,
+  without spending the bounded transient-error retry allowance; use the server's
+  Retry-After or a 300-second cooldown if absent. GraphQL budget errors also wait
+  and retry the exact query and variables. Resume the current page and then later
+  zones without restarting the cycle or discarding completed work. Only explicit
+  retry limits may abandon a rate-limited cycle and skip remaining zones. Cycles
+  never overlap, and waiting must preserve clean signal exits and HTTP serving.
 - Move the last cycle before UTC midnight earlier when it would not finish
   `DAY_CLOSE_MARGIN_SECONDS` before midnight; never publish a finished day after it.
 - Use monotonic time for durations and scheduling. Preserve clean signal exits.

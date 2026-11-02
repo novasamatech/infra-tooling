@@ -271,6 +271,20 @@ def test_defaults_impose_no_limit_of_the_exporter():
     assert api.slice_allowance is None
 
 
+def test_default_collects_more_than_ten_thousand_groups_at_the_plan_page_size(cloudflare, api):
+    events = [event(0, clientRequestPath=f"/{i}") for i in range(10001)]
+    cloudflare.add_zone(
+        "z", "example.org", max_page_size=15000, responder=aggregating_responder(events, START)
+    )
+    result = script.collect_zone(api, "z", "example.org", START, START + timedelta(seconds=1))
+    for kind in script.DATASETS:
+        assert len(getattr(result, kind)) == 10001
+        assert sum(getattr(result, kind).values()) == 10001
+    assert result.limited == dict.fromkeys(script.DATASETS, 0)
+    (call,) = cloudflare.data_calls()
+    assert call["variables"]["limit"] == 15000
+
+
 def test_limit_below_page_size_uses_one_query(traffic, api, caplog):
     api.group_limit = 1
     result = script.collect_zone(api, "z", "example.org", START, END)
@@ -683,21 +697,146 @@ def test_default_slices_reach_one_second_without_truncation(cloudflare, api, cap
     assert "full page" not in caplog.text
 
 
-def test_full_one_second_slice_is_reported_and_not_split_again(cloudflare, api, caplog):
+def test_full_one_second_slice_is_paginated_without_truncation(cloudflare, api, caplog):
     # Three query strings in one second; only the requests dataset groups by them.
     events = [event(5, 1, clientRequestQuery=f"?{query}") for query in range(3)]
     cloudflare.add_zone(
         "z", "example.org", max_page_size=2, responder=aggregating_responder(events, START)
     )
     result = script.collect_zone(api, "z", "example.org", START, START + timedelta(minutes=4))
-    assert result.limited == {"visits": 0, "requests": 1, "cache": 0, "edge": 0}
+    assert result.limited == dict.fromkeys(script.DATASETS, 0)
+    assert len(result.requests) == 3
+    assert sum(result.requests.values()) == result.total_requests == 3
+    pages = [c for c in cloudflare.data_calls() if "after" in c["variables"]]
+    assert pages and all(c["variables"]["since"] == window(5, 6)[0] for c in pages)
+    assert "full page" not in caplog.text
+
+
+@pytest.mark.parametrize("count", [2, 73])
+def test_dimension_pagination_collects_tied_groups_and_preserves_edge_scope(cloudflare, api, count):
+    events = [
+        event(0, 1, clientRequestPath=f"/{i // 3}", clientRequestHTTPHost=f"h{i % 3}.example")
+        for i in range(count)
+    ]
+    events.append(event(0, 100, requestSource="worker", clientRequestPath="/worker"))
+    cloudflare.add_zone(
+        "z", "example.org", max_page_size=2, responder=aggregating_responder(events, START)
+    )
+    result = script.collect_zone(api, "z", "example.org", START, START + timedelta(seconds=1))
+    assert result.limited == dict.fromkeys(script.DATASETS, 0)
+    assert sum(result.requests.values()) == result.total_requests == count + 100
+    assert sum(result.visits.values()) == result.total_visits == count + 100
+    assert sum(result.cache.values()) == count + 100
+    assert len(result.edge) == count and sum(result.edge.values()) == count
+    pages = [c for c in cloudflare.data_calls() if "after" in c["variables"]]
+    for call in pages:
+        assert (call["variables"]["since"], call["variables"]["until"]) == window(0, 1)
+        for alias, filters, _ in selections(call["query"]):
+            assert ('requestSource: "eyeball"' in filters) == (alias == "edge")
+    if count == 73:
+        assert reads(cloudflare, "requests") > 32
+
+
+def test_repeated_dimension_page_fails_instead_of_publishing_or_looping(cloudflare, api):
+    respond = aggregating_responder([event(0, clientRequestPath=f"/{i}") for i in range(3)], START)
+
+    def repeats(body):
+        body = {**body, "variables": {**body["variables"], "after": {}}}
+        return respond(body)
+
+    cloudflare.add_zone("z", "example.org", max_page_size=2, responder=repeats)
+    snapshot = script.collect_once(api, now=START + timedelta(seconds=1))
+    assert snapshot.zone_success == {"example.org": 0}
+    assert not snapshot.requests and not api.slice_hints
+
+
+def test_one_transient_empty_page_does_not_keep_refining_hints(cloudflare, api):
+    cloudflare.add_zone("z", "example.org", responder=blind(EVENTS, {window(0, 240)}))
+    script.collect_zone(api, "z", "example.org", START, END)
+    original = api.slice_hints.copy()
+    for _ in range(3):
+        cloudflare.graphql_calls.clear()
+        result = script.collect_zone(api, "z", "example.org", START, END)
+        assert result.limited == dict.fromkeys(script.DATASETS, 0)
+        assert sum(result.requests.values()) == len(EVENTS)
+        assert api.slice_hints == original
+        assert reads(cloudflare, "requests") == 2
+
+
+@pytest.mark.parametrize("status", [200, 429])
+def test_rate_limit_mid_slice_resumes_it_and_collects_later_zones(
+    traffic, api, monkeypatch, status
+):
+    respond = traffic.zones["z"]["responder"]
+    blocked = []
+    sleeps = []
+    monkeypatch.setattr(script.time, "sleep", sleeps.append)
+
+    def rate_limited(body):
+        if body["variables"]["since"] != window(0, 240)[0] and len(blocked) < 5:
+            blocked.append(body)
+            return json_response(status, {"errors": [{"extensions": {"code": "budget"}}]})
+        return respond(body)
+
+    traffic.zones["z"]["responder"] = rate_limited
+    traffic.add_zone("later", "later.example")
+    snapshot = script.collect_once(api, now=END)
+    assert snapshot.cycle_success == 1
+    assert snapshot.zone_success == {"example.org": 1, "later.example": 1}
+    assert sum(snapshot.requests.values()) == 14
+    assert all(value == 0 for value in snapshot.limited.values())
+    assert len(blocked) == 5 and all(body == blocked[0] for body in blocked)
+    # responses emulates adapter retries without calling urllib3's sleep;
+    # localhost transport tests cover the actual HTTP cooldowns separately.
+    assert sleeps == ([300] * 5 if status == 200 else [])
+
+
+@pytest.mark.parametrize("field", ["max_slice_requests", "max_extra_selections"])
+def test_explicit_budget_can_stop_dimension_pagination_but_never_claims_completeness(
+    cloudflare, api, field
+):
+    events = [event(0, clientRequestQuery=f"?{i}") for i in range(7)]
+    cloudflare.add_zone(
+        "z", "example.org", max_page_size=2, responder=aggregating_responder(events, START)
+    )
+    setattr(api, field, 1)
+    api.start_cycle()
+    result = script.collect_zone(api, "z", "example.org", START, START + timedelta(seconds=1))
+    assert result.limited["requests"] == 1
     assert len(result.requests) == 2
-    # Halving 240 s reaches one second after eight levels: two reads per level,
-    # and one check of the empty half.
-    assert reads(cloudflare, "requests") <= 1 + 2 * 8
-    assert reads(cloudflare, "requests", checks=True) <= 8
-    assert "returned a full page of 2 groups that was not split" in caplog.text
-    assert "(1s slice at the time resolution; dataset reads left: unlimited" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "defect", ["missing_dimension", "bad_type", "api_error", "malformed_aggregate"]
+)
+def test_pagination_errors_never_publish_partial_zone(cloudflare, api, defect):
+    respond = aggregating_responder([event(0, clientRequestQuery=f"?{i}") for i in range(3)], START)
+
+    def broken(body):
+        reply = respond(body)
+        if "after" not in body["variables"]:
+            return reply
+        if defect == "api_error":
+            return graphql_error("pagination failed")
+        data = json.loads(reply[2])
+        for alias, _, dimensions in selections(body["query"]):
+            groups = data["data"]["viewer"]["zones"][0][alias]
+            if defect == "malformed_aggregate":
+                data["data"]["viewer"]["zones"][0][alias] = (
+                    [] if dimensions else [requests_group(1), requests_group(1)]
+                )
+            elif groups:
+                value = groups[0]["dimensions"]
+                if defect == "missing_dimension":
+                    value.pop("clientRequestHTTPHost")
+                elif "OR" not in body["variables"]["after"]:
+                    value["clientRequestQuery"] = 1
+        return reply[0], reply[1], json.dumps(data)
+
+    cloudflare.add_zone("z", "example.org", max_page_size=2, responder=broken)
+    snapshot = script.collect_once(api, now=START + timedelta(seconds=1))
+    assert snapshot.cycle_success == 0
+    assert not snapshot.requests and not snapshot.zone_requests and not api.slice_hints
 
 
 # A burst of distinct paths in ten minutes of an otherwise quiet day.
@@ -867,19 +1006,19 @@ def test_empty_page_hiding_traffic_is_split_and_recovered(cloudflare, api, caplo
     assert "empty page" not in caplog.text
 
 
-def test_unsplittable_empty_page_with_traffic_is_reported(cloudflare, api, caplog):
+def test_unrecoverable_empty_page_fails_without_publishing_partial_analytics(
+    cloudflare, api, caplog
+):
     events = [event(5, 3)]
     blinded = {window(0, 240), window(0, 120), window(0, 60), window(0, 30), window(0, 15)}
     blinded |= {window(0, 7), window(3, 7), window(5, 7), window(5, 6)}
     cloudflare.add_zone("z", "example.org", responder=blind(events, blinded))
-    result = script.collect_zone(api, "z", "example.org", START, END)
-    assert result.requests == {}
-    assert result.limited == {"visits": 0, "requests": 1, "cache": 0, "edge": 0}
-    assert sum(result.cache.values()) == result.total_requests == 3
-    assert (
-        "requests returned an empty page for a window with traffic that was not split "
-        "(1s slice at the time resolution" in caplog.text
-    )
+    snapshot = script.collect_once(api, now=END)
+    assert snapshot.zone_success == {"example.org": 0}
+    assert snapshot.cycle_success == 0
+    assert not snapshot.requests and not snapshot.cache
+    assert not api.slice_hints
+    assert "refusing to publish incomplete analytics" in caplog.text
 
 
 def test_empty_page_under_a_configured_cap_is_reported(cloudflare, api, caplog):

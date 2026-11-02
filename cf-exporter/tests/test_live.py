@@ -183,7 +183,17 @@ def test_queried_graphql_schema_is_current(api):
     # Cloudflare exposes input-field names but not their deprecation status.
     filter_arg = next(a for a in dataset["args"] if a["name"] == "filter")
     filter_fields = introspect(api, type_name(filter_arg["type"]))["inputFields"]
-    assert {"datetime_geq", "datetime_lt", "requestSource"} <= {f["name"] for f in filter_fields}
+    queried_dimensions = {d for mapping in script.DATASETS.values() for d in mapping.values()}
+    assert {
+        "datetime_geq",
+        "datetime_lt",
+        "requestSource",
+        "AND",
+        "OR",
+        *queried_dimensions,
+        *(f"{d}_gt" for d in queried_dimensions),
+    } <= {f["name"] for f in filter_fields}
+    assert type_name(filter_arg["type"]) == "ZoneHttpRequestsAdaptiveGroupsFilter_InputObject"
     assert (
         type_name(next(f for f in filter_fields if f["name"] == "requestSource")["type"])
         == "string"
@@ -193,12 +203,15 @@ def test_queried_graphql_schema_is_current(api):
     order_values = introspect(api, type_name(order_by["type"]))["enumValues"]
     current(order_values, "count_DESC")
     current(order_values, "sum_visits_DESC")
+    for dimension in queried_dimensions:
+        current(order_values, f"{dimension}_ASC")
 
     groups = introspect(api, type_name(dataset["type"]))["fields"]
     current(groups, "count")
     sums = introspect(api, type_name(current(groups, "sum")["type"]))["fields"]
     current(sums, "visits")
     dimensions = introspect(api, type_name(current(groups, "dimensions")["type"]))["fields"]
+    current(dimensions, "datetime")
     for dimension in {d for mapping in script.DATASETS.values() for d in mapping.values()}:
         current(dimensions, dimension)
     # The eyeball filter compares against this dimension's values.
@@ -261,6 +274,42 @@ def test_every_zone_is_collected(api, zones):
     assert not failures
     # A renamed filter value would leave every zone without client requests.
     assert source_value_present(checked), checked
+
+
+def test_dimension_pagination_reads_a_completed_second_without_truncation(config, zones):
+    """Force real keyset pages, including a filtered empty tail, at page size one."""
+    config = dataclasses.replace(
+        config,
+        **{field: 0 for field in script.LIMITS if field != "page_size"},
+        page_size=1,
+        schema=script.Schema(),
+    )
+    api = script.create_api(config)
+    since, until = completed_day()
+    try:
+        for zone in zones:
+            data = api.graphql(
+                script.build_analytics_query({"requests": ["datetime"]}, ("requests",)),
+                {
+                    "zoneTag": zone["id"],
+                    "since": script.rfc3339(since),
+                    "until": script.rfc3339(until),
+                    "limit": 1,
+                },
+            )
+            groups = script.zone_node(data, zone["id"])["requests"]
+            if not groups:
+                continue
+            start = datetime.fromisoformat(groups[0]["dimensions"]["datetime"])
+            end = start + timedelta(seconds=1)
+            result = script.collect_zone(api, zone["id"], zone["name"], start, end)
+            assert result.total_requests > 0
+            assert not any(result.limited.values())
+            assert_sums_match_totals(api, zone, result, start, end)
+            return
+        pytest.skip("no completed-day traffic for pagination")
+    finally:
+        api.session.close()
 
 
 def test_disabled_labels_are_aggregated_by_the_api(config, zones):

@@ -120,6 +120,20 @@ def aggregating_responder(events, origin):
     pass the selection's filter are grouped by the requested dimensions only,
     ordered largest first, and only then cut to the page size."""
 
+    def passes(values, predicate):
+        if "OR" in predicate:
+            return any(passes(values, branch) for branch in predicate["OR"])
+        for name, value in predicate.items():
+            if name.endswith("_gt"):
+                matched = values[name.removesuffix("_gt")] > value
+            elif name.endswith("_geq"):
+                matched = values[name.removesuffix("_geq")] >= value
+            else:
+                matched = values[name] == value
+            if not matched:
+                return False
+        return True
+
     def respond(body):
         variables = body["variables"]
         start = datetime.fromisoformat(variables["since"])
@@ -128,8 +142,13 @@ def aggregating_responder(events, origin):
         for kind, filters, dimensions in selections(body["query"]):
             groups = {}
             for second, count, values in events:
-                if start <= origin + timedelta(seconds=second) < end and eyeball_only(
-                    filters, {"dimensions": values}
+                if (
+                    start <= origin + timedelta(seconds=second) < end
+                    and eyeball_only(filters, {"dimensions": values})
+                    and passes(
+                        {**values, "datetime": script.rfc3339(origin + timedelta(seconds=second))},
+                        variables.get("after", {}),
+                    )
                 ):
                     key = tuple(values.get(dimension) for dimension in dimensions)
                     groups[key] = groups.get(key, 0) + count
@@ -138,7 +157,11 @@ def aggregating_responder(events, origin):
                 node[kind] = [{"count": total, "sum": {"visits": total}}] if total else []
                 continue
             make = visits_group if kind == "visits" else requests_group
-            ranked = sorted(groups.items(), key=lambda item: item[1], reverse=True)
+            ranked = (
+                sorted(groups.items())
+                if "after" in variables
+                else sorted(groups.items(), key=lambda item: item[1], reverse=True)
+            )
             node[kind] = [
                 make(value, **dict(zip(dimensions, key, strict=True)))
                 for key, value in ranked[: variables["limit"]]
@@ -256,8 +279,10 @@ def rsps():
 
 
 @pytest.fixture
-def api():
-    return script.CloudflareAPI("dummy-credential", request_timeout=5, base_url=BASE_URL)
+def api(request):
+    return script.CloudflareAPI(
+        "dummy-credential", request_timeout=5, base_url=BASE_URL, **getattr(request, "param", {})
+    )
 
 
 @pytest.fixture

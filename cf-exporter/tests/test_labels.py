@@ -263,6 +263,57 @@ def test_group_cap_applies_per_zone_before_zones_are_combined(cloudflare, api, c
     assert limited == {"a.example": 1, "b.example": 1}
 
 
+@pytest.mark.parametrize("failure", ["not authorized", "rate limiter budget depleted"])
+def test_failed_zone_omits_combined_families_and_keeps_independent_zones(
+    cloudflare, api, clock, failure
+):
+    cloudflare.add_zone("a", "a.example", responder=aggregating_responder(EVENTS, DAY))
+    cloudflare.add_zone("b", "b.example", responder=aggregating_responder(EVENTS[:1], DAY))
+    api.schema = schema(cf_requests=["zone_name"], cf_zone_requests=["zone_name"])
+    collector = publish(api, clock, clock.value)
+    assert sum(s.value for s in samples(collector, "cf_requests")) == 12
+    api.max_retry_after_seconds = 30
+    cloudflare.zones["b"]["error"] = failure
+    publish(api, clock, clock.value, collector=collector)
+    assert samples(collector, "cf_requests") == samples(collector, "cf_zone_requests") == []
+    assert {s.labels["zone_name"] for s in samples(collector, "cf_visits")} == {"a.example"}
+    assert {
+        s.labels["zone_name"]: s.value
+        for s in samples(collector, "cf_exporter_zone_scrape_success")
+    } == {
+        "a.example": 1,
+        "b.example": 0,
+    }
+    assert samples(collector, "cf_exporter_last_cycle_success")[0].value == 0
+    cloudflare.zones["b"]["error"] = None
+    publish(api, clock, clock.value, collector=collector)
+    assert sum(s.value for s in samples(collector, "cf_requests")) == 12
+
+
+def test_cross_zone_series_keep_every_contribution_without_an_explicit_cap(cloudflare, api, clock):
+    cloudflare.add_zone(
+        "a",
+        "a.example",
+        responder=aggregating_responder(
+            [event(0, 10, clientRequestPath="/x"), event(1, 1, clientRequestPath="/y")], DAY
+        ),
+    )
+    cloudflare.add_zone(
+        "b",
+        "b.example",
+        responder=aggregating_responder(
+            [event(0, 9, clientRequestPath="/x"), event(1, 20, clientRequestPath="/y")], DAY
+        ),
+    )
+    api.schema = schema(cf_requests=list(set(script.REQUESTS_LABELS) - {"path"}))
+    collector = publish(api, clock, clock.value)
+    assert {s.labels["path"]: s.value for s in samples(collector, "cf_requests")} == {
+        "/x": 19,
+        "/y": 21,
+    }
+    assert all(s.value == 0 for s in samples(collector, "cf_exporter_group_limit_reached"))
+
+
 def test_schema_belongs_to_its_instance_and_snapshot(cloudflare, clock):
     catalog = {name: tuple(labels) for name, labels in script.METRIC_LABELS.items()}
     datasets = {kind: dict(mapping) for kind, mapping in script.DATASETS.items()}

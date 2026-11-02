@@ -21,8 +21,13 @@ health metrics. No dependencies are added.
   Cloudflare's documented quota and the scrape interval, the 60-second minimum
   slice, the 30-second maximum `Retry-After` and the 10000-group page cap are
   removed. Slices go down to one second, the window's resolution, and use the
-  plan's `maxPageSize`. A full one-second slice is still reported as truncated.
-- A `Retry-After` is waited for whatever its length unless a maximum is set.
+  plan's `maxPageSize`. Full one-second slices use dimension pagination rather
+  than publishing a truncated successful result.
+- A `Retry-After` is waited for whatever its length unless a maximum is set,
+  without inheriting urllib3's six-hour cap. HTTP 429 and GraphQL budget errors
+  wait and resume the same request without a default retry count limit, retaining
+  collected slices and continuing to later zones. A missing cooldown uses 300
+  seconds. The bounded retries for other transient failures remain separate.
 - The warning for a full page that was not split names the page size, the
   reason and the remaining budgets, rather than calling the page size a group
   limit: `returned a full page of N groups that was not split (...)`. A configured
@@ -56,6 +61,16 @@ health metrics. No dependencies are added.
 
 ### Fixed
 
+- Full one-second slices are paginated by the complete ordered dimension tuple,
+  using variable-based lexicographic filters and preserving the window and edge
+  source filter. Equal counts do not lose groups. Empty remaining ranges are
+  checked independently; unverifiable or nonadvancing pages fail the zone and
+  publish neither partial analytics nor slice hints. Only explicit operator
+  limits may permit truncated results.
+- A failed zone no longer reduces a metric aggregated without `zone_name` into
+  an apparently valid smaller sum. Those families, including combined zone totals,
+  are omitted until a successful cycle; independent zoned families and health
+  diagnostics remain available. No old and current windows are mixed.
 - Empty pages whose dimensionless check does not fit an explicit budget are
   flagged as incomplete instead of silently reporting zero traffic. Visits with
   a zero whole-window visit total need no check, even if requests exist.
@@ -81,8 +96,8 @@ health metrics. No dependencies are added.
   that window, so its requests were missing every cycle without a truncation
   flag. An empty page
   of a zone with traffic is now checked with one dimensionless read of the same
-  window and filter; a window with traffic is split like a full page, and one
-  that cannot be split is reported as truncated.
+  window and filter; a window with traffic is split like a full page, and a full
+  second uses dimension pagination. Unrecoverable empty pages fail the zone.
 - Slice hints kept only the number of slices and re-cut the whole day evenly
   every cycle. A burst then needed recursive splits again, and with the fixed
   per-selection limit an unchanged window first completed and later became

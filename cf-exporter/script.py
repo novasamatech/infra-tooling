@@ -24,6 +24,7 @@ import time
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from functools import partial
 from itertools import pairwise
 from socketserver import ThreadingMixIn
@@ -36,7 +37,7 @@ from prometheus_client import REGISTRY, make_wsgi_app
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
 from prometheus_client.registry import Collector
 from requests.adapters import HTTPAdapter
-from urllib3.exceptions import MaxRetryError, NewConnectionError, ResponseError
+from urllib3.exceptions import InvalidHeader, MaxRetryError, NewConnectionError, ResponseError
 from urllib3.exceptions import TimeoutError as TransportTimeoutError
 from urllib3.util.retry import Retry
 
@@ -45,6 +46,8 @@ ZONES_PER_PAGE = 50  # maximum allowed by GET /zones
 # Slices are whole seconds, the resolution of the window contract, unless the
 # operator configures a longer minimum.
 SLICE_RESOLUTION_SECONDS = 1
+# Cloudflare's documented cooldown when a rate-limit response has no Retry-After.
+RATE_LIMIT_RETRY_SECONDS = 300
 # The cycle before UTC midnight is moved earlier when it would not finish this
 # many seconds before midnight, so the day's final minutes are still exported.
 DAY_CLOSE_MARGIN_SECONDS = 30
@@ -197,7 +200,7 @@ class CloudflareAPIError(Exception):
 
 
 class RateLimitedError(CloudflareAPIError):
-    """Cloudflare rejected a request for its rate limit; later ones in this cycle would fail too."""
+    """An explicitly configured limit prevents waiting for Cloudflare's rate limit."""
 
 
 @dataclass(frozen=True)
@@ -328,6 +331,30 @@ class BoundedRetry(Retry):
     # Longest Retry-After to wait for, in seconds; None waits for any.
     max_retry_after: int | None = None
 
+    def parse_retry_after(self, retry_after: str) -> float:
+        # urllib3 otherwise silently caps Retry-After at six hours. Only the
+        # operator's explicit maximum may limit how long this exporter waits.
+        raw = retry_after.strip()
+        if raw.isascii() and raw.isdecimal():
+            return int(raw)
+        try:
+            date = parsedate_to_datetime(raw)
+        except (TypeError, ValueError, OverflowError):
+            raise InvalidHeader(f"Invalid Retry-After header: {retry_after}") from None
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=UTC)
+        return max(0, date.timestamp() - time.time())
+
+    def sleep(self, response=None) -> None:
+        if response is not None and response.status == 429 and self.max_retry_after is None:
+            delay = self.get_retry_after(response) or RATE_LIMIT_RETRY_SECONDS
+            logging.warning(
+                "Cloudflare rate limit: waiting %.0fs before retrying the request", delay
+            )
+            time.sleep(delay)
+        else:
+            super().sleep(response)
+
     def new(self, **kw):
         # urllib3 creates a Retry per attempt from its own parameters only.
         retry = super().new(**kw)
@@ -350,7 +377,12 @@ class BoundedRetry(Retry):
                 url,
                 ResponseError(f"Retry-After {retry_after:.0f}s exceeds {self.max_retry_after}s"),
             )
-        retry = super().increment(method, url, response, error, _pool, _stacktrace)
+        if response is not None and response.status == 429 and self.max_retry_after is None:
+            # Rate limiting must not spend the transient-error retry allowance,
+            # abandon the current page or skip later zones. Keep history bounded.
+            retry = self.new()
+        else:
+            retry = super().increment(method, url, response, error, _pool, _stacktrace)
         # Only a retried attempt gets here. A final one raises above or returns
         # its response, and CloudflareAPI._request reports it.
         if self.on_retry is not None:
@@ -464,6 +496,7 @@ class CloudflareAPI:
         self.max_slice_requests = max_slice_requests
         self.max_extra_selections = max_extra_selections
         self.min_slice_seconds = min_slice_seconds
+        self.max_retry_after_seconds = max_retry_after_seconds or None
         self.page_size = page_size
         self.schema = Schema() if schema is None else schema
         # (zone ID, dataset) -> (query signature, leaf slice starts after midnight)
@@ -604,16 +637,27 @@ class CloudflareAPI:
 
     def graphql(self, query: str, variables: Mapping) -> dict:
         """Execute a GraphQL query and return its `data`; any error raises."""
-        payload = self._request(
-            "POST", "/graphql", json={"query": query, "variables": dict(variables)}
-        )
-        if payload.get("errors"):
+        while True:
+            payload = self._request(
+                "POST", "/graphql", json={"query": query, "variables": dict(variables)}
+            )
+            if not payload.get("errors"):
+                break
             message = self._redact(f"GraphQL: {format_errors(payload['errors'])}")
             budget = _is_budget_error(payload["errors"])
             self.stats.record("graphql", error="budget_depleted" if budget else "graphql")
-            if budget:
+            if not budget:
+                raise CloudflareAPIError(message)
+            if (
+                self.max_retry_after_seconds is not None
+                and self.max_retry_after_seconds < RATE_LIMIT_RETRY_SECONDS
+            ):
                 raise RateLimitedError(message)
-            raise CloudflareAPIError(message)
+            logging.warning(
+                "Cloudflare GraphQL budget depleted: waiting %ds before retrying the request",
+                RATE_LIMIT_RETRY_SECONDS,
+            )
+            time.sleep(RATE_LIMIT_RETRY_SECONDS)
         data = payload.get("data")
         if not isinstance(data, dict):
             raise self._invalid("graphql", "GraphQL: response contains no data")
@@ -633,6 +677,8 @@ def rfc3339(moment: datetime) -> str:
 def build_analytics_query(
     dimensions: Mapping[str, Sequence[str]],
     datasets: Sequence[str] = (*DATASETS, "totals"),
+    *,
+    paging: bool = False,
 ) -> str:
     """Build an aliased query for just the selections needed by this window.
 
@@ -651,7 +697,11 @@ def build_analytics_query(
         )
         limit = "1" if totals else "$limit"
         order = "sum_visits_DESC" if kind == "visits" else "count_DESC"
+        if paging and fields:
+            order = ", ".join(f"{d}_ASC" for d in fields)
         extra = f", {FILTERED_DATASETS[kind]}" if kind in FILTERED_DATASETS else ""
+        if paging:
+            extra += ", AND: [$after]"
         selections.append(f"""
       {kind}: httpRequestsAdaptiveGroups(
         limit: {limit}
@@ -660,8 +710,12 @@ def build_analytics_query(
       ) {{ {value} {selection} }}""")
     # GraphQL rejects declarations of unused variables (e.g. a totals-only query).
     limit_variable = ", $limit: uint64!" if any(k != "totals" for k in datasets) else ""
+    cursor_variable = (
+        ", $after: ZoneHttpRequestsAdaptiveGroupsFilter_InputObject!" if paging else ""
+    )
+    parameters = f"$zoneTag: string!, $since: Time!, $until: Time!{limit_variable}{cursor_variable}"
     return f"""
-query HttpRequests($zoneTag: string!, $since: Time!, $until: Time!{limit_variable}) {{
+query HttpRequests({parameters}) {{
   viewer {{
     zones(filter: {{zoneTag: $zoneTag}}) {{
       {"".join(selections)}
@@ -901,7 +955,11 @@ def collect_zone(
     signatures = {kind: (tuple(dimensions[kind]), page_size) for kind in DATASETS}
 
     def fetch(
-        kinds: tuple[str, ...], start: datetime, end: datetime, dimensionless: bool = False
+        kinds: tuple[str, ...],
+        start: datetime,
+        end: datetime,
+        dimensionless: bool = False,
+        after: dict | None = None,
     ) -> dict:
         variables = {
             "zoneTag": zone_id,
@@ -910,7 +968,11 @@ def collect_zone(
         }
         if any(k != "totals" for k in kinds):
             variables["limit"] = 1 if dimensionless else page_size
-        query = build_analytics_query({} if dimensionless else dimensions, kinds)
+        if after is not None:
+            variables["after"] = after
+        query = build_analytics_query(
+            {} if dimensionless else dimensions, kinds, paging=after is not None
+        )
         return zone_node(api.graphql(query, variables), zone_id)
 
     def value_of(kind: str, group: dict) -> float | None:
@@ -1008,6 +1070,84 @@ def collect_zone(
                 hidden.add(kind)
         return hidden
 
+    def paginate(kind: str, start: datetime, end: datetime) -> dict[LabelValues, float] | None:
+        """Read a saturated second by the complete dimension tuple, without a cap.
+
+        Counts can tie and change, so they cannot be pagination keys. Each OR
+        branch advances one dimension after fixing its predecessors. All pages
+        keep the exact time window and dataset filter, including edge's scope.
+        """
+        values: dict[LabelValues, float] = {}
+        # Cloudflare rejects an empty object inside AND, so the first ordered
+        # page repeats the already-required lower time bound as its predicate.
+        after: dict = {"datetime_geq": rfc3339(start)}
+        previous: tuple | None = None
+
+        def page(dimensionless: bool = False) -> list | None:
+            if (budget[kind] is not None and budget[kind] < 1) or (
+                api.slice_allowance is not None and api.slice_allowance < 1
+            ):
+                cuts[kind] = (
+                    "explicit budget prevented completing dimension pagination; "
+                    f"dataset reads left: {_remaining(budget[kind])}, "
+                    f"shared extra selections left: {_remaining(api.slice_allowance)}"
+                )
+                return None
+            if budget[kind] is not None:
+                budget[kind] -= 1
+            if api.slice_allowance is not None:
+                api.slice_allowance -= 1
+            node = fetch((kind,), start, end, dimensionless=dimensionless, after=after)
+            return group_list(kind, node.get(kind))
+
+        while True:
+            groups = page()
+            if groups is None:
+                return values if previous is not None else None
+            read = partial(value_of, kind)
+            for group in groups:
+                checked_value(kind, group, read)
+                raw = _group_dimensions(kind, group, dimensions[kind])
+                key = tuple(raw.get(d) for d in dimensions[kind])
+                if any(value is None for value in key):
+                    raise CloudflareAPIError(f"GraphQL: {kind} pagination lacks a dimension")
+                try:
+                    advances = previous is None or key > previous
+                except TypeError:
+                    advances = False
+                if not advances:
+                    raise CloudflareAPIError(f"GraphQL: {kind} pagination did not advance")
+                previous = key
+            _add_samples(
+                values,
+                _aggregate(
+                    prefixes[kind], groups, exported[kind], dimensions[kind], read, label_pool
+                ),
+            )
+            if not groups:
+                # An empty next page can be the same API anomaly as an empty
+                # time slice. Certify the remaining filtered range independently.
+                aggregate = page(dimensionless=True)
+                if aggregate is None:
+                    return values
+                if len(aggregate) > 1:
+                    raise CloudflareAPIError(f"GraphQL: {kind} contains no valid aggregate list")
+                if aggregate and checked_value(kind, aggregate[0], read) > 0:
+                    raise CloudflareAPIError(
+                        f"GraphQL: {kind} pagination returned an empty page with traffic; "
+                        "refusing to publish incomplete analytics"
+                    )
+                return values
+            if len(groups) < page_size or not dimensions[kind]:
+                return values
+            raw = groups[-1]["dimensions"]
+            prefix = {}
+            branches = []
+            for dimension in dimensions[kind]:
+                branches.append({**prefix, f"{dimension}_gt": raw[dimension]})
+                prefix[dimension] = raw[dimension]
+            after = {"OR": branches}
+
     def merge(node: dict, kinds: tuple[str, ...], start: datetime, end: datetime) -> None:
         split = []
         seconds = (end - start).total_seconds()
@@ -1037,6 +1177,12 @@ def collect_zone(
             # Its one aggregate is complete even when page_size is one.
             full = bool(dimensions[kind]) and len(groups) >= page_size and read(groups[-1]) > 0
             if full or kind in hidden:
+                if not single_page and seconds <= SLICE_RESOLUTION_SECONDS:
+                    paged = paginate(kind, start, end)
+                    if paged is not None:
+                        _add_samples(samples[kind], paged)
+                        leaves[kind].append(start)
+                        continue
                 page = (
                     f"returned a full page of {page_size} groups"
                     if full
@@ -1349,6 +1495,10 @@ class CloudflareCollector(Collector):
             ("edge", "Client requests by edge and origin response status since midnight UTC"),
         ):
             name = METRICS[kind]
+            if "zone_name" not in schema.labels(name) and snapshot.cycle_success != 1:
+                # A sum over a changing subset of zones looks like a traffic
+                # change. Preserve independent zoned families and health only.
+                continue
             metric = GaugeMetricFamily(name, description, labels=schema.labels(name))
             for labels, value in getattr(snapshot, kind).items():
                 metric.add_metric(labels, value)
@@ -1358,6 +1508,8 @@ class CloudflareCollector(Collector):
             ("cf_zone_visits", "Total zone visits since midnight UTC", snapshot.zone_visits),
         ):
             label_names = schema.labels(name)
+            if not label_names and snapshot.cycle_success != 1:
+                continue
             metric = GaugeMetricFamily(name, description, labels=label_names)
             if label_names:
                 for zone, value in totals.items():
@@ -1375,7 +1527,7 @@ class CloudflareCollector(Collector):
             ),
             (
                 "cf_exporter_group_limit_reached",
-                "Whether groups were truncated (1) or complete (0)",
+                "Whether an explicit limit left the dataset incomplete (1) or complete (0)",
                 ("zone_name", "dataset"),
                 snapshot.limited,
             ),
