@@ -44,7 +44,8 @@ def _sample_values(body: str, name: str):
     for labels, value in re.findall(pattern, body, re.MULTILINE):
         yield (
             {
-                key: json.loads(quoted)
+                # Prometheus permits literal tabs and carriage returns in labels.
+                key: json.loads(quoted, strict=False)
                 for key, quoted in re.findall(r'(\w+)=("(?:\\.|[^"\\])*")', labels)
             },
             float(value),
@@ -88,16 +89,128 @@ def checked_snapshot_windows(body: str) -> dict[str, tuple[str, float]]:
 
 ALWAYS_COLLECTED = ("visits", "requests", "cache")
 DATASET_NAMES = (*ALWAYS_COLLECTED, "edge")
-EDGE_LABELS = frozenset(
-    {
+# Mirrors script.METRIC_LABELS, the labels of every analytics family by default.
+METRIC_LABELS = {
+    "cf_visits": (
+        "zone_name",
+        "host_name",
+        "path",
+        "client_country_name",
+        "client_request_referer",
+        "user_agent_browser",
+        "user_agent_os",
+    ),
+    "cf_requests": (
+        "zone_name",
+        "host_name",
+        "method_name",
+        "path",
+        "query",
+        "client_country_name",
+        "client_request_referer",
+        "user_agent_browser",
+        "user_agent_os",
+        "cache_status",
+        "origin_response_status",
+    ),
+    "cf_cache_requests": (
+        "zone_name",
+        "host_name",
+        "method_name",
+        "path",
+        "cache_status",
+        "origin_response_status",
+    ),
+    "cf_edge_requests": (
         "zone_name",
         "host_name",
         "method_name",
         "path",
         "edge_response_status",
         "origin_response_status",
-    }
+    ),
+    "cf_zone_requests": ("zone_name",),
+    "cf_zone_visits": ("zone_name",),
+}
+EDGE_LABELS = frozenset(METRIC_LABELS["cf_edge_requests"])
+# Exporter settings forwarded to the container when set. The container port is
+# fixed by the port mapping, and the token only travels over stdin.
+FORWARDED_SETTINGS = (
+    "CF_EXPORTER_REQUEST_TIMEOUT",
+    "CF_EXPORTER_SCRAPE_INTERVAL",
+    "CF_EXPORTER_LOGLEVEL",
+    "CF_EXPORTER_GROUP_LIMIT",
+    "CF_EXPORTER_MAX_SLICE_REQUESTS",
+    "CF_EXPORTER_MAX_EXTRA_SELECTIONS",
+    "CF_EXPORTER_MIN_SLICE_SECONDS",
+    "CF_EXPORTER_MAX_RETRY_AFTER_SECONDS",
+    "CF_EXPORTER_PAGE_SIZE",
+    "CF_EXPORTER_DISABLED_LABELS",
 )
+
+
+def expected_labels(disabled: str = "") -> dict[str, frozenset[str]]:
+    """Labels of every analytics family for a CF_EXPORTER_DISABLED_LABELS value.
+
+    The exporter validates the value; this only applies it.
+    """
+    removed = json.loads(disabled) if disabled.strip() else {}
+    return {
+        name: frozenset(labels) - frozenset(removed.get(name, ()))
+        for name, labels in METRIC_LABELS.items()
+    }
+
+
+def checked_analytics_labels(body: str, expected: dict[str, frozenset[str]]) -> dict[str, int]:
+    """Validate labels, values and sample counts against the snapshot's health.
+
+    Returns the number of samples per family.
+
+    Raises:
+        ValueError: A sample is invalid, duplicated, missing or inconsistent with health.
+    """
+    groups = _by_zone_and_dataset(body, "cf_exporter_groups")
+    if any(not math.isfinite(v) or v < 0 or not v.is_integer() for v in groups.values()):
+        raise ValueError("invalid dataset group count")
+    successful = {
+        labels["zone_name"]
+        for labels, value in _sample_values(body, "cf_exporter_zone_scrape_success")
+        if value == 1
+    }
+    datasets = {
+        "cf_visits": "visits",
+        "cf_requests": "requests",
+        "cf_cache_requests": "cache",
+        "cf_edge_requests": "edge",
+    }
+    counts = {}
+    for name, labels in expected.items():
+        seen = set()
+        by_zone = {}
+        for sample_labels, value in _sample_values(body, name):
+            if set(sample_labels) != labels:
+                raise ValueError(f"unexpected {name} labels")
+            key = tuple(sorted(sample_labels.items()))
+            if key in seen:
+                raise ValueError(f"duplicate {name} sample")
+            seen.add(key)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"invalid {name} value")
+            zone = sample_labels.get("zone_name")
+            by_zone[zone] = by_zone.get(zone, 0) + 1
+        if name in datasets:
+            wanted = {
+                zone: int(value) for (zone, kind), value in groups.items() if kind == datasets[name]
+            }
+        else:
+            wanted = dict.fromkeys(successful, 1)
+        if "zone_name" in labels:
+            if set(by_zone) - set(wanted) or any(by_zone.get(z, 0) != n for z, n in wanted.items()):
+                raise ValueError(f"{name} samples do not match snapshot health")
+        elif not max(wanted.values(), default=0) <= len(seen) <= sum(wanted.values()):
+            raise ValueError(f"{name} samples do not match snapshot health")
+        counts[name] = len(seen)
+    return counts
 
 
 def _by_zone_and_dataset(body: str, name: str) -> dict[tuple[str, str], float]:
@@ -110,18 +223,20 @@ def _by_zone_and_dataset(body: str, name: str) -> dict[tuple[str, str], float]:
     return result
 
 
-def checked_edge_family(body: str) -> dict[str, int]:
-    """Validate cf_edge_requests and dataset health from one exposition.
+def checked_edge_family(body: str, labels: frozenset[str] = EDGE_LABELS) -> dict[str, int]:
+    """Validate cf_edge_requests, exported with `labels`, and dataset health from one
+    exposition.
 
-    Returns the number of edge samples of every zone that collects the dataset.
+    Returns the number of edge label sets of every zone that collects the dataset:
+    its samples, or without zone_name its cf_exporter_groups value.
 
     Raises:
         ValueError: Edge samples or dataset health are invalid or inconsistent.
         KeyError: A successful-zone health sample lacks its zone label.
     """
     successful = {
-        labels["zone_name"]
-        for labels, value in _sample_values(body, "cf_exporter_zone_scrape_success")
+        health["zone_name"]
+        for health, value in _sample_values(body, "cf_exporter_zone_scrape_success")
         if value == 1
     }
     available = _by_zone_and_dataset(body, "cf_exporter_dataset_available")
@@ -140,20 +255,22 @@ def checked_edge_family(body: str) -> dict[str, int]:
         raise ValueError("invalid dataset group count")
     if any(value not in (0, 1) for value in limited.values()):
         raise ValueError("invalid dataset truncation flag")
+    edge_zones = {zone for zone in successful if available[(zone, "edge")] == 1}
     counts = dict.fromkeys(successful, 0)
     seen = set()
-    for labels, value in _sample_values(body, "cf_edge_requests"):
-        if set(labels) != EDGE_LABELS:
+    for sample_labels, value in _sample_values(body, "cf_edge_requests"):
+        if set(sample_labels) != labels:
             raise ValueError("unexpected edge labels")
-        key = tuple(sorted(labels.items()))
+        key = tuple(sorted(sample_labels.items()))
         if key in seen:
             raise ValueError("duplicate edge sample")
         seen.add(key)
-        if available.get((labels["zone_name"], "edge")) != 1:
+        zone = sample_labels.get("zone_name")
+        if (zone is None and not edge_zones) or (zone is not None and zone not in edge_zones):
             raise ValueError("edge samples for a zone without the edge dataset")
         for label in ("edge_response_status", "origin_response_status"):
-            status = labels[label]
-            if label == "origin_response_status" and status == "unknown":
+            status = sample_labels.get(label)
+            if status is None or (label == "origin_response_status" and status == "unknown"):
                 continue
             if (
                 not re.fullmatch(r"[0-9]+", status)
@@ -163,11 +280,16 @@ def checked_edge_family(body: str) -> dict[str, int]:
                 raise ValueError("edge sample with an invalid status")
         if not math.isfinite(value) or value <= 0:
             raise ValueError("edge sample without requests")
-        counts[labels["zone_name"]] += 1
-    for zone in successful:
-        if available[(zone, "edge")] == 1 and groups[(zone, "edge")] != counts[zone]:
+        if zone is not None:
+            counts[zone] += 1
+    per_zone = {zone: int(groups[(zone, "edge")]) for zone in edge_zones}
+    if "zone_name" in labels:
+        if per_zone != {zone: counts[zone] for zone in edge_zones}:
             raise ValueError("edge samples do not match cf_exporter_groups")
-    return {zone: count for zone, count in counts.items() if available[(zone, "edge")] == 1}
+    # Zones combine identical label sets: at least the largest zone's, at most all.
+    elif not max(per_zone.values(), default=0) <= len(seen) <= sum(per_zone.values()):
+        raise ValueError("edge samples do not match cf_exporter_groups")
+    return per_zone
 
 
 def cycle_started_today(body: str) -> bool:
@@ -261,6 +383,11 @@ def main() -> int:
     engine, image, port, timeout = sys.argv[1:]
     token = os.environ["CF_EXPORTER_API_TOKEN"].strip()
     command = shlex.split(engine)
+    labels = expected_labels(os.environ.get("CF_EXPORTER_DISABLED_LABELS", ""))
+    # By name only: the container reads each value from this process's environment.
+    settings = [
+        flag for name in FORWARDED_SETTINGS if name in os.environ for flag in ("--env", name)
+    ]
     # Temporary files contain only the container ID and redacted process logs.
     with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent) as directory:
         cidfile = Path(directory) / "container.id"
@@ -275,6 +402,7 @@ def main() -> int:
                     str(cidfile),
                     "-p",
                     f"127.0.0.1:{port}:8000",
+                    *settings,
                     image,
                     "/bin/sh",
                     "-c",
@@ -345,10 +473,12 @@ def main() -> int:
                                         return 1
                                 try:
                                     checked_snapshot_windows(body)
-                                    checked_edge_family(body)
+                                    checked_edge_family(body, labels["cf_edge_requests"])
+                                    series = checked_analytics_labels(body, labels)
                                 except (KeyError, ValueError) as error:
                                     print(f"image smoke test: FAILED - {error}")
                                     return 1
+                                print(f"image smoke test: series {series}")
                             else:
                                 print(
                                     "image smoke test: cycle crossed UTC midnight, "

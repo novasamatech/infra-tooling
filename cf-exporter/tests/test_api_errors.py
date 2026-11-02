@@ -15,6 +15,7 @@ import responses
 from conftest import BASE_URL, NOW, requests_group
 from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.parser import text_string_to_metric_families
+from urllib3.exceptions import InvalidHeader
 
 import script
 
@@ -97,6 +98,7 @@ def graphql_call(api):
         (graphql_call, {"status": 504, "json": {}}, {"server_error": 1}),
     ],
 )
+@pytest.mark.parametrize("api", [{"max_retry_after_seconds": 30}], indirect=True)
 def test_every_attempt_counts_once(rsps, api, call, mock, expected):
     """Each response counts once, with at most one error kind. The transport retries
     429 and 5xx responses three times; every attempt is counted, none twice."""
@@ -136,7 +138,16 @@ def test_transport_failure_counts_without_a_response(rsps, api, exception, error
 
 
 def test_cycle_counts_listing_settings_and_a_failed_zone(cloudflare, api):
-    cloudflare.add_zone("a", "good.example", requests=[requests_group(4)])
+    # Consistent datasets of the same requests: no empty page needs a check.
+    group = requests_group(4, edgeResponseStatus=200)
+    cloudflare.add_zone(
+        "a",
+        "good.example",
+        visits=[{"sum": {"visits": 0}}],
+        requests=[group],
+        cache=[group],
+        edge=[group],
+    )
     cloudflare.add_zone("b", "bad.example", error="not authorized")
     snapshot = script.collect_once(api, now=NOW)
     assert snapshot.zone_success == {"good.example": 1, "bad.example": 0}
@@ -156,8 +167,9 @@ def no_backoff(monkeypatch):
 
 
 @pytest.fixture
-def server():
-    """A local API whose responses tests script; transport retries are real."""
+def server(request):
+    """A local API whose responses tests script; transport retries are real.
+    Indirect parameters are client options."""
     replies, release = [], threading.Event()
 
     class Handler(BaseHTTPRequestHandler):
@@ -184,6 +196,7 @@ def server():
             "dummy-credential",
             request_timeout=0.5,
             base_url=f"http://127.0.0.1:{httpd.server_port}",
+            **getattr(request, "param", {}),
         )
         client.session.trust_env = False
         try:
@@ -209,7 +222,99 @@ def test_retried_attempts_are_counted_with_the_final_one(server, no_backoff):
     }
 
 
-def test_long_retry_after_counts_its_single_rate_limited_attempt(server, no_backoff):
+def test_long_retry_after_is_waited_for_by_default_and_counted(server, no_backoff):
+    client, replies = server
+    replies.extend([(429, {"Retry-After": "300"}), (200, {})])
+    assert client.graphql("q", {}) == {"viewer": {}}
+    assert no_backoff == [300]
+    assert counters(client) == {
+        ("responses", "graphql", "429"): 1,
+        ("responses", "graphql", "200"): 1,
+        ("errors", "graphql", "rate_limited"): 1,
+    }
+
+
+@pytest.mark.parametrize("headers, delay", [({"Retry-After": "300"}, 300), ({}, 300)])
+def test_rate_limits_beyond_three_retries_resume_the_same_request(
+    server, no_backoff, headers, delay
+):
+    client, replies = server
+    replies.extend([(429, headers)] * 5 + [(200, {})])
+    assert client.graphql("q", {"same": "window"}) == {"viewer": {}}
+    assert no_backoff == [delay] * 5
+    assert counters(client) == {
+        ("responses", "graphql", "429"): 5,
+        ("responses", "graphql", "200"): 1,
+        ("errors", "graphql", "rate_limited"): 5,
+    }
+
+
+def test_retry_after_above_the_library_default_has_no_implicit_cap(server, no_backoff):
+    client, replies = server
+    replies.extend([(429, {"Retry-After": "90000"}), (200, {})])
+    assert client.graphql("q", {}) == {"viewer": {}}
+    assert no_backoff == [90000]
+
+
+@pytest.mark.parametrize("server", [{"max_retry_after_seconds": 70000}], indirect=True)
+def test_explicit_retry_after_maximum_compares_the_original_header(server, no_backoff):
+    client, replies = server
+    replies.append((429, {"Retry-After": "90000"}))
+    with pytest.raises(script.RateLimitedError):
+        client.graphql("q", {})
+    assert no_backoff == []
+
+
+@pytest.mark.parametrize(
+    "header, expected",
+    [
+        ("Thu, 01 Jan 1970 00:01:40 GMT", 100),
+        ("Thu, 01 Jan 1970 00:01:40", 100),
+        ("Wed, 31 Dec 1969 23:59:00 GMT", 0),
+    ],
+)
+def test_http_date_retry_after_is_preserved(header, expected, monkeypatch):
+    monkeypatch.setattr(script.time, "time", lambda: 0)
+    assert script.BoundedRetry().parse_retry_after(header) == expected
+
+
+def test_invalid_retry_after_is_rejected():
+    with pytest.raises(InvalidHeader):
+        script.BoundedRetry().parse_retry_after("invalid date")
+
+
+def test_rate_limits_do_not_remove_the_server_error_retry_bound(server, no_backoff):
+    client, replies = server
+    replies.extend([(503, {}), (429, {"Retry-After": "1"}), (503, {}), (503, {}), (503, {})])
+    with pytest.raises(script.CloudflareAPIError, match="HTTP 503"):
+        client.graphql("q", {})
+    assert counters(client) == {
+        ("responses", "graphql", "503"): 4,
+        ("responses", "graphql", "429"): 1,
+        ("errors", "graphql", "server_error"): 4,
+        ("errors", "graphql", "rate_limited"): 1,
+    }
+
+
+def test_graphql_budget_errors_resume_the_exact_request_and_count_every_attempt(
+    rsps, api, no_backoff
+):
+    payload = {"data": None, "errors": [{"extensions": {"code": "budget"}}]}
+    for _ in range(5):
+        rsps.add(responses.POST, f"{BASE_URL}/graphql", json=payload)
+    rsps.add(responses.POST, f"{BASE_URL}/graphql", json={"data": {"viewer": {}}})
+    assert api.graphql("original query", {"until": "fixed window"}) == {"viewer": {}}
+    bodies = [json.loads(call.request.body) for call in rsps.calls]
+    assert bodies == [{"query": "original query", "variables": {"until": "fixed window"}}] * 6
+    assert no_backoff == [300] * 5
+    assert counters(api) == {
+        ("responses", "graphql", "200"): 6,
+        ("errors", "graphql", "budget_depleted"): 5,
+    }
+
+
+@pytest.mark.parametrize("server", [{"max_retry_after_seconds": 30}], indirect=True)
+def test_retry_after_above_the_maximum_counts_its_single_rate_limited_attempt(server, no_backoff):
     client, replies = server
     replies.append((429, {"Retry-After": "300"}))
     with pytest.raises(script.RateLimitedError):

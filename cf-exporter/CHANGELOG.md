@@ -8,6 +8,103 @@ SPDX-License-Identifier: Apache-2.0
 All notable changes to `cf-exporter` are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.8.0] — 2026-10-29
+
+Metric names, labels and label order are unchanged by default, as are the
+traffic scope of every family, the UTC window contract, readiness and the
+health metrics. No dependencies are added.
+
+### Changed
+
+- The exporter no longer limits its own collection by default. The fixed limit
+  of 32 reads per zone and selection, the cycle budget derived from two thirds of
+  Cloudflare's documented quota and the scrape interval, the 60-second minimum
+  slice, the 30-second maximum `Retry-After` and the 10000-group page cap are
+  removed. Slices go down to one second, the window's resolution, and use the
+  plan's `maxPageSize`. Full one-second slices use dimension pagination rather
+  than publishing a truncated successful result.
+- A `Retry-After` is waited for whatever its length unless a maximum is set,
+  without inheriting urllib3's six-hour cap. HTTP 429 and GraphQL budget errors
+  wait and resume the same request without a default retry count limit, retaining
+  collected slices and continuing to later zones. A missing cooldown uses 300
+  seconds. The bounded retries for other transient failures remain separate.
+- The warning for a full page that was not split names the page size, the
+  reason and the remaining budgets, rather than calling the page size a group
+  limit: `returned a full page of N groups that was not split (...)`. A configured
+  cap keeps the `hit the N group limit (configured cap)` warning.
+
+### Added
+
+- Optional limits, each off when unset, empty or `0`:
+  `CF_EXPORTER_MAX_SLICE_REQUESTS` (reads per zone and dataset and cycle),
+  `CF_EXPORTER_MAX_EXTRA_SELECTIONS` (selections beyond one read per zone and
+  dataset, shared by all zones in a cycle), `CF_EXPORTER_MIN_SLICE_SECONDS`,
+  `CF_EXPORTER_MAX_RETRY_AFTER_SECONDS` and `CF_EXPORTER_PAGE_SIZE`, next to the
+  existing `CF_EXPORTER_GROUP_LIMIT`. The previous behavior at the default
+  interval corresponds to `CF_EXPORTER_MAX_SLICE_REQUESTS=32`,
+  `CF_EXPORTER_MIN_SLICE_SECONDS=60`, `CF_EXPORTER_MAX_RETRY_AFTER_SECONDS=30`,
+  `CF_EXPORTER_PAGE_SIZE=10000` and `CF_EXPORTER_MAX_EXTRA_SELECTIONS` of 200
+  minus 6 per zone, apart from the changed slice hints.
+- `CF_EXPORTER_DISABLED_LABELS`, a JSON object of metric names to labels, disables
+  any label of `cf_visits`, `cf_requests`, `cf_cache_requests`,
+  `cf_edge_requests`, `cf_zone_requests` and `cf_zone_visits`. The dimension is
+  left out of that metric's query, so Cloudflare aggregates before the page size.
+  Without `zone_name`, identical label sets of all zones are summed. Disabling
+  `edge_response_status` no longer requires it from the plan; the client-request
+  filter stays. Invalid values fail startup.
+- The startup log lists enabled limits and disabled labels. Make targets, live
+  tests, profiling and the image smoke test pass these settings through; the
+  smoke test checks the labels of every analytics sample against them.
+- `make profile-live` accepts `--until` for a fixed window of a day and reports
+  settings, analytics and HTTP requests and series per family separately, and the
+  zone, sums, slices and truncation of a sum that differs from its total.
+
+### Fixed
+
+- Full one-second slices are paginated by the complete ordered dimension tuple,
+  using variable-based lexicographic filters and preserving the window and edge
+  source filter. Equal counts do not lose groups. Empty remaining ranges are
+  checked independently; unverifiable or nonadvancing pages fail the zone and
+  publish neither partial analytics nor slice hints. Only explicit operator
+  limits may permit truncated results.
+- A failed zone no longer reduces a metric aggregated without `zone_name` into
+  an apparently valid smaller sum. Those families, including combined zone totals,
+  are omitted until a successful cycle; independent zoned families and health
+  diagnostics remain available. No old and current windows are mixed.
+- Empty pages whose dimensionless check does not fit an explicit budget are
+  flagged as incomplete instead of silently reporting zero traffic. Visits with
+  a zero whole-window visit total need no check, even if requests exist.
+- A dimensionless one-group response is complete at page size one; it no longer
+  triggers unnecessary slicing or a false truncation warning, with or without
+  an explicit group cap.
+- Snapshot label schemas defensively copy and freeze their disabled-label
+  mappings and sets, so later caller mutations cannot change the exposition.
+- Profiling rejects nonpositive cycle counts and invalid or unfinished `--day`
+  dates. Fixed `--until` windows on past days enforce the same sum checks as
+  `--day`. Validation retains per-zone scalar summaries instead of duplicate
+  series. Source checks accept a zone whose traffic has no client requests, but
+  require client requests in some zone with traffic, so a renamed source value
+  that empties both the filter and its reference is still detected.
+- Analytics exposition checks compare sample counts with snapshot health, so a
+  missing metric's samples cannot pass merely because its remaining labels are
+  valid. Their parser accepts legal Prometheus label values with literal tabs
+  or carriage returns, as well as escaped quotes, backslashes and newlines.
+- An empty analytics page was taken as a window without traffic. The API can
+  return no groups for a window that has traffic: one window with the full set
+  of `cf_requests` dimensions returned an empty page for several minutes, also
+  on repeated requests, while its halves did not. The remembered slices reused
+  that window, so its requests were missing every cycle without a truncation
+  flag. An empty page
+  of a zone with traffic is now checked with one dimensionless read of the same
+  window and filter; a window with traffic is split like a full page, and a full
+  second uses dimension pagination. Unrecoverable empty pages fail the zone.
+- Slice hints kept only the number of slices and re-cut the whole day evenly
+  every cycle. A burst then needed recursive splits again, and with the fixed
+  per-selection limit an unchanged window first completed and later became
+  truncated. Hints now keep the boundaries of the successful slices, extend the
+  last one as the window grows, and are not reused for other dimensions or page
+  sizes; an unchanged burst costs the same selections every cycle.
+
 ## [1.7.0] — 2026-10-27
 
 Existing metric names, labels, label order, analytics queries, the collection
