@@ -103,7 +103,8 @@ changes on `main` and the checks pass: a release bumps `.version`,
 - Verify compares what the restore created. Target-only objects outside the
   restored schemas, in `public` or without a schema are warnings; row counts and
   sequence values are read only for restored objects (the target's own may not
-  be readable by the group user).
+  be readable by the group user), and only with `verify_rows: exact`: with
+  `none` the source may keep writing after the dump.
 - Remove config-owned libpq variables (`CONFIG_OWNED_LIBPQ_ENV`) once at start,
   so psycopg and the client tools see the same environment.
 - S3 parts above `max_part_memory` are spooled to temporary files; part growth

@@ -96,7 +96,8 @@ Features:
 * **Verification.** After a restore, `verify` compares source and target
   catalogs (schemas, tables, columns, indexes, constraints, triggers, routines,
   types, views, sequences, comments), checks that all target indexes are valid
-  and compares exact row counts. Objects that only the target has outside the
+  and, for a quiescent source, compares exact row counts and sequence values.
+  Objects that only the target has outside the
   restored schemas (for example ones the database service creates in `public`
   or in its own schemas) are reported, not counted as differences.
 * **Restartable.** A state file records dumps, finished phases and checks.
@@ -113,9 +114,11 @@ Features:
   the object storage. Operator targets use host networking (`NETWORK=host`).
 * The client major version must be at least the newest server major version
   (`check` verifies it); the target server must not be older than the source.
-* Writers to the source databases (for example indexers) should be stopped
-  before the dump: the dump is a consistent snapshot, and `verify` compares row
-  counts with the live source.
+* Writers to the source databases (for example indexers) may keep running: the
+  dump is a consistent snapshot, and changes made after it do not reach the
+  target. `verify_rows: exact` compares row counts and sequence values with the
+  live source, so it needs stopped writers; with live writers use
+  `verify_rows: none`, which compares the structure only.
 * libpq environment variables that would override the config (`PGHOST`,
   `PGUSER`, `PGOPTIONS`, `PGSERVICE`, `PGSSLMODE`, ...) are ignored; others, such
   as `PGSSLROOTCERT`, apply to every connection, the client tools' included.
@@ -283,8 +286,9 @@ Verification compares full routine definitions and aggregate settings, trigger
 enablement, sequence parameters, ownership links and `last_value`/`is_called`,
 RLS policies, partition definitions, column order and domain defaults as well
 as the catalogs above. Counts use a read-only, repeatable-read transaction on
-each server and avoid counting inherited rows twice. Keep source writers
-stopped: the two servers do not share a snapshot.
+each server and avoid counting inherited rows twice. The two servers do not
+share a snapshot, so row counts and sequence values are compared only with
+`verify_rows: exact`, for a source without writers; `none` skips both.
 
 # Harness and development
 

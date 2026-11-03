@@ -852,7 +852,7 @@ class DatabaseJob:
         detail = (
             f"{report.tables} tables, {report.total_rows} rows match"
             if report.rows_checked
-            else "row counts not checked"
+            else "row counts and sequence values not checked"
         )
         self.log.info("verify passed: structure matches, %s", detail)
         return True

@@ -6,6 +6,10 @@
   `--userns=keep-id` only for rootless podman. As root, a user namespace on the
   host network made crun fail with "mount `sysfs` to `sys`: Operation not
   permitted".
+- `verify_rows: none` also skips sequence values, so a source whose writers
+  keep running after the dump verifies. Before, `verify` failed on every
+  sequence the source advanced after the dump. Structure and index validity are
+  still compared; `exact` compares row counts and sequence values as before.
 
 ## 1.0.1 — 2026-11-03
 

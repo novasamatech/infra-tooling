@@ -65,7 +65,7 @@ options:
   # restore_jobs: 1        # pg_restore -j, local storage only
   restore_pgoptions: "-c statement_timeout=0 -c maintenance_work_mem=1GB -c max_parallel_maintenance_workers=1"
   probe_ddl: true          # rehearse the DDL on the target in a rolled-back transaction
-  verify_rows: exact       # exact row counts after restore (source must be quiescent) | none
+  verify_rows: exact       # exact: row counts and sequence values (source without writers) | none: structure only
 
 # Groups share one user and password, the same on both servers unless the
 # group sets `destination: {user, password}`.
