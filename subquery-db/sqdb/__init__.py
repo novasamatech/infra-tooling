@@ -3,4 +3,4 @@
 
 """sqdb: logical migration of SubQuery PostgreSQL databases with a four-phase restore."""
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"

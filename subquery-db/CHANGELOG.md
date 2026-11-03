@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.1 — 2026-11-03
+
+- Restores into targets whose extensions were installed in advance by another
+  role (for example by an admin while the databases are provisioned). Phase 1
+  and the DDL probe leave out the dump's `COMMENT ON EXTENSION`, which only the
+  extension's owner may run; `CREATE EXTENSION` sets the same comment. Before,
+  the probe and phase 1 failed with `must be owner of extension`.
+
 ## 1.0.0 — 2026-10-27
 
 Replaces `migrate_db_s3.sh`, `migrate_db_local.sh` and `run_migrate_db_s3.sh`

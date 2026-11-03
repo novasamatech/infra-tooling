@@ -217,9 +217,15 @@ with one job. `dump_jobs > 1` needs the local `directory` format.
 Every phase runs `pg_restore --no-owner --no-privileges --exit-on-error`, so
 restored objects belong to the group user and the first error stops the phase
 (the earlier scripts also failed on any error, through the exit code).
-`restore_pgoptions` is passed as `PGOPTIONS`. Phases 2 and 4 use
-`--use-list` files built from the archive TOC; the lists, the TOC and every
-tool's output are kept under the work directory.
+`restore_pgoptions` is passed as `PGOPTIONS`. Every phase except the data
+load uses a `--use-list` file built from the archive TOC; the lists, the TOC and
+every tool's output are kept under the work directory.
+
+Phase 1 leaves out the dump's `COMMENT ON EXTENSION` entries. Only an
+extension's owner may set its comment, and a database service or the tooling
+that provisions the databases may install extensions as an admin before the
+restore. `CREATE EXTENSION` (skipped when the extension exists) sets the same
+comment from the extension's control file.
 
 By default every target database must already exist, owned by or granted to
 its group user; a missing one is an error. With `--create-databases` a missing
