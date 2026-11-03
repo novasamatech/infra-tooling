@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.2 — 2026-11-03
+
+- Operator targets run under rootful podman. The Makefile now adds
+  `--userns=keep-id` only for rootless podman. As root, a user namespace on the
+  host network made crun fail with "mount `sysfs` to `sys`: Operation not
+  permitted".
+
 ## 1.0.1 — 2026-11-03
 
 - Restores into targets whose extensions were installed in advance by another

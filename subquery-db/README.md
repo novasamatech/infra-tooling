@@ -106,9 +106,9 @@ Features:
 
 ## Requirements
 
-* `make` and Podman (or Docker with `CONTAINER_ENGINE=docker`). Everything else,
-  including the PostgreSQL client tools (17 by default, `PG_MAJOR`), runs in the
-  runtime image.
+* `make` and Podman, rootless or as root (or Docker with
+  `CONTAINER_ENGINE=docker`). Everything else, including the PostgreSQL client
+  tools (17 by default, `PG_MAJOR`), runs in the runtime image.
 * Network access from the host to the source and destination servers and to
   the object storage. Operator targets use host networking (`NETWORK=host`).
 * The client major version must be at least the newest server major version
