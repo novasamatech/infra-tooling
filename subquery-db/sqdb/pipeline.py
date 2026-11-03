@@ -399,11 +399,8 @@ class DatabaseJob:
         for phase in (1, 2, 4):
             if phase == 2 and not toc.index_entries:
                 continue
-            args = (
-                ["--section=pre-data"]
-                if phase == 1
-                else ["--section=post-data", f"--use-list={lists[phase]}"]
-            )
+            section = "pre-data" if phase == 1 else "post-data"
+            args = [f"--section={section}", f"--use-list={lists[phase]}"]
             result = self._run(
                 [
                     pg_bin("pg_restore"),
@@ -508,7 +505,7 @@ class DatabaseJob:
     def _write_lists(self, toc: Toc, prefix: str) -> dict[int, Path]:
         self.tmp.mkdir(parents=True, exist_ok=True)
         paths = {}
-        for phase in (2, 4):
+        for phase in (1, 2, 4):
             path = self.tmp / f"{prefix}.phase{phase}.list"
             path.write_text(toc.phase_list(phase), encoding="utf-8")
             paths[phase] = path
@@ -679,12 +676,11 @@ class DatabaseJob:
             "--exit-on-error",
             "--verbose",
         ]
-        if phase == 1:
-            argv.append("--section=pre-data")
-        elif phase == 3:
+        if phase == 3:
             argv.append("--section=data")
         else:
-            argv += [f"--use-list={lists[phase]}", "--section=post-data"]
+            section = "pre-data" if phase == 1 else "post-data"
+            argv += [f"--use-list={lists[phase]}", f"--section={section}"]
         if self.db.options.restore_jobs > 1:
             argv += ["-j", str(self.db.options.restore_jobs)]
         argv += ["-d", self._target_dsn()]
@@ -720,6 +716,11 @@ class DatabaseJob:
             len(toc.entries),
             len(toc.index_entries),
         )
+        if toc.extension_comments:
+            self.log.info(
+                "restore: phase 1 skips %d COMMENT ON EXTENSION entries (set by CREATE EXTENSION)",
+                len(toc.extension_comments),
+            )
 
         if start == 1:
             self.ensure_empty_target(toc.schemas)

@@ -55,6 +55,19 @@ def test_phase_lists_partition_the_toc():
         toc.phase_list(3)
 
 
+def test_phase_1_leaves_out_extension_comments():
+    toc = parse_toc(SAMPLE)
+    comments = {e.line for e in toc.extension_comments}
+    assert {e.detail.strip() for e in toc.extension_comments} == {
+        "EXTENSION btree_gist",
+        "EXTENSION pg_trgm",
+    }
+    phase1 = toc.phase_list(1).splitlines()
+    assert not comments & set(phase1)
+    assert sorted(phase1 + list(comments)) == sorted(e.line for e in toc.entries)
+    assert entry(toc, "EXTENSION", "btree_gist").line in phase1
+
+
 def test_entries_with_blank_owner_and_multiword_types():
     toc = parse_toc(SAMPLE)
     ext = entry(toc, "EXTENSION", "btree_gist")

@@ -68,6 +68,9 @@ changes on `main` and the checks pass: a release bumps `.version`,
   `INDEX ATTACH` and `COMMENT ON INDEX` only for plain indexes; anything tied
   to a constraint stays in phase 4. Restore with `--no-owner --no-privileges
   --exit-on-error`. Do not move constraints before the data load.
+- Phase 1 and the DDL probe leave out `COMMENT ON EXTENSION`: targets may come
+  with the dump's extensions installed by an admin, and only the owner may
+  comment on them.
 - Use verbose TOC dependencies for the phase split. TOC display names are not
   escaped and can contain spaces; extract schema names from generated SQL
   before inspecting or cleaning a target.

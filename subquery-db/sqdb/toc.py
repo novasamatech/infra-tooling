@@ -84,6 +84,10 @@ class Entry:
             return None
         return _unquote(self.tag[len("INDEX ") :])
 
+    @property
+    def is_extension_comment(self) -> bool:
+        return self.type == "COMMENT" and self.detail.startswith("EXTENSION ")
+
 
 def _unquote(name: str) -> str:
     if len(name) >= 2 and name.startswith('"') and name.endswith('"'):
@@ -137,9 +141,21 @@ class Toc:
     def counts(self) -> dict[str, int]:
         return dict(sorted(Counter(entry.type for entry in self.entries).items()))
 
+    @property
+    def extension_comments(self) -> list[Entry]:
+        return [entry for entry in self.entries if entry.is_extension_comment]
+
     def phase_list(self, phase: int) -> str:
-        """``--use-list`` content for phase 2 (indexes) or phase 4 (the rest)."""
-        if phase == 2:
+        """``--use-list`` content for phase 1 (pre-data), 2 (indexes) or 4 (the rest).
+
+        Phase 1 leaves out ``COMMENT ON EXTENSION``: only the extension's owner may
+        run it, and a database service or its provisioning may have installed the
+        extension as another role. ``CREATE EXTENSION`` sets the same comment from
+        the extension's control file.
+        """
+        if phase == 1:
+            selected = [entry for entry in self.entries if not entry.is_extension_comment]
+        elif phase == 2:
             selected = self.index_entries
         elif phase == 4:
             selected = self.other_entries

@@ -388,3 +388,18 @@ def test_clean_target_protects_schemas_whose_names_start_with_pg(e2e, review):
     assert run.returncode == 1 and "outside the selected schemas; rolled back" in run.output
     with e2e.connect("new", review.target) as conn:
         assert conn.execute("SELECT to_regclass('pgx_sidecar.events')").fetchone()[0]
+
+
+def test_extensions_installed_by_another_role_do_not_stop_the_restore(e2e, review):
+    """Provisioning may install the dump's extensions as an admin before the restore.
+
+    The group user does not own them and may not run the dump's COMMENT ON EXTENSION.
+    """
+    with e2e.connect("new", review.target) as conn:
+        conn.execute("CREATE EXTENSION btree_gist WITH SCHEMA public")
+        conn.execute("CREATE EXTENSION pg_trgm WITH SCHEMA public")
+    run = migrate(e2e, review)
+    assert "probe passed" in run.output
+    assert state(review)["verify"]["status"] == "passed"
+    with e2e.connect("old", SOURCE) as source, e2e.connect("new", review.target) as dest:
+        assert data_digest(source) == data_digest(dest)
