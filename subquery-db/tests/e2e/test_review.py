@@ -403,3 +403,35 @@ def test_extensions_installed_by_another_role_do_not_stop_the_restore(e2e, revie
     assert state(review)["verify"]["status"] == "passed"
     with e2e.connect("old", SOURCE) as source, e2e.connect("new", review.target) as dest:
         assert data_digest(source) == data_digest(dest)
+
+
+def test_catalog_only_verify_accepts_a_source_that_kept_writing(e2e, review):
+    """With verify_rows none the source may stay live: rows and sequence values move on."""
+    migrate(e2e, review)
+    metadata = sql.Identifier(SCHEMA, "_metadata")
+    sequence = f'"{SCHEMA}".batch_seq'
+    with e2e.connect("old", SOURCE) as conn:
+        saved = conn.execute(
+            sql.SQL("SELECT last_value, is_called FROM {}").format(
+                sql.Identifier(SCHEMA, "batch_seq")
+            )
+        ).fetchone()
+        conn.execute(
+            sql.SQL(
+                'INSERT INTO {} (key, value, "createdAt", "updatedAt") '
+                "VALUES ('written-after-dump', '1', now(), now())"
+            ).format(metadata)
+        )
+        conn.execute("SELECT nextval(%s::regclass)", (sequence,))
+    try:
+        run = e2e.sqdb(review.config, review.work, "verify", "--rows", "none")
+        assert run.returncode == 0, run.output
+        assert "row counts and sequence values not checked" in run.output
+        run = e2e.sqdb(review.config, review.work, "verify", "--rows", "exact")
+        assert run.returncode == 1 and "verification failed" in run.output
+    finally:
+        with e2e.connect("old", SOURCE) as conn:
+            conn.execute(
+                sql.SQL("DELETE FROM {} WHERE key = 'written-after-dump'").format(metadata)
+            )
+            conn.execute("SELECT setval(%s::regclass, %s, %s)", (sequence, *saved))

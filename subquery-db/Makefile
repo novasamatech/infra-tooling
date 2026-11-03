@@ -61,9 +61,16 @@ TTY_FLAG   := $(shell [ -t 0 ] && echo --tty)
 
 # Run as the operator (also over the runtime image's own user), so the config
 # stays readable and WORK files stay owned by the operator with either engine.
-USER_FLAGS := --user $(shell id -u):$(shell id -g)
+# Rootless podman maps the operator into the container with keep-id. Rootful
+# podman needs no mapping, and with a user namespace crun cannot mount sysfs
+# on the host network ("mount `sysfs` to `sys`: Operation not permitted").
+HOST_UID   := $(shell id -u)
+HOST_GID   := $(shell id -g)
+USER_FLAGS := --user $(HOST_UID):$(HOST_GID)
 ifneq ($(findstring podman,$(CONTAINER_ENGINE)),)
+ifneq ($(HOST_UID),0)
 USER_FLAGS += --userns=keep-id
+endif
 endif
 
 DEV_RUN  = $(CONTAINER_ENGINE) run --rm $(USER_FLAGS) -v "$(ROOT):/src" -w /src
