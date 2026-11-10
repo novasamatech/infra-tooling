@@ -199,17 +199,21 @@ Catalog = dict[str, tuple[str, str | None]]
 
 
 def catalog_snapshot(
-    conn: psycopg.Connection, sequences: set[str] | None = None
+    conn: psycopg.Connection, sequences: set[str] | None = None, values: bool = True
 ) -> dict[str, Catalog]:
     """Catalog maps; sequence values are read only for ``sequences`` when given.
 
     Reading a value needs privileges on the sequence, which a target's own
-    objects (for example a service's) do not grant to the group user.
+    objects (for example a service's) do not grant to the group user. Without
+    ``values`` no sequence value is read: they are data, and a live source moves
+    them on after the dump, like its row counts.
     """
     snapshot: dict[str, Catalog] = {}
     for name, query in CATALOG_QUERIES.items():
         SUPERVISOR.check()
         snapshot[name] = {row[0]: (row[1], row[2]) for row in conn.execute(query).fetchall()}
+    if not values:
+        return snapshot
     for name, (definition, schema) in list(snapshot["sequences"].items()):
         if sequences is not None and name not in sequences:
             continue
@@ -371,8 +375,10 @@ def compare_databases(
             )
 
     log.info("comparing catalogs")
-    src_catalog = catalog_snapshot(source)
-    dst_catalog = catalog_snapshot(target, sequences=set(src_catalog["sequences"]))
+    # Row counts and sequence values are data: compared only when the source is
+    # quiescent (rows), so that a source that keeps writing can be verified.
+    src_catalog = catalog_snapshot(source, values=rows)
+    dst_catalog = catalog_snapshot(target, sequences=set(src_catalog["sequences"]), values=rows)
     source_schemas = set(src_catalog["schemas"])
     for name in CATALOG_QUERIES:
         if name == "extensions":
