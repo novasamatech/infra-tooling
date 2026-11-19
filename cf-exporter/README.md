@@ -1,153 +1,217 @@
 # Cloudflare Exporter for Prometheus
 
-This service exports Cloudflare HTTP request analytics through a Prometheus HTTP endpoint.
+This service exports Cloudflare HTTP request analytics in closed 5-minute buckets. Every exported number is the count of one finished bucket, checked against independently read totals, and is served until a scraper has taken it.
 
 ## How It Works
 
-On every cycle the exporter lists all zones the API token can access using REST `GET /zones`. For each zone, a separate GraphQL HTTP request discovers the plan's available fields and page size from `settings.httpRequestsAdaptiveGroups`. An aliased analytics query retrieves visits, requests, cache requests, client-facing edge requests and dimensionless zone totals from `httpRequestsAdaptiveGroups`. Only the edge selection is restricted to requests from clients. No host list or host filter is required.
+Time is cut into buckets of 300 seconds aligned to UTC. A bucket is read once it has ended and settled, 5 minutes later. Its samples are exported with the **end of the bucket as their timestamp**, so the numbers of an hour, a day or a month are the sum of their buckets and do not depend on when or how often the exporter is scraped.
 
-All groups are fetched by default. Completeness takes priority over memory, request count and collection duration: the exporter never automatically drops groups or labels to save resources. A full page with a nonzero last group is retried over two smaller, disjoint time windows, recursively, and values for identical label sets are summed. Only full selections are retried; a full visits page ending in zero needs no retry. Parent pages are discarded before merging their children. Slices use `datetime_geq` / `datetime_lt` with whole-second boundaries, the resolution of the window contract, so the smallest slice is one second. The page size is the plan's `maxPageSize`. A page is a property of one slice, not a limit on the number of groups.
+The exporter lists all zones the API token can access with REST `GET /zones` and reads each zone's plan from `settings.httpRequestsAdaptiveGroups`: available fields, page size, longest query range and how far back data can be read. No host list or host filter is required.
 
-A full one-second slice is read using dimension pagination: all queried dimensions are sorted ascending, and each subsequent page filters out the complete preceding dimension tuple. Counts are not cursor keys, so equal counts do not omit groups. Every page keeps the same window and source filter. An empty remaining range is verified with a dimensionless query using that same filter. A nonadvancing page, missing cursor dimensions or an empty remainder with traffic fails the zone instead of publishing a successful partial result. This is keyset pagination using Cloudflare's sorting and filtering support, not an API cursor.
+### Reading a window
 
-The API can return an empty page for a window that has traffic, for minutes and also on repeated identical requests, while the halves of that window and other dimension sets are answered correctly. An empty page is therefore checked with one dimensionless read of the same window and filter, together for datasets empty in that window, unless their matching whole-window total is zero. Visits use the visits total for this decision. A window that has traffic is split like a full page; at one second, dimension pagination attempts to recover it, and an unverifiable result fails the zone. If an explicit limit prevents splitting or checking the page, the dataset is flagged as incomplete, since zero traffic could not be established. A selection without dimensions returns at most one aggregate: a page size of one does not truncate that aggregate or require slicing.
+One GraphQL request reads a window of buckets of one zone from `httpRequestsAdaptiveGroups` with four aliased selections, each grouped by `datetimeFiveMinutes`:
 
-The exporter imposes no limit of its own on this work by default: no group cap, no slicing budget, no minimum slice above one second, no page size below the plan's and no maximum `Retry-After`. Cloudflare's own limits still apply. Each of these can be enabled separately; see [Collection limits](#collection-limits). Only an explicitly enabled limit may stop collection with a partial dataset; it logs a warning with the reason and remaining budgets and sets that dataset's truncation metric.
+| Selection | Content |
+| --- | --- |
+| `groups` | Requests and visits by the union of the dimensions of `cf_visits_5m`, `cf_requests_5m` and `cf_cache_requests_5m`; the three families are aggregated from it |
+| `totals` | Requests and visits per bucket, without dimensions |
+| `edge` | Requests from clients (`requestSource: "eyeball"`) by the dimensions of `cf_edge_requests_5m` |
+| `edge_totals` | Requests from clients per bucket, without dimensions |
 
-Successful slices are remembered per zone and dataset until UTC midnight: the next cycle starts from the same slice boundaries instead of the whole day, and every slice is fetched again, so late revisions are included. A grown window extends the last slice; a slice that became full is split again. An unchanged burst therefore costs the same selections every cycle after the first. Only a successful zone collection updates the remembered boundaries; they are not reused when the queried dimensions or the page size change. Zone totals always use one dimensionless full-window selection with `limit: 1`. More than one analytics HTTP request is needed when slicing.
+All groups are fetched. A full page of `groups` or `edge` is read again in two halves, on bucket boundaries and then within the bucket down to one second. A full second is read with dimension pagination: all queried dimensions are sorted ascending and each page continues after the complete dimension tuple of the previous one. Counts are never pagination keys. A part of such a split read that Cloudflare answers at a reduced resolution (see below) is asked for again at once, up to three times.
 
-Every zone uses the same UTC window: midnight to the start of the cycle. An empty window at midnight sends no analytics query and publishes zero zone totals. The exporter publishes the complete snapshot after collection, so a scrape never sees a half-finished cycle. Series absent from the new snapshot disappear. Failure of any slice omits all analytics for that zone for the cycle, while other zones are preserved.
+### Why a bucket is trusted
 
-After midnight, scrapes omit yesterday's day-scoped families until a new-day snapshot is published: `cf_visits`, `cf_requests`, `cf_cache_requests`, `cf_edge_requests`, `cf_zone_requests`, `cf_zone_visits`, `cf_exporter_groups`, `cf_exporter_group_limit_reached`, `cf_exporter_dataset_available` and `cf_exporter_snapshot_window_end_seconds`. Zone health and cycle metrics stay available, including if a cycle started before midnight and finished afterwards. The cycle before midnight is moved earlier once a day if, judged by the previous cycle's duration, it would not finish 30 seconds before midnight. The last observed API window still ends at that cycle's **start**, so the unobserved tail includes its collection duration, the closing margin, any missed final scrape and data Cloudflare has not ingested yet. There is no final reconciliation of the previous day.
+Under load Cloudflare answers a selection from a table that holds every tenth or hundredth event instead of its full data. Such an answer differs in two ways:
 
-API failures are logged and reported through health metrics. Transient 5xx and transport errors have up to three retries with backoff. By default HTTP 429 is retried as many times as necessary, waiting for `Retry-After`, or 300 seconds if absent; these attempts do not spend the transient-error retry allowance. A GraphQL error reporting a depleted budget with another status also waits 300 seconds and retries the exact query and variables. The current page resumes when capacity returns, completed slices are retained and later zones are still collected in the same cycle. A `Retry-After` is respected without the library's implicit six-hour cap. `CF_EXPORTER_MAX_RETRY_AFTER_SECONDS` can explicitly bound waiting; if that policy rejects a rate-limited request, the remaining zones are skipped and reported as failed. A failed zone is never reported as a truncated or empty success. Cycles never overlap: one that takes longer than the interval is followed by the next at once. While a long cycle runs, HTTP keeps serving the previous atomic snapshot and readiness can become stale. SIGTERM and SIGINT exit cleanly.
+- every group has a sample interval (`avg { sampleInterval }`) of 10 or more, and its count is an estimate;
+- a bucket with few events has **no group at all**. A reduced answer for a quiet hour is simply empty, and two reduced selections agree on zero.
+
+Each selection is answered on its own, also within one request. An empty answer therefore proves nothing. A bucket is accepted only when all of this holds:
+
+1. **The totals are proven to come from the full data.** `totals` and `edge_totals` are read together with the buckets of the 24 hours before the window (after it at the far end of the dataset's reach). One group with a sample interval below 5 anywhere in that answer proves the full data for the whole answer, empty buckets included.
+2. The groups add up to the totals: requests and visits of `groups` to `totals`, requests of `edge` to `edge_totals`.
+3. No group of the bucket shows a reduced resolution, unless its selection is proven full by another group of the same answer. A bucket read in several parts is not accepted if one of its parts came at a reduced resolution.
+4. Client requests do not exceed all requests.
+
+What happens otherwise:
+
+| Answer | Reaction |
+| --- | --- |
+| A selection with groups at a sample interval of 5 or more only | Read again at once, up to three times, with a slightly different page size (Cloudflare caches answers by query and variables) |
+| Totals without any group over a range with a bucket known to have events | A reduced answer that left them out: read again like one |
+| Totals without any group in the 24 hours | Read again over 7 days. Never longer: Cloudflare answers ranges of a month from a reduced table every time |
+| Totals without any group in 7 days, three answers in a row | The zone is idle; its empty buckets are accepted |
+| Buckets that contradict each other | Every selection is read again at once |
+| Still not acceptable | The bucket stays pending and is read again after 2, 4, 8, 15 and then every 30 minutes |
+
+Known events are the accepted buckets with requests, which the database keeps after their delivery, and the newest bucket with events in any answer. The proof range of the totals is widened to the nearest such bucket within a week of the window. An answer from the full data then has a group there, and an answer without any is known to be a reduced one. This covers the second read of a bucket, which lies in its own range, and history read behind newer buckets after a lost database.
+
+Pending buckets are not exported. A bucket appears late rather than wrong.
+
+One case cannot be proven: a zone that Cloudflare itself stores at a sample interval of 5 or more throughout. Its buckets return the same unverifiable answer every time; after 6 hours of that they are accepted and counted in `cf_exporter_bucket_reads_total{result="accepted_unverified"}`. Only an answer whose totals have groups, all at such an interval, one of them for the bucket itself, and add up is accepted this way. An empty answer, one without the bucket, one without known events or one that contradicts itself is never accepted, however often it comes; such a bucket stays pending until it leaves the dataset's reach and is counted as `abandoned`.
+
+### Late events and history
+
+- An accepted bucket is read once more one to two hours after it ended, all buckets of an hour in one request. If late events changed it, the bucket is served again with the same timestamps and the new values. A bucket served with other labels than the exporter uses now (`CF_EXPORTER_DISABLED_LABELS` or the zone's plan changed) is not read again: serving it once more would add a second series for the same events. Such skipped rechecks are counted as `recheck_skipped`.
+- On first start, after a lost database and after an outage, the exporter reads everything the dataset still has, newest first, up to `notOlderThan` minus one hour, or `CF_EXPORTER_BACKFILL_DAYS`. History is read at most once per 15 seconds and only while fewer than 500 000 samples wait for the scraper, so fresh buckets always come first.
+- Cloudflare allows 300 GraphQL queries in 5 minutes for all users of a token together and counts every selection of a request. The pace of the history leaves room for two instances and their fresh buckets. Whenever the limit is reached anyway, the interval between history reads doubles, up to 4 minutes, and halves again after every hour without a rejection. The pause is waited in pieces of at most 15 seconds and never past the moment the next bucket settles: a new bucket is read when it settles, a due retry or recheck at most 15 seconds later.
+- Buckets that were tried but never verified before they left the dataset's reach are counted as `abandoned`.
+- A zone that is missing from the zone listing, also one that only the database still knows after a restart, keeps its state for a day but is not read. If it is listed again within that time, only the buckets that became due meanwhile are read. Health metrics show the listed zones only.
+
+### Failures
+
+API failures are logged and reported through health metrics; the process keeps running. Transient 5xx and transport errors have up to three retries with backoff. By default HTTP 429 is waited for as long as `Retry-After` says, or 300 seconds without one, without spending the retry allowance; a GraphQL error reporting a depleted budget is handled the same way. `CF_EXPORTER_MAX_RETRY_AFTER_SECONDS` bounds that wait; when it rejects a request, all requests, including settings and the zone listing, pause for 300 seconds. A failed read never yields partial data. SIGTERM and SIGINT exit cleanly.
+
+After any other failed read the zone is left alone for 60 seconds; other zones continue. What follows keeps one bucket that cannot be read from holding back its zone:
+
+| Failed read | Next |
+| --- | --- |
+| A window of several buckets, first failure | Tried again as it is. After a history read of the zone's full window size, its history windows are halved and stay at most that size until its settings are fetched again, within the hour; a smaller window that fails changes nothing |
+| The same window again | Its buckets are read one by one |
+| A single bucket | Tried again after 1, 2, 4, 8, 15 and then every 30 minutes; the rest of the zone is read meanwhile |
+| A recheck | Tried again every 15 minutes, for up to 6 hours after the bucket |
+
+When a read works again after two or more failed reads of the zone in a row, its postponed buckets are read at once.
 
 ## Prometheus Metrics
 
 ### Analytics
 
-| Metric | Type | Description |
+Served on `/analytics`. Every sample is the number of events in one bucket and carries the bucket end as its timestamp.
+
+| Metric | Type | Value per bucket |
 | --- | --- | --- |
-| `cf_visits` | Gauge | Cloudflare's `sum.visits` since midnight UTC, for all paths |
-| `cf_requests` | Gauge | Cloudflare's `count` since midnight UTC, for all paths |
-| `cf_cache_requests` | Gauge | Request count since midnight UTC with cache dimensions, for all hosts and paths |
-| `cf_edge_requests` | Gauge | Client request count since midnight UTC by edge and origin status, for all hosts and paths |
-| `cf_zone_requests` | Gauge | Dimensionless request count since midnight UTC; label: `zone_name` |
-| `cf_zone_visits` | Gauge | Dimensionless visit count since midnight UTC; label: `zone_name` |
+| `cf_visits_5m` | Gauge | Cloudflare's `sum.visits` |
+| `cf_requests_5m` | Gauge | Cloudflare's `count`, all request sources |
+| `cf_cache_requests_5m` | Gauge | The same requests by cache dimensions |
+| `cf_edge_requests_5m` | Gauge | Requests from clients by edge and origin status |
+| `cf_zone_requests_5m` | Gauge | All requests of the zone, without dimensions |
+| `cf_zone_visits_5m` | Gauge | All visits of the zone, without dimensions |
 
-`cf_visits` labels: `zone_name`, `host_name`, `path`, `client_country_name`, `client_request_referer`, `user_agent_browser`, `user_agent_os`.
+`cf_visits_5m` labels: `zone_name`, `host_name`, `path`, `client_country_name`, `client_request_referer`, `user_agent_browser`, `user_agent_os`.
 
-`cf_requests` labels: `zone_name`, `host_name`, `method_name`, `path`, `query`, `client_country_name`, `client_request_referer`, `user_agent_browser`, `user_agent_os`, `cache_status`, `origin_response_status`.
+`cf_requests_5m` labels: `zone_name`, `host_name`, `method_name`, `path`, `query`, `client_country_name`, `client_request_referer`, `user_agent_browser`, `user_agent_os`, `cache_status`, `origin_response_status`.
 
-`cf_cache_requests` labels: `zone_name`, `host_name`, `method_name`, `path`, `cache_status`, `origin_response_status`. Keeping `origin_response_status` explains origin behavior such as `bypass`; measured on 2026-10-25, it added only 0.3% cache groups. All hosts of every discovered zone are included dynamically.
+`cf_cache_requests_5m` labels: `zone_name`, `host_name`, `method_name`, `path`, `cache_status`, `origin_response_status`.
 
-`cf_edge_requests` labels: `zone_name`, `host_name`, `method_name`, `path`, `edge_response_status`, `origin_response_status`. It counts client requests only; see [Client-facing responses](#client-facing-responses).
+`cf_edge_requests_5m` labels: `zone_name`, `host_name`, `method_name`, `path`, `edge_response_status`, `origin_response_status`.
 
-- Only groups with nonzero values are exported.
-- An empty referer is reported as `direct`.
-- Optional dimensions unavailable on the zone's plan are reported as `unknown`. Free plans currently lack `query` and `client_request_referer`. The edge dataset's required fields are handled separately below.
-- Every label above is exported by default. Any of them can be disabled per metric; see [Label selection](#label-selection).
-- Truncation is decided from the pages themselves, never from the zone totals, which are fetched separately and can differ from the slices for the current day. A full visits page ordered by visits ending in zero is complete. A configured cap requests one extra group to see whether anything was cut; a cap equal to the page size leaves no room for that, so a full page is reported. A slice that an explicit limit prevents completing is reported. A cut, or an empty page that an explicit budget prevents verifying, logs a warning and sets `cf_exporter_group_limit_reached`.
-- An absent or malformed analytics result is reported as a failure, rather than an empty successful collection.
+`cf_zone_requests_5m` and `cf_zone_visits_5m` labels: `zone_name`.
 
-These are estimates for the current UTC window, not process counters. A smaller value can be a revised estimate; a new day can start with a value greater than or equal to yesterday's last value. Generic counter-reset detection cannot identify the UTC boundary reliably. Use the snapshot window contract below when interpreting changes over time.
+- Only label sets with events in the bucket have a sample. The zone totals have one for **every** accepted bucket, also with value 0: a zone total of 0 means no traffic, a missing zone total means the bucket is not accepted yet.
+- In every accepted bucket `cf_requests_5m` and `cf_cache_requests_5m` add up to `cf_zone_requests_5m`, and `cf_visits_5m` to `cf_zone_visits_5m`.
+- An empty referer is reported as `direct`. Dimensions the zone's plan does not offer are not queried and reported as `unknown`; Free plans currently lack `query` and `client_request_referer`.
+- To estimate origin traffic, count every cache status except `hit`, including `none`.
 
-To estimate origin traffic, count every status except `hit`, including `none`: in a check against an origin's own request counts, only all non-`hit` statuses together matched. To diagnose the day-to-date share absent from `cf_requests`:
+Sums over time are sums of buckets. With a range that is a multiple of 5 minutes:
 
 ```promql
-1 - sum by (zone_name) (cf_requests) / cf_zone_requests
+# Visits per host and day
+sum by (host_name) (sum_over_time(cf_visits_5m[1d]))
+# Share of 5xx among client requests, last hour
+sum(sum_over_time(cf_edge_requests_5m{edge_response_status=~"5.."}[1h]))
+  / sum(sum_over_time(cf_edge_requests_5m[1h]))
+# Newest accepted bucket of every zone
+max by (zone_name) (timestamp(cf_zone_requests_5m))
 ```
 
-Cloudflare can still ingest recent data while sliced queries are running, so very small differences from zone totals can occur for a current-day window. Completed-day sums are checked separately. Slicing removes exporter group truncation; it does not change Cloudflare's adaptive sampling.
+Do not use `rate()` or `increase()`: these are not counters. Data arrives 6 to 8 minutes after a bucket ends, later while Cloudflare answers at a reduced resolution. A panel or alert should look at closed buckets, for example with an `offset` of 10 minutes.
 
 ### Client-facing responses
 
-`cf_edge_requests` counts requests from clients only. Its selection and every slice use the filter `requestSource: "eyeball"`, which excludes Cloudflare's own subrequests, for example from Workers or Early Hints. All other analytics families keep counting every request source. Do not mix `cf_edge_requests` with `cf_requests`, `cf_cache_requests` or `cf_zone_requests` in one ratio, and do not expect equal sums.
+`cf_edge_requests_5m` counts requests from clients only: its selections use the filter `requestSource: "eyeball"`, which excludes Cloudflare's own subrequests, for example from Workers. All other families count every request source. Do not mix `cf_edge_requests_5m` with them in one ratio.
 
-- `edge_response_status` is the HTTP status Cloudflare returned to the client. It includes responses Cloudflare produced without an origin response: cache hits, redirects, blocked requests, `499` (the client closed the connection) and Cloudflare's 52x and `530` errors.
-- `origin_response_status` is the status Cloudflare received from the origin. `0` means there was no origin response: the request was served from cache or by a Worker, or the origin could not be reached. It never replaces or determines the edge status. Both are kept when they differ, for example origin `200` with edge `520`.
-- All methods, response codes, hosts and paths are included. An edge status of `0` stays `"0"`; it is not inferred to be a successful response. Query strings, countries, user agents and referers are not.
-- A non-2xx status is not necessarily a failure: `101` (protocol switch), redirects and `304` are normal responses.
-- For the share of a status or status class, use all statuses for the same zone, host, method, path and window as the denominator. Retain both status dimensions until interpreting per-group changes over time, then aggregate. The denominator is complete only for a successfully collected zone with `cf_exporter_group_limit_reached{dataset="edge"}` at `0`. An absent sample is not zero traffic, and a window without traffic has no defined share. The exporter fetches no unconditional client total; a check of an empty edge page can fetch its dimensionless client count with the same filter.
-- The dataset requires `dimensions_requestSource` for its filter, and `dimensions_edgeResponseStatus` while `edge_response_status` is exported, in the plan's `availableFields`. Without them, the zone's other datasets are still collected, `cf_exporter_dataset_available{dataset="edge"}` is `0`, there are neither edge samples nor `dataset="edge"` group metrics, and a warning is logged every cycle. An API error is not taken as missing support: the zone fails as usual and reports no availability. An exported edge status is never reported as `unknown`; a group without it fails the zone. Malformed dimensions, including a non-integer or out-of-range status (the API declares statuses as unsigned 16-bit integers), fail the zone even in zero-valued groups or discarded probe/parent pages.
-
-### Snapshot window contract
-
-`cf_exporter_snapshot_window_end_seconds{zone_name, window_start}` describes the exact API window for a successfully collected zone:
-
-- `window_start` is midnight UTC as an RFC3339 string with `Z`. It identifies the window independently of the exporter process. A restart during the same day keeps this identity; UTC midnight changes it even if an analytics value stays the same or increases.
-- The gauge value is the exclusive window end as Unix seconds, truncated to whole seconds. Thus the interval is `[window_start, value)`. This is the cycle start passed to the API, not the time collection finished or the endpoint was scraped.
-- All analytics and this metadata are rendered from one atomic snapshot, and all successful zones of a cycle share the same window. Metadata is present for successful zones even if they have no nonzero groups or the window is empty at midnight. A failed zone has neither analytics nor window metadata for that cycle; its `cf_exporter_zone_scrape_success` is `0`. Other zones remain independent. If zone listing fails, no zone has analytics, metadata or `cf_exporter_zone_scrape_success`, and `cf_exporter_last_cycle_success` is `0`.
-- An explicit collection limit can leave a successful API response incomplete. Check `cf_exporter_group_limit_reached` for the relevant dataset before interpreting an absent group as zero. Without explicit limits, unverifiable completeness fails the zone rather than publishing partial analytics.
-- Yesterday's window metadata disappears together with yesterday's analytics. An interval crossing midnight needs no observed zero to distinguish the two windows.
-
-Day visibility is checked at the start of a scrape. A response that spans UTC midnight still describes one consistent snapshot; its window is identified by the metadata, rather than inferred from the response's arrival time.
-
-The metadata describes values from the **same zone and the same source exposition**. When storing samples from several exporter instances, retain source identity and match the metadata to the analytics sample's scrape before combining sources. An old retained analytics sample must not acquire the window of a newer metadata sample. Overlapping windows from independent instances describe overlapping traffic and must not be added as separate traffic. A missing sample or failed collection is not a measurement of zero requests.
-
-The exporter preserves the API estimates without converting them to a process counter, clamping revisions or accumulating overlapping windows. For example, `100` followed by `95` within one window remains `100`, then `95`; it is a downward correction, not a counter reset. A newly observed group with value `3` retains those three requests in its daily estimate. On first startup during a day, the initial values already include the observable day-to-date history; there is no information about when those requests occurred before observation. The window end, zone health and truncation metrics allow consumers to identify stale or incomplete observations without assuming a fixed scrape schedule.
-
-Late-ingested data for the current day can revise a later snapshot, including data whose event time predates the previous window end. Data arriving for a finished day after its last observed snapshot is not recovered. No interval count or cache hit ratio reconstructed from these snapshots has event-level timing precision. Retain all six cache dimensions while interpreting changes; aggregate independent groups afterwards. All cache statuses, including `none`, belong in total-traffic denominators. An empty traffic window has no defined hit ratio.
+- `edge_response_status` is the HTTP status Cloudflare returned to the client, including responses without an origin response: cache hits, redirects, blocked requests, `499` and Cloudflare's 52x and `530` errors.
+- `origin_response_status` is the status Cloudflare received from the origin; `0` means there was none. Both are kept when they differ, for example origin `200` with edge `520`.
+- A non-2xx status is not necessarily a failure: `101`, redirects and `304` are normal responses.
+- The dataset needs `dimensions_requestSource` and, while `edge_response_status` is exported, `dimensions_edgeResponseStatus` in the plan's `availableFields`. Without them the zone's other families are still collected, `cf_exporter_dataset_available{dataset="edge"}` is `0` and a warning is logged. An API error is never taken as missing support. An exported edge status is never `unknown`; statuses must be unsigned 16-bit integers, and a malformed group fails the read.
 
 ### Label selection
 
-`CF_EXPORTER_DISABLED_LABELS` disables labels per metric. It is a JSON object whose keys are full metric names and whose values are lists of labels to disable. Unset, empty or `{}` disables nothing; an empty list for a metric keeps all of that metric's labels. A top-level list is invalid. For example, without query strings in `cf_requests`:
+`CF_EXPORTER_DISABLED_LABELS` disables labels per metric. It is a JSON object whose keys are metric names and whose values are lists of labels. For example, without query strings and referers in `cf_requests_5m`, while `cf_visits_5m` keeps its referer:
 
 ```json
-{"cf_requests": ["query"]}
+{"cf_requests_5m": ["query", "client_request_referer"]}
 ```
 
-or without query strings and referers in `cf_requests`, while `cf_visits` keeps its referer:
+- A disabled label is absent from the metric and its bucket values are summed over it. Its dimension is left out of the query once no family reads it from the same selection, so Cloudflare aggregates before the page size.
+- Every label except `zone_name` can be disabled. Zones are accepted bucket by bucket at different times, so a sum over zones is left to the query: `sum without (zone_name) (...)`.
+- An unknown metric or label, a repeated key or a value of the wrong JSON type fails startup.
 
-```json
-{"cf_requests": ["query", "client_request_referer"]}
-```
+### Scraping
 
-| Metric | Labels that can be disabled |
+`GET /analytics` returns the buckets that are not delivered yet, up to 50 000 samples per response and always whole buckets. Buckets that still need a response come first, the newest first; older ones follow in later responses. Buckets that had their responses and only wait for the delivery time fill what is left of a response, so they never keep others out. The response honors `Accept-Encoding: gzip`.
+
+| Requirement | Reason |
 | --- | --- |
-| `cf_visits` | `zone_name`, `host_name`, `path`, `client_country_name`, `client_request_referer`, `user_agent_browser`, `user_agent_os` |
-| `cf_requests` | `zone_name`, `host_name`, `method_name`, `path`, `query`, `client_country_name`, `client_request_referer`, `user_agent_browser`, `user_agent_os`, `cache_status`, `origin_response_status` |
-| `cf_cache_requests` | `zone_name`, `host_name`, `method_name`, `path`, `cache_status`, `origin_response_status` |
-| `cf_edge_requests` | `zone_name`, `host_name`, `method_name`, `path`, `edge_response_status`, `origin_response_status` |
-| `cf_zone_requests`, `cf_zone_visits` | `zone_name` |
+| Request `/analytics?consume=1` | Only such a response counts as a delivery. Without the parameter the endpoint can be read by hand at any time without taking samples away from the scraper |
+| Honor the exposed timestamps | The timestamps are the data. In Prometheus-compatible scrapers this is `honor_timestamps: true` |
+| No staleness markers for this job | Series leave the response after every delivered bucket. A marker written then is no bucket value, and next to the bucket samples it can interfere with deduplication |
+| Accept samples up to the dataset's reach in the past | History and late buckets are hours to weeks old |
+| A response size limit of at least 64 MiB | One response has up to 50 000 samples, usually 10 to 15 MB uncompressed, more with long label values or a very large bucket |
 
-- A disabled label is absent from the metric, and its dimension is not queried for that metric. Cloudflare aggregates over it before applying the page size, so fewer groups are fetched and sliced, not fetched and dropped. The other metrics keep the label. The remaining labels keep their order.
-- An unknown metric, a label the metric does not have, a repeated key or a value of the wrong JSON type fails startup.
-- An enabled label that the zone's plan does not offer is still `unknown`; an enabled empty referer is still `direct`.
-- `zone_name` is not a Cloudflare dimension. Zones are still collected and checked separately; without `zone_name`, identical label sets of all zones are summed into one series. If any zone fails, that cycle omits the families without `zone_name`, including dimensionless zone totals, rather than publishing a reduced sum or reusing old samples. Families with `zone_name` still expose successful zones, and health metrics describe the failure. A successful cycle restores the combined families. A metric without any labels is one series. An explicitly enabled group cap applies per zone before summation, so such sums can be incomplete; the default has no cap. `cf_exporter_groups` and the other health metrics keep `zone_name`; `cf_exporter_groups` then counts a zone's label sets before zones are combined.
-- Disabling `edge_response_status` removes its field from the edge dataset's requirements. The client-request filter and its field stay required, and every exported status is still validated.
-- No filters are added and the traffic scope of every metric is unchanged.
+A bucket leaves `/analytics` after two complete consuming responses and 10 minutes since it was accepted; its samples are then deleted. A response that was not sent completely does not count, nor does one for a bucket accepted again while it was on its way. If nobody scrapes, buckets wait: 35 days after their acceptance at most, then they are dropped and counted as `expired`.
 
-### Exporter Health
+Several replicas can run side by side. Each reads Cloudflare on its own and keeps its own database. Scrape every replica and drop the labels that identify the replica from the analytics samples; the replicas then produce the same series with the same timestamps, and the time-series database stores them once if it deduplicates identical samples. Replicas can disagree for a bucket whose late events only one of them has seen; which value is kept is up to the database.
+
+A database or query layer that caches the results of range queries may keep answers computed before a late sample arrived. Bypass or disable that cache for these metrics.
+
+### Exporter health
+
+Served on `/metrics` and every other path, without timestamps.
 
 | Metric | Labels | Description |
 | --- | --- | --- |
-| `cf_exporter_zone_scrape_success` | `zone_name` | 1 if the last collection of the zone succeeded, 0 otherwise |
-| `cf_exporter_last_cycle_success` | None | 1 if zone listing and every zone succeeded in the last cycle |
-| `cf_exporter_last_cycle_timestamp_seconds` | None | Unix time when the last cycle finished |
-| `cf_exporter_cycle_duration_seconds` | None | Duration of the last cycle |
-| `cf_exporter_snapshot_window_end_seconds` | `zone_name`, `window_start` | Exclusive API window end as Unix seconds; `window_start` identifies the UTC day |
-| `cf_exporter_groups` | `zone_name`, `dataset` | Nonzero label sets of the zone; dataset is `visits`, `requests`, `cache` or `edge` |
-| `cf_exporter_group_limit_reached` | `zone_name`, `dataset` | 1 when an explicit limit cut data or prevented verifying an empty page, otherwise 0 |
-| `cf_exporter_dataset_available` | `zone_name`, `dataset` | 1 if the zone's plan supports the dataset, 0 if it is not collected; only for successfully collected zones |
-| `cf_exporter_api_responses_total` | `api`, `code` | Counter of HTTP responses from the Cloudflare API by status code, including retried attempts |
-| `cf_exporter_api_errors_total` | `api`, `error` | Counter of failed Cloudflare API attempts by error kind, including retried attempts |
+| `cf_exporter_zone_success` | `zone_name` | 1 if the zone's last settings request or read succeeded, 0 otherwise |
+| `cf_exporter_dataset_available` | `zone_name`, `dataset` | 1 if the zone's plan supports the dataset (`visits`, `requests`, `cache`, `edge`), 0 if it is not collected |
+| `cf_exporter_pending_buckets` | `zone_name` | Buckets within reach that are not accepted yet, including scheduled retries and unread history |
+| `cf_exporter_newest_bucket_end_seconds` | `zone_name` | End of the newest accepted bucket |
+| `cf_exporter_oldest_bucket_end_seconds` | `zone_name` | End of the oldest accepted bucket still tracked |
+| `cf_exporter_undelivered_buckets` | None | Accepted zone buckets still served on `/analytics` |
+| `cf_exporter_undelivered_samples` | None | Their samples |
+| `cf_exporter_bucket_reads_total` | `result` | Counter of bucket outcomes, see below |
+| `cf_exporter_analytics_responses_total` | None | Counter of complete consuming `/analytics` responses |
+| `cf_exporter_analytics_samples_total` | None | Counter of samples in them |
+| `cf_exporter_storage_persistent` | None | 1 if the state is kept in the database file, 0 if only in memory |
+| `cf_exporter_storage_full` | None | 1 if a write failed for lack of disk space within the last minute; reads wait meanwhile |
+| `cf_exporter_storage_resets_total` | None | Counter of database recreations |
+| `cf_exporter_loop_timestamp_seconds` | None | Unix time of the last collection loop iteration |
+| `cf_exporter_api_responses_total` | `api`, `code` | Counter of HTTP responses from the Cloudflare API, including retried attempts |
+| `cf_exporter_api_errors_total` | `api`, `error` | Counter of failed Cloudflare API attempts by kind, including retried attempts |
 
-Every successfully collected zone has all four availability samples: visits, requests and cache are always `1`; edge is `1` or `0`. Missing availability means there is no successful current-day snapshot for the zone (for example startup, collection failure or expiry at UTC midnight), not an unsupported plan. Availability is day-scoped and disappears with the analytics; zone and cycle health remain available.
+`result` of `cf_exporter_bucket_reads_total`, all exported from zero:
 
-Cycle metrics appear after the first cycle finishes. Example alert conditions for the default 300-second interval:
+| `result` | Meaning |
+| --- | --- |
+| `accepted` | Verified and stored |
+| `accepted_unverified` | Never verified; the same consistent answer at a high sample interval for 6 hours |
+| `sampled` | An answer came at a reduced resolution, lacked known events or its totals were not proven complete; read again later |
+| `inconsistent` | The selections contradict each other; read again later |
+| `recheck_unchanged`, `recheck_changed` | The later second read; a changed bucket is served again |
+| `recheck_failed` | The second read did not verify; tried again for up to 6 hours |
+| `recheck_skipped` | The second read was cancelled because the bucket was served with other labels |
+| `abandoned` | Tried but never verified before it left the dataset's reach |
+| `expired` | Accepted but not scraped within 35 days after its acceptance |
+| `error` | The read failed; counted per read, not per bucket |
+
+Example alert conditions:
 
 ```promql
-cf_exporter_last_cycle_success == 0
-time() - cf_exporter_last_cycle_timestamp_seconds > 900
-max by (zone_name, dataset) (cf_exporter_group_limit_reached) == 1
-cf_exporter_dataset_available == 0
-cf_exporter_cycle_duration_seconds > 240
+# No accepted bucket for 30 minutes
+time() - cf_exporter_newest_bucket_end_seconds > 1800
+# The scraper does not take the samples
+cf_exporter_undelivered_buckets > 0 and increase(cf_exporter_analytics_responses_total[15m]) == 0
+# Data lost for good
+increase(cf_exporter_bucket_reads_total{result=~"abandoned|expired"}[1h]) > 0
+# The database file cannot be used, or its disk is full
+cf_exporter_storage_persistent == 0 or cf_exporter_storage_full == 1
+# The collection loop is stuck
+time() - cf_exporter_loop_timestamp_seconds > 900
 ```
 
-### Cloudflare API errors
-
-`cf_exporter_api_responses_total` and `cf_exporter_api_errors_total` are process counters that start at zero with the exporter. `api` is `rest` for the zone listing and `graphql` for settings and analytics. Every request attempt is counted once, including attempts the transport retries before a request succeeds, so the counters also show rate limits and outages that a successful cycle hides. Every `error` series is exported from zero:
+`cf_exporter_api_responses_total` and `cf_exporter_api_errors_total` count every request attempt once, including attempts the transport retries before a request succeeds. `api` is `rest` for the zone listing and `graphql` for settings and analytics. Every `error` series is exported from zero:
 
 | `error` | Meaning |
 | --- | --- |
@@ -160,50 +224,31 @@ cf_exporter_cycle_duration_seconds > 240
 | `invalid_response` | A response that is not a JSON object, reports `success: false`, has no GraphQL data or an invalid zone listing |
 | `graphql` | Any other error in a GraphQL response, which usually has HTTP 200 |
 
-A response with an error status is counted in both counters; transport failures have no response code. Rate-limited attempts are counted even when waiting and retrying later succeeds. Only an explicitly configured retry policy can make rate limiting abandon the current request and skip the cycle's remaining zones; those skipped zones appear as failed rather than as more errors. Analytics content that fails validation, such as a malformed group, fails the zone without being counted here. Labels never contain URLs, messages, zone names or credentials.
-
-```promql
-# Rate limiting, even when a retry later succeeded
-increase(cf_exporter_api_errors_total{error=~"rate_limited|budget_depleted"}[15m]) > 0
-# API unavailability
-increase(cf_exporter_api_errors_total{error=~"server_error|timeout|connection"}[15m]) > 0
-# Error rates by kind
-sum by (api, error) (rate(cf_exporter_api_errors_total[1h]))
-```
+Labels never contain URLs, messages, zone names or credentials.
 
 ### Readiness
 
-`GET /readyz` on the metrics port returns HTTP 200 with `ready` only when the
-last published snapshot comes from a successful cycle with at least one zone and
-every discovered zone succeeded. Both the API window end and the cycle
-completion must be less than three collection intervals old and not in the
-future; the window age includes the cycle's own duration. With the default
-300-second interval, the limit is 900 seconds. Otherwise it returns HTTP 503
-with a one-line reason: before the first cycle, after a failed zone listing or
-zone collection, without discovered zones, or with a stale snapshot. A later
-successful cycle restores readiness.
+`GET /readyz` returns HTTP 200 with `ready` once the database can be used and the zones were listed for the first time; otherwise HTTP 503 with a one-line reason. `HEAD` reports the same status without a body; other methods return 405.
 
-Readiness does not depend on the UTC day. After midnight, scrapes omit the
-previous day's day-scoped families until the new day's first snapshot is
-published. This refill is normal operation: a fresh previous-day snapshot stays
-ready, and the freshness limit still applies.
+Readiness deliberately does not depend on how fresh the data is or on Cloudflare's current state: a slow or failing Cloudflare must not take all replicas out of service at once. Old data is an alert on `cf_exporter_newest_bucket_end_seconds`. Do not use `/readyz` for liveness.
 
-An empty successful traffic window is ready. A plan's unsupported dataset or a
-reported group truncation does not fail readiness; the existing availability
-and truncation metrics describe those conditions. Readiness reads the atomic
-in-memory snapshot without API calls or metrics serialization. It answers during
-a concurrent large metrics scrape, and responses carry `Cache-Control: no-store`.
-`HEAD /readyz` reports the same status without a body; other methods return 405.
-Every other path still serves metrics.
+## Storage
 
-`/metrics` keeps serving metrics and health diagnostics while `/readyz` returns
-503. Use `/readyz` for a Kubernetes readiness probe rather than a TCP probe or
-the metrics status, but not for liveness: a Cloudflare failure should not
-restart the exporter. A not-ready pod is removed from its Service endpoints, and
-instances sharing one Cloudflare account usually become unready together. Scrape
-the exporter through a target discovery that keeps not-ready pods; otherwise the
-health metrics disappear exactly when collection fails. The endpoint introduces
-no coordination between instances.
+The state is one SQLite database: which buckets are accepted, pending or delivered, and the samples not delivered yet. Everything in it can be read again from Cloudflare, so the exporter looks after the file itself:
+
+| Situation | What the exporter does |
+| --- | --- |
+| No file or directory | Creates them and reads the history within reach again |
+| A corrupt database of the exporter, or one of another schema version | Replaces it and reads the history again |
+| A file that is not recognizably the exporter's: not an SQLite file, or one without the exporter's application id in its header, damaged or not | Leaves it untouched and keeps the state in memory. Only a file of zero bytes alone, as a crash can leave, is replaced as well |
+| A database operation fails while running | Recreates the database and repeats the operation; if the new file fails as well, continues in memory |
+| The file is removed or replaced while running | Notices it at the next operation and opens the path again. Of the write-ahead files next to it, only its own leftovers are removed |
+| The path cannot be used at all | Keeps the state in memory and tries the file again every 60 seconds |
+| The database can be read but not written, as on a file system that became read-only | Replaces the file if it can; otherwise keeps the state in memory and tries the file again every 60 seconds. A write is tested every time the file is opened |
+| The disk is full | Keeps the database as it is and does not read for a minute, then tries again; `cf_exporter_storage_full` is 1 meanwhile. A full disk at start keeps the state in memory |
+| Another process holds the database lock | Waits up to 30 seconds and fails that operation; nothing is deleted |
+
+History that is read again is exported again with the same timestamps and values, which a database that deduplicates identical samples stores once. No vacuuming or other maintenance is needed: delivered samples are deleted, and the file stops growing at its peak.
 
 ## Configuration
 
@@ -212,84 +257,69 @@ Create an API token with **Zone / Zone / Read** and **Zone / Analytics / Read** 
 | Environment Variable | Default | Accepted Values |
 | --- | --- | --- |
 | `CF_EXPORTER_API_TOKEN` | Required | API token; surrounding whitespace is stripped, embedded whitespace and non-printable or non-ASCII characters are rejected |
-| `CF_EXPORTER_REQUEST_TIMEOUT` | `30` | Positive integer, HTTP timeout in seconds |
-| `CF_EXPORTER_SCRAPE_INTERVAL` | `300` | Positive integer, collection interval in seconds |
+| `CF_EXPORTER_DB_PATH` | `/var/lib/cf-exporter/cf-exporter.sqlite3` | Path of the database file |
 | `CF_EXPORTER_METRICS_PORT` | `8000` | Integer from 1 to 65535 |
+| `CF_EXPORTER_REQUEST_TIMEOUT` | `30` | Positive integer, HTTP timeout in seconds |
 | `CF_EXPORTER_DISABLED_LABELS` | `{}` (every label) | JSON object of metric names to lists of labels; see [Label selection](#label-selection) |
 | `CF_EXPORTER_LOGLEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 
-Optional limits of the exporter's own work are listed under [Collection limits](#collection-limits). Invalid settings or a missing/malformed token cause startup to fail. An unknown log level falls back to INFO with a warning. Logs and configuration representations redact the token; the startup log lists the enabled limits and disabled labels.
-
-### Collection limits
-
-Each setting is a nonnegative integer. Unset, empty or `0` imposes no limit, which is the default; a positive value enables the limit. Negative or non-integer values fail startup. All limits apply per exporter process: instances sharing an API token do not coordinate, and none of these values is derived from Cloudflare's quota, the number of instances or the scrape interval.
+Optional limits. Each is a nonnegative integer; unset, empty or `0` imposes none:
 
 | Environment Variable | Limit when positive |
 | --- | --- |
-| `CF_EXPORTER_GROUP_LIMIT` | Exports the largest N nonzero groups per zone and dataset. Up to the page size, one full-window query with one extra probe group shows whether the cap cut anything; larger values slice and select after merging. |
-| `CF_EXPORTER_MAX_SLICE_REQUESTS` | Analytics reads per zone and dataset in one cycle, including the first windows, discarded parent pages and checks of empty pages. |
-| `CF_EXPORTER_MAX_EXTRA_SELECTIONS` | Selections per cycle beyond one read per zone and dataset, shared by all zones and datasets, including checks of empty pages. Every aliased selection counts, also inside one HTTP request; settings, zone totals and transport retries do not. Renewed every cycle. |
-| `CF_EXPORTER_MIN_SLICE_SECONDS` | Slices this long or shorter are not split further. |
-| `CF_EXPORTER_MAX_RETRY_AFTER_SECONDS` | A longer `Retry-After` fails the request at once instead of being waited for. |
-| `CF_EXPORTER_PAGE_SIZE` | Groups per page; a value above a zone's `maxPageSize` uses `maxPageSize`. |
+| `CF_EXPORTER_BACKFILL_DAYS` | History is read and exported this many days back instead of everything the dataset has. Proof ranges still use the dataset's whole reach |
+| `CF_EXPORTER_MAX_RETRY_AFTER_SECONDS` | A longer `Retry-After` fails the request at once instead of being waited for |
+| `CF_EXPORTER_PAGE_SIZE` | Groups per page of the selections with dimensions; a value above a zone's `maxPageSize` uses `maxPageSize` |
 
-When a slicing limit cuts data, the warning names it, for example `dataset slice budget` or `configured minimum slice of 60s`, with the reads and shared selections left. Remembered slices are merged to fit a smaller budget, keeping their boundaries. An empty page that cannot be checked within the budget is flagged as incomplete. A limit never turns an API failure into a successful truncated collection, and the request timeout and transport retries are separate network settings.
-
-Supply the token through the environment at execution time. For an interactive Bash session:
-
-```bash
-read -r -s -p 'Cloudflare API token: ' CF_EXPORTER_API_TOKEN
-export CF_EXPORTER_API_TOKEN
-```
+Invalid settings or a missing or malformed token fail startup. An unknown log level falls back to INFO with a warning. Logs and configuration representations redact the token; the startup log lists the storage path, enabled limits and disabled labels. Settings removed in 2.0.0 (`CF_EXPORTER_SCRAPE_INTERVAL`, `CF_EXPORTER_GROUP_LIMIT`, `CF_EXPORTER_MAX_SLICE_REQUESTS`, `CF_EXPORTER_MAX_EXTRA_SELECTIONS`, `CF_EXPORTER_MIN_SLICE_SECONDS`) are ignored with a warning.
 
 ## Containers
 
 `make image` builds `ghcr.io/novasamatech/infra-tooling/cf-exporter` with the tag in `.version` using Podman. Override `CONTAINER_ENGINE=docker` to use Docker.
 
-```bash
-make image
-make image-run PORT=8000
-make test-image PORT=8000 SMOKE_TIMEOUT=180
-```
-
-`image-run` runs in the foreground. `run`, `image-run` and live-test targets send the token to the container through stdin and export it inside the running process, so it is absent from container metadata and command-line arguments. Other settings set in the environment, such as `CF_EXPORTER_DISABLED_LABELS` or a limit, are passed by name to these targets and to the smoke test's container (except the port). The smoke test reads the complete `/metrics` response, checks container metadata and new metric families, requires `/readyz` to stay unready until a cycle is published, waits for a successful cycle, validates the window sample of every successful zone, the labels of every analytics sample for the configured schema, the matching readiness and the Cloudflare API counters, prints nonzero API error counts and series per family, and removes the container on exit.
-
-To run a published image with Docker:
+The image runs as UID and GID 1000 and declares `/var/lib/cf-exporter` as a volume. Mount a volume writable by that user or group to keep the database across restarts. Without one the exporter works the same and reads the history again after every restart. Each instance needs a directory of its own; the database holds the bucket bookkeeping of the reach and the samples not scraped yet, and grows while nobody scrapes.
 
 ```bash
 printf '%s\n' "$CF_EXPORTER_API_TOKEN" | docker run --rm -i \
-  -p 8000:8000 \
+  -p 8000:8000 -v cf-exporter-state:/var/lib/cf-exporter \
   ghcr.io/novasamatech/infra-tooling/cf-exporter:latest \
   /bin/sh -c 'IFS= read -r CF_EXPORTER_API_TOKEN; export CF_EXPORTER_API_TOKEN; exec python script.py'
 ```
 
-Other settings can be passed with Docker's `-e`, for example `-e CF_EXPORTER_SCRAPE_INTERVAL=600`.
+Other settings can be passed with `-e`, for example `-e CF_EXPORTER_BACKFILL_DAYS=7`.
 
 ## Development
 
-All routine tasks go through the [Makefile](Makefile); `make help` lists them. [Dockerfile.dev](Dockerfile.dev) uses `python:3.13-alpine`, matching the runtime image, and installs `requirements-dev.txt`. Its image tag hashes the pinned runtime/development requirements and the dev Dockerfile; source changes do not rebuild it. No host Python environment or package installation is needed.
+Everything for running, checking and debugging goes through the [Makefile](Makefile); `make help` lists the targets. [Dockerfile.dev](Dockerfile.dev) uses `python:3.13-alpine`, matching the runtime image, and installs `requirements-dev.txt`. No host Python environment is needed.
 
-Podman is the default engine; use `CONTAINER_ENGINE=docker` for Docker. Sources are mounted at `/src`; rootless Podman uses `--userns=keep-id`, and Docker uses the host UID/GID, preserving ownership of generated files. On hosts without a systemd user bus, use `CONTAINER_ENGINE='podman --cgroup-manager=cgroupfs'`.
+Token-dependent targets take the token from `CF_EXPORTER_API_TOKEN` or, if that is unset, from the first line of the file `TOKEN_FILE`, and pass it to the container through stdin, so it is absent from container metadata and command lines. Settings of one machine can be kept in an untracked `local.mk` next to the Makefile:
 
-```bash
-make test                 # offline tests with coverage
-make lint                 # ruff lint and format checks
-make fmt                  # automatic formatting and lint fixes
-make coverage             # offline tests and HTML coverage report
-make test-live            # real Cloudflare API; requires token in the environment
-make test-all             # offline and live tests
-make run PORT=8000        # exporter in the Python 3.13 dev image
-make lock                 # resolve requirements*.in into pinned requirements*.txt
-make outdated             # list dependencies with newer releases
-make profile-live         # live cycle, memory and exposition measurements; requires token
-make clean                # remove caches, coverage output and all dev images
+```make
+CONTAINER_ENGINE := podman --cgroup-manager=cgroupfs
+TOKEN_FILE := /path/to/token
+PORT := 18000
 ```
 
-Direct dependencies are declared in `requirements.in` and `requirements-dev.in`. Regenerate the pinned files with `make lock`, which resolves in a throwaway `python:3.13-alpine` container. Runtime pins constrain development resolution. A trap removes temporary lock files on failure; the temporary resolver is removed with the container. `test-image` uses any host `python3` only for its stdlib smoke driver; the tested exporter runs in the Python 3.13 runtime image.
+| Command | Purpose |
+| --- | --- |
+| `make ci` | Lint and offline tests, as in the repository CI |
+| `make test` | Offline tests with coverage; `PYTEST_ARGS='tests/test_storage.py -k wiped --no-cov'` narrows the run |
+| `make lint`, `make fmt` | Ruff checks; formatting and fixes |
+| `make test-live` | Real Cloudflare API and process tests |
+| `make stop-check` | Stop a running live check (`test-live`, `test-all`, `profile-live`) |
+| `make profile-live` | Compares exported buckets of closed hours with independently read hourly totals; `PROFILE_ARGS='--hours 6'` |
+| `make run` | The exporter in the dev image, container `cf-exporter-run`, database inside the container |
+| `make status` | Readiness and health metrics of that exporter |
+| `make scrape` | Its `/analytics` response, without consuming it |
+| `make logs`, `make stop` | Its last log lines; stop it |
+| `make image`, `make image-run` | Build and run the runtime image |
+| `make test-image` | Build the image and check it end to end |
+| `make lock`, `make outdated` | Pin dependencies from `requirements*.in`; list updates |
+| `make coverage`, `make clean` | HTML coverage report; remove caches and dev images |
 
-Offline tests mock external HTTP requests, including time-filtered regression tests for slicing, repeated bursts, optional limits and midnight. Label tests use a fake API that groups by the requested dimensions before the page size, and check queries and the exposition for every label configuration. Window-contract tests inspect the actual Prometheus exposition across startup, independent instances, UTC boundaries, revisions, failures and recovery. Edge tests check the client-request filter in every selection and slice, the preserved client and origin statuses, plan support and dataset health. Retry tests use a local HTTP server to exercise actual transport and backoff. Readiness tests use the real metrics HTTP server with synthetic and fake-API snapshots, covering failure recovery, freshness limits, the midnight refill and concurrent scrapes. API counter tests count every attempt of real transport retries against a local server, including read timeouts and refused connections. Live tests check every queried GraphQL dataset, setting, dimension and sort value for existence and deprecation, plus filter-field existence (Cloudflare does not expose input-field deprecation). They verify exact sums for a completed UTC day, comparing edge groups with an independently fetched client-request total and checking the filter value against requests grouped by source. They collect every accessible zone including Free zones, check a configuration with disabled labels against the zone totals, and run the exporter process through readiness and SIGTERM. Live tests and profiling use the same settings from the environment as the exporter. Process logs stay in memory. Pytest skips live tests without `CF_EXPORTER_API_TOKEN`; explicit Makefile live targets require it.
+`make profile-live` exits with 1 if a zone's exported sums differ from the reference or a zone has no settings, and with 2 if no zone could be judged. Run it during business hours of Europe and North America as well, when Cloudflare answers at a reduced resolution most often.
 
-`make profile-live` runs [tests/profile_live.py](tests/profile_live.py) in the dev image with the exporter's settings from the environment and prints one JSON line per cycle: the window, enabled limits and disabled labels, cycle duration, GraphQL, settings and analytics HTTP requests, analytics selections, groups per dataset, series per family, truncated selections, zones without the edge dataset, equality with the zone totals, `strict_totals`, `source_filter_valid`, exposition size, samples, in-process encoding time and peak RSS. The request counts measure GraphQL calls before transport retries; the API counters count every attempt. It prints no credentials and no label values except, for a sum that differs from its total, the zone with both sums, its groups, slices and truncation. Pass `PROFILE_ARGS='--day YYYY-MM-DD --cycles 2'` to profile a completed UTC day. The date must be strictly before today and `--cycles` must be positive. `--until YYYY-MM-DDTHH:MM:SSZ` fixes the window to that day's midnight up to the given time, so label configurations can be compared on the same window. Both `--day` and `--until` on a past UTC day require every sum to match and return a failure on a mismatch; `strict_totals` reports this policy. For the current day, differences are reported without failing on totals alone because ingestion can continue. The edge reference is an independently fetched client-request total outside the measured selections; its filter is checked against raw sources, including zones with only subrequests, and queried only where the edge dataset is supported. Across the checked zones, some zone with traffic must report client requests: a renamed source value would empty the filter and its reference in every zone at once. Per-zone validation retains scalar summaries rather than a second set of series. Only historical profiling bypasses the visibility gate, preserving the original window boundaries.
+Offline tests run against an in-memory fake of the Cloudflare API that stores single events and answers bucket queries the way Cloudflare does, including answers from a reduced table. They cover bucket acceptance and repair, the proof ranges, splitting and pagination, scheduling, the self-healing storage with real files, the HTTP endpoints with a real server, labels, the edge dataset, API error counters with real transport retries, and the checks of the validation tool and the image smoke test themselves. Live tests check every queried dataset, setting, dimension, filter and sort value against the schema, compare a closed hour with independent totals, read a busy bucket in parts, page through it by its dimensions, run the exporter as a process through a restart on the same database, and delete the database under the running process.
 
 ## License
 

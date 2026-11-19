@@ -8,6 +8,142 @@ SPDX-License-Identifier: Apache-2.0
 All notable changes to `cf-exporter` are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.0] — 2026-11-19
+
+A new architecture and a **breaking change**: every metric family, the scrape
+endpoint and the deployment requirements are different. Dashboards, alerts and
+the scrape configuration have to be migrated together with the upgrade; nothing
+of 1.x is kept. No dependencies are added; the database uses Python's `sqlite3`.
+
+### Why
+
+Up to 1.8.0 the exporter read the whole UTC day again in every cycle and
+published the answer as a gauge "since midnight". Under load Cloudflare answers
+single selections from a table holding every tenth or hundredth event. Such an
+answer went out as it was: thousands of series vanished for a cycle and came
+back, and every dip was counted as a reset by `increase()`. A slow Cloudflare
+also made every instance unready at the same time, which emptied the scrape.
+
+### Changed
+
+- The exporter reads **closed 5-minute buckets** aligned to UTC and exports
+  each bucket's counts once, with the bucket end as the sample timestamp.
+  Sums over any period are sums of buckets and no longer depend on scrape
+  timing, restarts or which instance was scraped.
+- New families replace the old ones: `cf_visits_5m`, `cf_requests_5m`,
+  `cf_cache_requests_5m`, `cf_edge_requests_5m`, `cf_zone_requests_5m` and
+  `cf_zone_visits_5m`. Their labels and label order are those of the 1.x
+  families. `cf_visits`, `cf_requests`, `cf_cache_requests`, `cf_edge_requests`,
+  `cf_zone_requests` and `cf_zone_visits` are removed. Queries change from
+  `increase(cf_visits[1d])` to `sum_over_time(cf_visits_5m[1d])`.
+- Analytics are served on **`/analytics`**; `/metrics` and every other path
+  serve health metrics only. The scraper has to request
+  `/analytics?consume=1`, honor the exposed timestamps and write no staleness
+  markers for that job; see the README's "Scraping".
+- A bucket is exported only after it is verified: its totals are proven to
+  come from Cloudflare's full data, its groups add up to them, and client
+  requests do not exceed all requests. A reduced or contradictory answer is
+  read again, at once and then with growing delays, and is never exported.
+  Data appears late rather than wrong.
+- `visits`, `requests` and `cache` are aggregated from one selection over the
+  union of their dimensions instead of three selections.
+- `/readyz` reports whether the process can serve: the database is usable and
+  the zones were listed once. It no longer depends on data freshness, so a
+  slow Cloudflare cannot make all instances unready.
+- Health metrics are new: `cf_exporter_zone_success`,
+  `cf_exporter_pending_buckets`, `cf_exporter_newest_bucket_end_seconds`,
+  `cf_exporter_oldest_bucket_end_seconds`, `cf_exporter_undelivered_buckets`,
+  `cf_exporter_undelivered_samples`, `cf_exporter_bucket_reads_total{result}`,
+  `cf_exporter_analytics_responses_total`,
+  `cf_exporter_analytics_samples_total`, `cf_exporter_storage_persistent`,
+  `cf_exporter_storage_full`, `cf_exporter_storage_resets_total` and
+  `cf_exporter_loop_timestamp_seconds`. `cf_exporter_dataset_available` and the
+  API counters are kept. `cf_exporter_zone_scrape_success`,
+  `cf_exporter_last_cycle_*`, `cf_exporter_cycle_duration_seconds`,
+  `cf_exporter_snapshot_window_end_seconds`, `cf_exporter_groups` and
+  `cf_exporter_group_limit_reached` are removed.
+- `zone_name` can no longer be disabled with `CF_EXPORTER_DISABLED_LABELS`;
+  aggregate zones in the query. Metric names in that setting are the new ones.
+
+### Added
+
+- A local SQLite database (`CF_EXPORTER_DB_PATH`, default
+  `/var/lib/cf-exporter/cf-exporter.sqlite3`) with the state of every bucket
+  and the samples not scraped yet. It needs no maintenance and heals itself:
+  a missing, corrupt, outdated, removed or failing database of the exporter is
+  recreated and the history is read again from Cloudflare; an unusable path,
+  or a database that can be read but not written, falls back to memory and is
+  tried again every minute. Only a file that is recognizably the exporter's is
+  ever deleted; a lock held by another process and a full disk never cause a
+  wipe. While the disk is full, reads wait (`cf_exporter_storage_full`).
+- Samples wait for the scraper: a bucket stays on `/analytics` until two
+  complete consuming responses and 10 minutes have passed. A scraper outage of
+  any length up to 35 days after a bucket's acceptance loses nothing. Buckets
+  that still need a response go first; those only waiting for the 10 minutes
+  fill what is left of a response and never keep others out.
+- One bucket that cannot be read does not hold back its zone: a window that
+  fails twice is read bucket by bucket, a failed history read of full size
+  halves the zone's history windows, and a bucket that fails alone is tried
+  again with delays growing to 30 minutes while the rest of the zone is read.
+  After an outage the postponed buckets are read at once.
+- A zone missing from the zone listing, also after a restart, keeps its state
+  for a day without being read, so that an incomplete listing does not cause
+  its history to be read again.
+- History: on first start, after a lost database or an outage, everything the
+  dataset still has is read, newest first, behind fresh buckets and at most
+  once per 15 seconds, which leaves room in Cloudflare's rate limit for two
+  instances. Whenever the limit is reached, history is read more slowly for
+  the next hours; a new bucket never waits for that pace.
+  `CF_EXPORTER_BACKFILL_DAYS` shortens the history, not the proof ranges.
+- A second read of every bucket one to two hours after it ended picks up late
+  events; a changed bucket is served again with the same timestamps. A bucket
+  served with other labels than the current ones is not read again
+  (`recheck_skipped`), so that no events are served under two label sets.
+- Several instances can run side by side without coordination and produce
+  identical series.
+- The image declares the volume `/var/lib/cf-exporter`, owned by UID 1000.
+- Make targets for everything needed to run and debug: `status`, `scrape`,
+  `logs` and `stop` for the exporter started by `make run`, `stop-check` for a
+  running live check, `PYTEST_ARGS` for `make test`, `TOKEN_FILE` as a source
+  of the token, and an optional untracked `local.mk` for the settings of one
+  machine.
+- `make profile-live` compares the exported buckets of closed hours with
+  independently read hourly totals and fails on a difference.
+
+### Removed
+
+- `CF_EXPORTER_SCRAPE_INTERVAL`, `CF_EXPORTER_GROUP_LIMIT`,
+  `CF_EXPORTER_MAX_SLICE_REQUESTS`, `CF_EXPORTER_MAX_EXTRA_SELECTIONS` and
+  `CF_EXPORTER_MIN_SLICE_SECONDS`. Setting one of them logs a warning.
+  `CF_EXPORTER_MAX_RETRY_AFTER_SECONDS` and `CF_EXPORTER_PAGE_SIZE` remain.
+- The "since midnight" window, its slice hints, the day-close scheduling and
+  the snapshot window metadata.
+
+### Known limits
+
+- A zone that Cloudflare stores at a sample interval of 5 or more throughout
+  cannot be verified. Its buckets are exported 6 hours late and counted as
+  `accepted_unverified`. A bucket that never gets a consistent answer with
+  groups is not exported at all and is counted as `abandoned`.
+- A bucket whose late events arrive more than two hours after it ended keeps
+  its earlier value, and so does one whose labels changed since it was served.
+- A zone with almost no traffic is believed idle after three answers in a row
+  without any group over a week. A reduced answer can lack the few events of
+  such a zone. Every range is widened to the nearest bucket known to have
+  events within a week, and an answer without it is never a look at an idle
+  zone. What is left is a zone without any known event within a week of the
+  bucket: its first requests after a week of silence, or any bucket read while
+  the database is empty, if three reduced answers in a row lack them.
+- Changing `CF_EXPORTER_DISABLED_LABELS` and losing the database afterwards
+  serves the history again under the new labels, next to the old series of
+  the same buckets; sums over labels then count that history twice.
+- A single bucket with more groups than a page (10 000 on current plans) is
+  read in many parts, and it is accepted only when every part came from the
+  full data. While Cloudflare answers a large share of requests at a reduced
+  resolution, such a bucket is exported later, never with estimated counts.
+- An idle zone costs three requests per read, because its emptiness has to be
+  shown three times.
+
 ## [1.8.0] — 2026-10-29
 
 Metric names, labels and label order are unchanged by default, as are the

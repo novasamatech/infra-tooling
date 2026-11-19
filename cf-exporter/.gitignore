@@ -2,3 +2,5 @@
 .ruff_cache/
 .coverage
 htmlcov/
+.state/
+local.mk
