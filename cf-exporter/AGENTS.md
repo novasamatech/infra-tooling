@@ -127,7 +127,7 @@ deadline.
   in a row the zone is idle. "In a row" is literal: any other answer between
   them starts the count again. Known events are the accepted buckets with
   requests (`buckets.requests`, `client_requests`, kept after delivery) and the
-  newest event of any answer (`Exporter._last_event`). `_proof` widens the range
+  newest event of any answer (`ZoneState.last_event`). `_proof` widens the range
   to the nearest known event within the long range of the window; an answer
   without groups over a range with a known event left them out: state
   "missing", a reduced answer, never a look at an idle zone. A recheck always
@@ -197,12 +197,25 @@ deadline.
   `DELIVERY_SECONDS` since acceptance. Undelivered buckets expire
   `UNDELIVERED_KEEP_SECONDS` after their acceptance, never by the bucket's own
   age: a dataset can reach further back. Reading the endpoint without the
-  parameter must never consume data.
+  parameter must never consume data, and needs no token. With
+  `CF_EXPORTER_CONSUME_TOKEN` set, `?consume=1` counts only with that bearer
+  token (constant-time comparison) and is answered 403 without it. Delivery is
+  counted per bucket, not per scraper: document, do not hide, that one
+  consuming scraper per instance (or several writing one deduplicating store)
+  is required. The response budget is `CF_EXPORTER_RESPONSE_SAMPLES`.
 - `/metrics` and every other path serve health metrics only, without timestamps.
   Keep `READ_RESULTS` and `API_ERRORS` fixed, exported from zero and mirrored in
   `image_smoke.py`. Labels never carry URLs, messages or credentials. Only
   `main()` registers collectors; imports must not install handlers or register
-  global metrics.
+  global metrics. Other threads read the exporter only through
+  `Exporter.snapshot()` and `count_delivery()`, never its lock or fields.
+- Per-zone memory lives in one `ZoneState` per zone in `Exporter.zone_states`
+  and goes with it; never add a parallel per-zone dict that needs its own
+  cleanup. A zone whose plan cannot serve reads (`ZonePlanError`) is asked again
+  after `SETTINGS_REFRESH_SECONDS`, an API failure after `ERROR_RETRY_SECONDS`.
+- The secrets `CF_EXPORTER_API_TOKEN` and `CF_EXPORTER_CONSUME_TOKEN` are
+  redacted from every log line (`SECRET_SETTINGS`) and kept out of `repr` and the
+  startup description.
 - `/readyz` means the process can serve: usable storage and one zone listing.
   It must not depend on data freshness or on Cloudflare's current state, so that
   a slow Cloudflare cannot make every replica unready together. No liveness use.
@@ -218,7 +231,7 @@ deadline.
 - One bucket that cannot be read must not hold back its zone
   (`Exporter._postpone`, `_window`): a window is tried again once as it is; a
   failed history read of the zone's full window size halves its windows
-  (`window_ceilings`), a smaller one changes nothing; a window that fails twice is read
+  (`ZoneState.window_ceiling`), a smaller one changes nothing; a window that fails twice is read
   bucket by bucket; a bucket that fails alone waits `RETRY_DELAYS` while the
   rest of the zone is read. Failed reads are counted per bucket (`errors`) and
   make it `abandoned` like failed verifications. After `OUTAGE_FAILURES` failed
@@ -228,7 +241,8 @@ deadline.
 - Cloudflare's limit of 300 GraphQL queries in 5 minutes is shared by every
   instance and user of the token and counts each selection of a request. A
   request that meets it waits for minutes with the fresh buckets behind it, so
-  only history is paced (`HISTORY_INTERVAL_SECONDS`, sized for two instances)
+  only history is paced (`HISTORY_INTERVAL_SECONDS`, sized for two instances,
+  `CF_EXPORTER_HISTORY_INTERVAL_SECONDS` for others)
   and slowed down after rejections (`Exporter._watch_rate_limit`). Keep live
   checks cheap for the same reason: a read with pages of a few groups costs
   hundreds of queries, and under load its small parts come back empty from the

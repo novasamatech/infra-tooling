@@ -202,8 +202,8 @@ def read_zone_rows(api, schema, zone, window):
     exporter = script.Exporter(api, storage, schema)
     # One zone, as if just listed: only its settings are requested.
     now = time.time()
-    exporter.zones = {zone["id"]: zone["name"]}
-    exporter.zones_listed, exporter.zones_at = True, now
+    exporter._follow_listing({zone["id"]: zone["name"]}, now)
+    exporter.zones_at = now
     exporter.refresh(now)
     plan = exporter.plans[zone["id"]]
     unaccepted = profile_live.read_zone(exporter, plan, *window)

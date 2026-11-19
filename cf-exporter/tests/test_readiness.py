@@ -96,6 +96,69 @@ def test_analytics_is_compressed_on_request(cloudflare, exporter, app):
     assert int(headers["Content-Length"]) == len(gzip.compress(plain.encode(), compresslevel=6))
 
 
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("gzip", True),
+        ("gzip, deflate", True),
+        ("deflate, GZIP;q=0.5", True),
+        ("x-gzip", True),
+        ("gzip;q=0", False),
+        ("gzip; q=0.0, *;q=1", False),
+        ("*", True),
+        ("*;q=0", False),
+        ("deflate", False),
+        ("identity", False),
+        ("", False),
+        ("gzip;q=oops", False),
+    ],
+)
+def test_gzip_is_used_only_when_the_client_accepts_it(header, expected):
+    assert script.accepts_gzip(header) is expected
+
+
+def test_gzip_declined_with_a_zero_quality_is_not_sent(cloudflare, exporter, app):
+    cloudflare.add_zone("z1", "example.org", event(T0 + 10, count=4))
+    run(exporter)
+    _, headers, _ = request(app, "/analytics", headers={"Accept-Encoding": "gzip;q=0"})
+    assert "Content-Encoding" not in headers
+
+
+def test_consume_token_guards_delivery_but_not_reading(cloudflare, exporter, storage, clock):
+    """Anything that reaches the port could otherwise take samples away from the
+    scraper. Looking at the endpoint stays open."""
+    cloudflare.add_zone("z1", "example.org", event(T0 + 10, count=4))
+    run(exporter)
+    guarded = script.make_app(
+        exporter, storage, CollectorRegistry(), consume_token="scraper-secret"
+    )
+    status, _, body = request(guarded, "/analytics")
+    assert status == 200 and values(parse(body), "cf_requests_5m") == {T0 + BUCKET: 4}
+    for headers in ({}, {"Authorization": "Bearer wrong"}, {"Authorization": "scraper-secret"}):
+        status, _, body = request(guarded, "/analytics", query="consume=1", headers=headers)
+        assert status == 403 and "bearer token" in body
+    status, _, _ = request(guarded, "/analytics", method="HEAD", query="consume=1")
+    assert status == 403
+    assert exporter.analytics_responses == 0
+    authorized = {"Authorization": "Bearer scraper-secret"}
+    for _ in range(script.DELIVERY_RESPONSES):
+        status, _, _ = request(guarded, "/analytics", query="consume=1", headers=authorized)
+        assert status == 200
+    assert exporter.analytics_responses == script.DELIVERY_RESPONSES
+    clock.advance(script.DELIVERY_SECONDS)
+    exporter.prune(clock.now)
+    assert storage.undelivered_samples() == 0
+
+
+def test_response_size_can_be_configured(cloudflare, exporter, storage):
+    cloudflare.add_zone("z1", "example.org", event(T0 + 10, count=1), event(T0 - 290, count=2))
+    run(exporter)
+    small = script.make_app(exporter, storage, CollectorRegistry(), response_samples=1)
+    _, _, body = request(small, "/analytics")
+    # Whole buckets, at least one, and no more than the budget allows.
+    assert len({timestamp for *_, timestamp in parse(body)}) == 1
+
+
 def test_only_consuming_responses_deliver(cloudflare, exporter, storage, clock, app):
     cloudflare.add_zone("z1", "example.org", event(T0 + 10, count=4))
     run(exporter)

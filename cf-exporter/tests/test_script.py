@@ -48,12 +48,17 @@ def test_parse_env_custom_values():
             "CF_EXPORTER_MAX_RETRY_AFTER_SECONDS": "30",
             "CF_EXPORTER_PAGE_SIZE": "500",
             "CF_EXPORTER_DISABLED_LABELS": '{"cf_requests_5m": ["query"]}',
+            "CF_EXPORTER_HISTORY_INTERVAL_SECONDS": "40",
+            "CF_EXPORTER_RESPONSE_SAMPLES": "10000",
+            "CF_EXPORTER_CONSUME_TOKEN": " scraper-secret\n",
         }
     )
     assert (config.request_timeout, config.metrics_port) == (60, 9000)
     assert config.db_path == "/data/state.sqlite3"
     assert (config.backfill_days, config.max_retry_after_seconds, config.page_size) == (7, 30, 500)
     assert "query" not in config.schema.labels("cf_requests_5m")
+    assert (config.history_interval, config.response_samples) == (40, 10000)
+    assert config.consume_token == "scraper-secret"
     api = script.create_api(config)
     assert (api.max_retry_after_seconds, api.page_size, api.request_timeout) == (30, 500, 60)
     api.session.close()
@@ -73,24 +78,37 @@ def test_invalid_token_is_rejected_without_echoing_it(token):
 
 
 def test_config_repr_excludes_credentials():
-    assert "dummy-credential" not in repr(
-        script.parse_env({"CF_EXPORTER_API_TOKEN": "dummy-credential"})
+    config = script.parse_env(
+        {"CF_EXPORTER_API_TOKEN": "dummy-credential", "CF_EXPORTER_CONSUME_TOKEN": "dummy-consumer"}
     )
+    assert "dummy-credential" not in repr(config) and "dummy-consumer" not in repr(config)
+    assert "dummy-consumer" not in script.describe(config)
 
 
 def test_log_formatter_redacts_credentials_in_messages_and_tracebacks():
-    token = "dummy-credential"
-    formatter = script.RedactingFormatter(token)
+    token, consumer = "dummy-credential", "dummy-consumer"
+    formatter = script.RedactingFormatter(token, consumer, "")
     try:
         raise RuntimeError(token)
     except RuntimeError:
         record = logging.LogRecord(
-            "test", logging.ERROR, __file__, 1, "failed: %s", (token,), sys.exc_info()
+            "test", logging.ERROR, __file__, 1, "failed: %s %s", (token, consumer), sys.exc_info()
         )
     output = formatter.format(record)
-    assert token not in output
+    assert token not in output and consumer not in output
     assert "[REDACTED]" in output
     assert "RuntimeError" in output
+
+
+def test_configured_logging_redacts_both_secrets(capsys):
+    environ = {"CF_EXPORTER_API_TOKEN": "dummy-credential", "CF_EXPORTER_CONSUME_TOKEN": "dummy-c"}
+    script.configure_logging(environ)
+    try:
+        logging.error("leak %s and %s", "dummy-credential", "dummy-c")
+    finally:
+        logging.basicConfig(force=True)
+    err = capsys.readouterr().err
+    assert "dummy-credential" not in err and "dummy-c " not in err and "leak" in err
 
 
 @pytest.mark.parametrize("value", [None, "", "   \n"])
@@ -105,6 +123,8 @@ def test_parse_env_empty_values_use_defaults():
         {"CF_EXPORTER_API_TOKEN": "abc", "CF_EXPORTER_METRICS_PORT": "", "CF_EXPORTER_DB_PATH": " "}
     )
     assert config.metrics_port == 8000 and config.db_path == script.DEFAULT_DB_PATH
+    assert (config.history_interval, config.response_samples) == (15, 50_000)
+    assert config.consume_token == ""
 
 
 @pytest.mark.parametrize(
@@ -118,6 +138,9 @@ def test_parse_env_empty_values_use_defaults():
         ("CF_EXPORTER_BACKFILL_DAYS", "1.5", "must be an integer"),
         ("CF_EXPORTER_MAX_RETRY_AFTER_SECONDS", "-1", "must be >= 0"),
         ("CF_EXPORTER_PAGE_SIZE", "many", "must be an integer"),
+        ("CF_EXPORTER_HISTORY_INTERVAL_SECONDS", "0", "must be >= 1"),
+        ("CF_EXPORTER_RESPONSE_SAMPLES", "0", "must be >= 1"),
+        ("CF_EXPORTER_CONSUME_TOKEN", "two words", "must contain only printable ASCII"),
     ],
 )
 def test_parse_env_rejects_invalid_values(name, value, message):
@@ -129,7 +152,8 @@ def test_describe_lists_storage_limits_and_disabled_labels():
     config = script.parse_env({"CF_EXPORTER_API_TOKEN": "abc"})
     assert script.describe(config) == (
         "storage /var/lib/cf-exporter/cf-exporter.sqlite3; optional limits: none; "
-        "disabled labels: none"
+        "disabled labels: none; history every 15s; up to 50000 samples per response; "
+        "consume token not set"
     )
     config = script.parse_env(
         {
@@ -145,7 +169,8 @@ def test_describe_lists_storage_limits_and_disabled_labels():
     assert script.describe(config) == (
         "storage /data/x.sqlite3; optional limits: CF_EXPORTER_BACKFILL_DAYS=3, "
         "CF_EXPORTER_PAGE_SIZE=100; disabled labels: cf_visits_5m: path; "
-        "cf_requests_5m: query, user_agent_os"
+        "cf_requests_5m: query, user_agent_os; history every 15s; "
+        "up to 50000 samples per response; consume token not set"
     )
 
 
@@ -779,6 +804,9 @@ def test_main_wires_everything_together(monkeypatch, quiet_logging, tmp_path, ca
     monkeypatch.setenv("CF_EXPORTER_BACKFILL_DAYS", "2")
     monkeypatch.setenv("CF_EXPORTER_PAGE_SIZE", "777")
     monkeypatch.setenv("CF_EXPORTER_DISABLED_LABELS", '{"cf_requests_5m": ["query"]}')
+    monkeypatch.setenv("CF_EXPORTER_HISTORY_INTERVAL_SECONDS", "30")
+    monkeypatch.setenv("CF_EXPORTER_RESPONSE_SAMPLES", "2000")
+    monkeypatch.setenv("CF_EXPORTER_CONSUME_TOKEN", "scraper-secret")
     # Settings of 1.x that no longer exist are reported, not silently ignored.
     monkeypatch.setenv("CF_EXPORTER_SCRAPE_INTERVAL", "300")
     monkeypatch.setenv("CF_EXPORTER_GROUP_LIMIT", "")
@@ -788,7 +816,9 @@ def test_main_wires_everything_together(monkeypatch, quiet_logging, tmp_path, ca
     monkeypatch.setattr(
         script.signal, "signal", lambda sig, handler: handlers.update({sig: handler})
     )
-    monkeypatch.setattr(script, "start_http_server", lambda *args: servers.append(args))
+    monkeypatch.setattr(
+        script, "start_http_server", lambda *args, **options: servers.append((args, options))
+    )
     # While the loop runs, the registered collectors serve the health metrics.
     monkeypatch.setattr(
         script.Exporter,
@@ -801,10 +831,17 @@ def test_main_wires_everything_together(monkeypatch, quiet_logging, tmp_path, ca
 
     assert set(handlers) == {signal.SIGTERM, signal.SIGINT}
     exporter, stop, text = runs[0]
-    assert servers == [(9123, exporter, exporter.storage)]
+    assert servers == [
+        (
+            (9123, exporter, exporter.storage),
+            {"response_samples": 2000, "consume_token": "scraper-secret"},
+        )
+    ]
     assert not stop.is_set()
     assert exporter.api.session.headers["Authorization"] == "Bearer abc"
     assert (exporter.backfill_days, exporter.api.page_size) == (2, 777)
+    assert exporter.history_pace() == 30
+    assert "scraper-secret" not in caplog.text and "consume token required" in caplog.text
     assert "query" not in exporter.schema.labels("cf_requests_5m")
     assert exporter.storage.persistent and path.exists()
     assert "CF_EXPORTER_SCRAPE_INTERVAL was removed in 2.0.0 and is ignored" in caplog.text
@@ -824,7 +861,9 @@ def test_database_is_closed_when_a_signal_ends_the_loop(monkeypatch, quiet_loggi
     storages = []
     monkeypatch.setattr(script, "REGISTRY", CollectorRegistry())
     monkeypatch.setattr(script.signal, "signal", lambda sig, handler: None)
-    monkeypatch.setattr(script, "start_http_server", lambda *args: storages.append(args[2]))
+    monkeypatch.setattr(
+        script, "start_http_server", lambda *args, **options: storages.append(args[2])
+    )
 
     def interrupted(self, stop):
         script._handle_signal(signal.SIGTERM, None)

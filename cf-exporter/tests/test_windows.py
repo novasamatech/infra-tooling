@@ -11,7 +11,7 @@ import threading
 from itertools import pairwise
 
 import pytest
-from conftest import BUCKET, T0, analytics, event, health, run, sampled, values
+from conftest import BUCKET, PRO_FIELDS, T0, analytics, event, health, run, sampled, values
 
 import script
 
@@ -205,6 +205,21 @@ def test_history_reads_are_paced_and_fresh_reads_are_not(cloudflare, exporter, c
     assert stop.waits == [5] * (history_reads - 1)
 
 
+def test_history_interval_can_be_configured(cloudflare, api, storage, clock):
+    """Two instances fit Cloudflare's rate limit at the default pace; more
+    instances, or other users of the token, need a longer interval."""
+    cloudflare.add_zone("z1", "example.org", not_older_than=5 * 3600)
+    exporter = script.Exporter(api, storage, clock=clock, history_interval=40)
+    stop = Stop(clock)
+    while exporter.tick(stop):
+        pass
+    history_reads = len(first_requests(cloudflare)) - 1
+    assert history_reads >= 2 and exporter.history_pace() == 40
+    # Waited in pieces, never longer than the loop interval at once.
+    assert sum(stop.waits) >= 40 * (history_reads - 1)
+    assert max(stop.waits) <= script.LOOP_SECONDS
+
+
 def test_history_pace_never_holds_back_a_new_bucket(cloudflare, exporter, clock, monkeypatch):
     """A long pause between history reads is waited in pieces: the next bucket is
     read when it settles, not when the pause is over."""
@@ -272,13 +287,14 @@ def test_fresh_and_recheck_windows_respect_the_dataset_max_duration(cloudflare, 
 def test_small_failed_history_read_leaves_the_window_size_alone(cloudflare, exporter, clock):
     cloudflare.add_zone("z1", "example.org", not_older_than=2 * 86400)
     exporter.refresh(clock.now)
-    exporter.windows["z1"] = 48
+    zone = exporter.zone_states["z1"]
+    zone.window = 48
     ends = [T0 - 20 * BUCKET + index * BUCKET for index in range(3)]
-    exporter._postpone("history", "z1", ends, False)
-    assert exporter.windows == {"z1": 48} and exporter.window_ceilings == {}
+    exporter._postpone("history", zone, ends, False)
+    assert (zone.window, zone.window_ceiling) == (48, None)
     full = [T0 - 100 * BUCKET + index * BUCKET for index in range(48)]
-    exporter._postpone("history", "z1", full, False)
-    assert exporter.windows == exporter.window_ceilings == {"z1": 24}
+    exporter._postpone("history", zone, full, False)
+    assert (zone.window, zone.window_ceiling) == (24, 24)
 
 
 def test_history_is_read_more_slowly_after_the_rate_limit_was_reached(
@@ -488,12 +504,12 @@ def test_history_window_that_fails_is_not_grown_back_at_once(cloudflare, exporte
     assert history[:3] == [12, 24, 48]
     assert set(history[3:-1]) == {24} and len(history) > 20
     assert sum(history) - 48 + 12 == 575  # every bucket of the two days exactly once
-    assert exporter.window_ceilings == {"z1": 24}
+    assert exporter.zone_states["z1"].window_ceiling == 24
     assert exporter.results["error"] == 1
     # Fetching the settings again lifts the ceiling.
     clock.advance(script.SETTINGS_REFRESH_SECONDS)
     exporter.refresh(clock.now)
-    assert exporter.window_ceilings == {}
+    assert exporter.zone_states["z1"].window_ceiling is None
 
 
 def test_failing_zone_does_not_hold_back_the_others(cloudflare, exporter, storage):
@@ -503,7 +519,7 @@ def test_failing_zone_does_not_hold_back_the_others(cloudflare, exporter, storag
     samples = analytics(exporter, storage)
     assert values(samples, "cf_requests_5m", zone_name="b.example") == {T0 + BUCKET: 6}
     assert values(samples, "cf_zone_requests_5m", zone_name="a.example") == {}
-    assert exporter.zone_success == {"a.example": 0, "b.example": 1}
+    assert exporter.snapshot().success == {"a.example": 0, "b.example": 1}
 
 
 def test_unexpected_error_in_one_read_is_contained(
@@ -551,7 +567,7 @@ def test_explicit_rate_limit_maximum_pauses_all_reads(cloudflare, exporter, cloc
     run(exporter)
     assert exporter.results["error"] == 1
     assert {c["zone"] for c in cloudflare.calls[1:]} == {"za", "zb"}
-    assert exporter.zone_success == {"a.example": 1, "b.example": 1}
+    assert exporter.snapshot().success == {"a.example": 1, "b.example": 1}
 
 
 @pytest.mark.parametrize("api", [{"max_retry_after_seconds": 1}], indirect=True)
@@ -597,14 +613,45 @@ def test_settings_failure_is_retried_and_leaves_other_zones_alone(
     bad.settings_error = "not authorized"
     cloudflare.add_zone("zb", "b.example", event(T0 + 10, count=6))
     run(exporter)
-    assert exporter.zone_success == {"a.example": 0, "b.example": 1}
+    assert exporter.snapshot().success == {"a.example": 0, "b.example": 1}
     assert {c["zone"] for c in cloudflare.calls} == {"zb"}
     bad.settings_error = None
     clock.advance(script.ERROR_RETRY_SECONDS)
     run(exporter)
-    assert exporter.zone_success == {"a.example": 1, "b.example": 1}
+    assert exporter.snapshot().success == {"a.example": 1, "b.example": 1}
     samples = analytics(exporter, storage)
     assert values(samples, "cf_requests_5m", zone_name="a.example") == {T0 + BUCKET: 4}
+
+
+@pytest.mark.parametrize(
+    "unusable",
+    [
+        {"enabled": False},
+        {"fields": [f for f in PRO_FIELDS if f != "count"]},
+        {"max_duration": 120},
+    ],
+    ids=["not-enabled", "missing-field", "too-short"],
+)
+def test_zone_whose_plan_cannot_be_read_is_asked_again_hourly(
+    cloudflare, exporter, clock, caplog, unusable
+):
+    """Asking again a minute later changes nothing about a plan, and with many
+    such zones it would cost a good part of the shared rate limit."""
+    enabled = unusable.pop("enabled", True)
+    zone = cloudflare.add_zone("za", "a.example", **unusable)
+    zone.enabled = enabled
+    cloudflare.add_zone("zb", "b.example")
+    with caplog.at_level(logging.ERROR):
+        run(exporter)
+    assert "a.example: cannot be read" in caplog.text
+    assert exporter.snapshot().success == {"a.example": 0, "b.example": 1}
+    for _ in range(59):
+        clock.advance(60)
+        run(exporter)
+    assert cloudflare.settings_calls.count("za") == 1
+    clock.advance(60)
+    run(exporter)
+    assert cloudflare.settings_calls.count("za") == 2
 
 
 def test_settings_are_fetched_once_and_refreshed_hourly(cloudflare, exporter, clock):
@@ -722,7 +769,8 @@ def test_zone_missing_from_one_listing_keeps_its_state(cloudflare, exporter, sto
     assert remembered("za") > 0 and "za" in exporter.plans
     clock.advance(script.ZONE_KEEP_SECONDS)
     run(exporter)
-    assert remembered("za") == 0 and exporter._gone == {} and "za" not in exporter.plans
+    assert remembered("za") == 0 and exporter.gone_zones() == []
+    assert "za" not in exporter.zone_states
 
 
 def test_incomplete_first_listing_after_a_restart_keeps_a_zones_state(
@@ -742,7 +790,7 @@ def test_incomplete_first_listing_after_a_restart_keeps_a_zones_state(
     restarted = script.Storage(path)
     second = script.Exporter(api, restarted, clock=clock)
     run(second)
-    assert set(second._gone) == {"za"}
+    assert second.gone_zones() == ["za"]
     assert restarted.summary()["zones"]["za"] == stored
     cloudflare.zones["za"] = zone
     clock.advance(script.ZONES_REFRESH_SECONDS)

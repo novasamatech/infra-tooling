@@ -141,7 +141,7 @@ def test_collection_counts_listing_settings_reads_and_a_failed_zone(cloudflare, 
     cloudflare.add_zone("a", "good.example", event(T0 + 10, count=4))
     cloudflare.add_zone("b", "bad.example").error = "not authorized"
     run(exporter)
-    assert exporter.zone_success == {"good.example": 1, "bad.example": 0}
+    assert exporter.snapshot().success == {"good.example": 1, "bad.example": 0}
     # One listing; settings for both zones; a fresh and a history read of the
     # good zone and one rejected read of the bad one.
     assert counters(api) == {

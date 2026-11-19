@@ -15,6 +15,10 @@ endpoint and the deployment requirements are different. Dashboards, alerts and
 the scrape configuration have to be migrated together with the upgrade; nothing
 of 1.x is kept. No dependencies are added; the database uses Python's `sqlite3`.
 
+**Upgrading:** `:latest` moves to 2.0.0 with this release. A deployment that
+follows `:latest` loses every 1.x metric at once; pin `:1.8.0` until the scrape
+configuration, dashboards and alerts are migrated, then switch to `:2.0.0`.
+
 ### Why
 
 Up to 1.8.0 the exporter read the whole UTC day again in every cycle and
@@ -92,15 +96,24 @@ also made every instance unready at the same time, which emptied the scrape.
 - History: on first start, after a lost database or an outage, everything the
   dataset still has is read, newest first, behind fresh buckets and at most
   once per 15 seconds, which leaves room in Cloudflare's rate limit for two
-  instances. Whenever the limit is reached, history is read more slowly for
-  the next hours; a new bucket never waits for that pace.
-  `CF_EXPORTER_BACKFILL_DAYS` shortens the history, not the proof ranges.
+  instances; `CF_EXPORTER_HISTORY_INTERVAL_SECONDS` sets another pace. Whenever
+  the limit is reached, history is read more slowly for the next hours; a new
+  bucket never waits for that pace. `CF_EXPORTER_BACKFILL_DAYS` shortens the
+  history, not the proof ranges.
+- `CF_EXPORTER_RESPONSE_SAMPLES` sets the samples per `/analytics` response
+  (default 50 000), to match the scraper's response size limit.
+- `CF_EXPORTER_CONSUME_TOKEN`: when set, a consuming `/analytics` request needs
+  it as a bearer token and is answered 403 without it, so that nothing else
+  that reaches the port can take samples away from the scraper.
+- A zone whose plan cannot serve the reads is asked again hourly instead of
+  every minute.
 - A second read of every bucket one to two hours after it ended picks up late
   events; a changed bucket is served again with the same timestamps. A bucket
   served with other labels than the current ones is not read again
   (`recheck_skipped`), so that no events are served under two label sets.
 - Several instances can run side by side without coordination and produce
-  identical series.
+  identical series. The store has to keep one sample per series and timestamp;
+  see the README's "Scraping".
 - The image declares the volume `/var/lib/cf-exporter`, owned by UID 1000.
 - Make targets for everything needed to run and debug: `status`, `scrape`,
   `logs` and `stop` for the exporter started by `make run`, `stop-check` for a

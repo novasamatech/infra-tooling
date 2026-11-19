@@ -55,14 +55,16 @@ One case cannot be proven: a zone that Cloudflare itself stores at a sample inte
 ### Late events and history
 
 - An accepted bucket is read once more one to two hours after it ended, all buckets of an hour in one request. If late events changed it, the bucket is served again with the same timestamps and the new values. A bucket served with other labels than the exporter uses now (`CF_EXPORTER_DISABLED_LABELS` or the zone's plan changed) is not read again: serving it once more would add a second series for the same events. Such skipped rechecks are counted as `recheck_skipped`.
-- On first start, after a lost database and after an outage, the exporter reads everything the dataset still has, newest first, up to `notOlderThan` minus one hour, or `CF_EXPORTER_BACKFILL_DAYS`. History is read at most once per 15 seconds and only while fewer than 500 000 samples wait for the scraper, so fresh buckets always come first.
-- Cloudflare allows 300 GraphQL queries in 5 minutes for all users of a token together and counts every selection of a request. The pace of the history leaves room for two instances and their fresh buckets. Whenever the limit is reached anyway, the interval between history reads doubles, up to 4 minutes, and halves again after every hour without a rejection. The pause is waited in pieces of at most 15 seconds and never past the moment the next bucket settles: a new bucket is read when it settles, a due retry or recheck at most 15 seconds later.
+- On first start, after a lost database and after an outage, the exporter reads everything the dataset still has, newest first, up to `notOlderThan` minus one hour, or `CF_EXPORTER_BACKFILL_DAYS`. History is read at most once per 15 seconds (`CF_EXPORTER_HISTORY_INTERVAL_SECONDS`) and only while fewer than 500 000 samples wait for the scraper, so fresh buckets always come first.
+- Cloudflare allows 300 GraphQL queries in 5 minutes for all users of a token together and counts every selection of a request. A history read costs about 4 queries, and the fresh buckets of an instance about 50 per 5 minutes. The default interval of 15 seconds leaves room for two instances; for `N` instances on one token, use at least `1200 × N / (300 − 50 × N)` seconds (24 for three, 48 for four), more if the token has other users. Whenever the limit is reached anyway, the interval between history reads doubles, up to 4 minutes, and halves again after every hour without a rejection. The pause is waited in pieces of at most 15 seconds and never past the moment the next bucket settles: a new bucket is read when it settles, a due retry or recheck at most 15 seconds later.
 - Buckets that were tried but never verified before they left the dataset's reach are counted as `abandoned`.
 - A zone that is missing from the zone listing, also one that only the database still knows after a restart, keeps its state for a day but is not read. If it is listed again within that time, only the buckets that became due meanwhile are read. Health metrics show the listed zones only.
 
 ### Failures
 
 API failures are logged and reported through health metrics; the process keeps running. Transient 5xx and transport errors have up to three retries with backoff. By default HTTP 429 is waited for as long as `Retry-After` says, or 300 seconds without one, without spending the retry allowance; a GraphQL error reporting a depleted budget is handled the same way. `CF_EXPORTER_MAX_RETRY_AFTER_SECONDS` bounds that wait; when it rejects a request, all requests, including settings and the zone listing, pause for 300 seconds. A failed read never yields partial data. SIGTERM and SIGINT exit cleanly.
+
+A zone whose settings request fails is tried again after 60 seconds. A zone whose plan cannot serve the reads (the dataset is not enabled, a required field is missing, or the plan's range is shorter than a bucket) is reported with `cf_exporter_zone_success` 0 and asked again only hourly: asking sooner changes nothing and costs the shared rate limit.
 
 After any other failed read the zone is left alone for 60 seconds; other zones continue. What follows keeps one bucket that cannot be read from holding back its zone:
 
@@ -142,19 +144,28 @@ Do not use `rate()` or `increase()`: these are not counters. Data arrives 6 to 8
 
 ### Scraping
 
-`GET /analytics` returns the buckets that are not delivered yet, up to 50 000 samples per response and always whole buckets. Buckets that still need a response come first, the newest first; older ones follow in later responses. Buckets that had their responses and only wait for the delivery time fill what is left of a response, so they never keep others out. The response honors `Accept-Encoding: gzip`.
+`GET /analytics` returns the buckets that are not delivered yet, up to 50 000 samples per response (`CF_EXPORTER_RESPONSE_SAMPLES`) and always whole buckets. Buckets that still need a response come first, the newest first; older ones follow in later responses. Buckets that had their responses and only wait for the delivery time fill what is left of a response, so they never keep others out. The response is gzip-compressed if `Accept-Encoding` allows gzip with a quality above zero.
 
 | Requirement | Reason |
 | --- | --- |
 | Request `/analytics?consume=1` | Only such a response counts as a delivery. Without the parameter the endpoint can be read by hand at any time without taking samples away from the scraper |
+| One consuming scraper per exporter instance, or several that write into the same deduplicating store | Delivery is counted per bucket, not per scraper. Under a backlog a bucket goes out in exactly two responses; if both reach one scraper, another scraper never sees the bucket |
+| Only the scraper may consume: restrict the port to it, or set `CF_EXPORTER_CONSUME_TOKEN` and send `Authorization: Bearer <token>` | A consuming request is destructive: two of them and ten minutes delete a bucket from the exporter. With the token, `?consume=1` without it is answered 403; reading without the parameter stays open |
 | Honor the exposed timestamps | The timestamps are the data. In Prometheus-compatible scrapers this is `honor_timestamps: true` |
 | No staleness markers for this job | Series leave the response after every delivered bucket. A marker written then is no bucket value, and next to the bucket samples it can interfere with deduplication |
 | Accept samples up to the dataset's reach in the past | History and late buckets are hours to weeks old |
-| A response size limit of at least 64 MiB | One response has up to 50 000 samples, usually 10 to 15 MB uncompressed, more with long label values or a very large bucket |
+| A response size limit above the largest response, at least 64 MiB with the default `CF_EXPORTER_RESPONSE_SAMPLES` | One response has up to 50 000 samples, usually 10 to 15 MB uncompressed, more with long label values or a very large bucket. A response the scraper drops after reading it still counts as sent |
+| A store that keeps one sample per series and timestamp, preferably the larger value | See below |
 
-A bucket leaves `/analytics` after two complete consuming responses and 10 minutes since it was accepted; its samples are then deleted. A response that was not sent completely does not count, nor does one for a bucket accepted again while it was on its way. If nobody scrapes, buckets wait: 35 days after their acceptance at most, then they are dropped and counted as `expired`.
+A bucket leaves `/analytics` after two complete consuming responses and 10 minutes since it was accepted; its samples are then deleted. A response counts once its body was written; whether the scraper then keeps it is not known to the exporter. A response that was not sent completely does not count, nor does one for a bucket accepted again while it was on its way. If nobody scrapes, buckets wait: 35 days after their acceptance at most, then they are dropped and counted as `expired`.
 
-Several replicas can run side by side. Each reads Cloudflare on its own and keeps its own database. Scrape every replica and drop the labels that identify the replica from the analytics samples; the replicas then produce the same series with the same timestamps, and the time-series database stores them once if it deduplicates identical samples. Replicas can disagree for a bucket whose late events only one of them has seen; which value is kept is up to the database.
+The same sample arrives many times: in every response for at least ten minutes, from every replica, and again after the history is read again. A bucket changed by its second read arrives with the same timestamp and a new value. The store therefore has to keep one sample per series and timestamp:
+
+- With deduplication that keeps the larger of two values at one timestamp, sums are right and late corrections win.
+- A store that rejects a second sample at an existing timestamp with another value, as Prometheus' own storage does, keeps the first value: nothing is counted twice, but the correction is lost.
+- A store that keeps every sample counts each bucket several times in `sum_over_time`.
+
+Several replicas can run side by side. Each reads Cloudflare on its own and keeps its own database. Scrape every replica and drop the labels that identify the replica from the analytics samples; the replicas then produce the same series with the same timestamps, which such a store keeps once. Replicas can disagree for a bucket whose late events only one of them has seen; the store's rule decides which value stays.
 
 A database or query layer that caches the results of range queries may keep answers computed before a late sample arrived. Bypass or disable that cache for these metrics.
 
@@ -262,6 +273,9 @@ Create an API token with **Zone / Zone / Read** and **Zone / Analytics / Read** 
 | `CF_EXPORTER_REQUEST_TIMEOUT` | `30` | Positive integer, HTTP timeout in seconds |
 | `CF_EXPORTER_DISABLED_LABELS` | `{}` (every label) | JSON object of metric names to lists of labels; see [Label selection](#label-selection) |
 | `CF_EXPORTER_LOGLEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
+| `CF_EXPORTER_HISTORY_INTERVAL_SECONDS` | `15` | Positive integer: least seconds between two history reads; see [Late events and history](#late-events-and-history) for more instances on one token |
+| `CF_EXPORTER_RESPONSE_SAMPLES` | `50000` | Positive integer: samples per `/analytics` response, whole buckets, at least one. Size the scraper's response limit to it. A smaller value delivers a backlog more slowly: each bucket needs two responses |
+| `CF_EXPORTER_CONSUME_TOKEN` | Not set | Bearer token a `?consume=1` request has to send; same character rules as the API token. Unset, any consuming request counts |
 
 Optional limits. Each is a nonnegative integer; unset, empty or `0` imposes none:
 
@@ -271,7 +285,7 @@ Optional limits. Each is a nonnegative integer; unset, empty or `0` imposes none
 | `CF_EXPORTER_MAX_RETRY_AFTER_SECONDS` | A longer `Retry-After` fails the request at once instead of being waited for |
 | `CF_EXPORTER_PAGE_SIZE` | Groups per page of the selections with dimensions; a value above a zone's `maxPageSize` uses `maxPageSize` |
 
-Invalid settings or a missing or malformed token fail startup. An unknown log level falls back to INFO with a warning. Logs and configuration representations redact the token; the startup log lists the storage path, enabled limits and disabled labels. Settings removed in 2.0.0 (`CF_EXPORTER_SCRAPE_INTERVAL`, `CF_EXPORTER_GROUP_LIMIT`, `CF_EXPORTER_MAX_SLICE_REQUESTS`, `CF_EXPORTER_MAX_EXTRA_SELECTIONS`, `CF_EXPORTER_MIN_SLICE_SECONDS`) are ignored with a warning.
+Invalid settings or a missing or malformed token fail startup. An unknown log level falls back to INFO with a warning. Logs and configuration representations redact both tokens; the startup log lists the storage path, enabled limits, disabled labels, the history interval, the response size and whether a consume token is required. Settings removed in 2.0.0 (`CF_EXPORTER_SCRAPE_INTERVAL`, `CF_EXPORTER_GROUP_LIMIT`, `CF_EXPORTER_MAX_SLICE_REQUESTS`, `CF_EXPORTER_MAX_EXTRA_SELECTIONS`, `CF_EXPORTER_MIN_SLICE_SECONDS`) are ignored with a warning.
 
 ## Containers
 
@@ -282,9 +296,11 @@ The image runs as UID and GID 1000 and declares `/var/lib/cf-exporter` as a volu
 ```bash
 printf '%s\n' "$CF_EXPORTER_API_TOKEN" | docker run --rm -i \
   -p 8000:8000 -v cf-exporter-state:/var/lib/cf-exporter \
-  ghcr.io/novasamatech/infra-tooling/cf-exporter:latest \
+  ghcr.io/novasamatech/infra-tooling/cf-exporter:2.0.0 \
   /bin/sh -c 'IFS= read -r CF_EXPORTER_API_TOKEN; export CF_EXPORTER_API_TOKEN; exec python script.py'
 ```
+
+Pin a version tag. `:latest` follows every release, and 2.0.0 changes every metric family and the scrape requirements; see the [CHANGELOG](CHANGELOG.md).
 
 Other settings can be passed with `-e`, for example `-e CF_EXPORTER_BACKFILL_DAYS=7`.
 

@@ -173,10 +173,11 @@ def test_two_empty_answers_are_not_enough(cloudflare, exporter, storage, clock, 
     assert exporter.results["accepted"] == 23
 
 
-def test_empty_answers_count_only_in_a_row(cloudflare, api, exporter):
-    zone = cloudflare.add_zone("z1", "example.org")
-    plan = plan_for(api, zone)
-    exporter._long_proof.add(("z1", "totals"))
+def test_empty_answers_count_only_in_a_row(cloudflare, exporter, clock):
+    cloudflare.add_zone("z1", "example.org")
+    exporter.refresh(clock.now)
+    plan = exporter.plans["z1"]
+    exporter.zone_states["z1"].long_proof.add("totals")
     stats = script.ReadStats(states={"totals": "empty"}, ranges={"totals": (T0 - 86400, T0)})
     assert exporter._settle_proof(plan, stats) == {"totals"}
     assert exporter._settle_proof(plan, stats) == {"totals"}
@@ -207,7 +208,7 @@ def test_reduced_answer_with_groups_between_empty_ones_keeps_the_zone_from_being
         not_older_than=10 * 86400 + 3600,
     )
     newest = exporter.plan(clock.now)
-    exporter._long_proof = {("z1", "totals"), ("z1", "edge_totals")}
+    exporter.zone_states["z1"].long_proof = {"totals", "edge_totals"}
     factors = [100, 10, 100, 100]
 
     def reduced(call, alias, groups):
@@ -232,7 +233,7 @@ def test_empty_answer_over_a_range_with_known_events_is_not_believed(
     is empty for it, however often it is asked: that must not look idle."""
     zone = cloudflare.add_zone("z1", "example.org", event(T0 - 3000, count=3))
     run(exporter)
-    assert exporter._last_event[("z1", "totals")] == T0 - 2700
+    assert exporter.zone_states["z1"].last_event["totals"] == T0 - 2700
     zone.add(event(T0 + 310, count=3))
     cloudflare.transforms.append(sampled(set(ALL)))
     clock.advance(BUCKET)
@@ -241,7 +242,7 @@ def test_empty_answer_over_a_range_with_known_events_is_not_believed(
     # The earlier requests are known to lie in the range: an answer without
     # them is a reduced one, read again, and never a look at an idle zone.
     assert [call["aliases"] for call in cloudflare.calls[before:]] == [ALL, TOTALS, TOTALS, TOTALS]
-    assert exporter._long_proof == set()
+    assert exporter.zone_states["z1"].long_proof == set()
     assert exporter.results["sampled"] == 1
     assert END + BUCKET not in values(analytics(exporter, storage), "cf_zone_requests_5m")
 
@@ -255,7 +256,7 @@ def test_empty_answer_over_a_range_with_known_events_is_not_believed(
 def test_long_proof_range_is_left_when_the_zone_has_traffic_again(cloudflare, exporter, clock):
     zone = cloudflare.add_zone("z1", "example.org", not_older_than=10 * 86400 + 3600)
     run(exporter)
-    assert exporter._long_proof == {("z1", "totals"), ("z1", "edge_totals")}
+    assert exporter.zone_states["z1"].long_proof == {"totals", "edge_totals"}
     zone.add(
         *(
             event(T0 + 310 + index * BUCKET, source="edgeWorkerFetch")
@@ -266,7 +267,7 @@ def test_long_proof_range_is_left_when_the_zone_has_traffic_again(cloudflare, ex
     newest = exporter.plan(clock.now)
     exporter.read("fresh", "z1", newest - 3600, newest)
     # Only the selection that has plenty of groups again; clients are still absent.
-    assert exporter._long_proof == {("z1", "edge_totals")}
+    assert exporter.zone_states["z1"].long_proof == {"edge_totals"}
     assert exporter._proof(exporter.plans["z1"], newest - 3600, newest) == {
         "totals": (newest - script.PROOF_SECONDS, newest),
         "edge_totals": (newest - script.LONG_PROOF_SECONDS, newest),
@@ -601,7 +602,7 @@ def test_proof_range_is_a_day_before_the_window_or_after_it_at_the_edge(
     start = oldest + 7200
     assert exporter._proof(plan, start, start + 3600)["totals"] == (oldest, oldest + day)
     # A quiet zone's selection is read over a week, and no further.
-    exporter._long_proof.add(("z1", "edge_totals"))
+    exporter.zone_states["z1"].long_proof.add("edge_totals")
     ranges = exporter._proof(plan, END - 3600, END)
     assert ranges["totals"] == (END - day, END)
     assert ranges["edge_totals"] == (END - 7 * day, END)

@@ -18,6 +18,7 @@ history is read again from Cloudflare. Health metrics are served on /metrics.
 
 import gzip
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -49,6 +50,10 @@ from urllib3.util.retry import Retry
 
 API_BASE_URL = "https://api.cloudflare.com/client/v4"
 ZONES_PER_PAGE = 50  # maximum allowed by GET /zones
+DEFAULT_REQUEST_TIMEOUT = 30
+DEFAULT_METRICS_PORT = 8000
+HOUR_SECONDS = 3600
+DAY_SECONDS = 86400
 
 # Every analytics sample counts the events of one bucket of this many seconds,
 # aligned to the Unix epoch (and so to UTC days), and carries the bucket end.
@@ -57,12 +62,12 @@ BUCKET_SECONDS = 300
 SETTLE_SECONDS = 300
 # An accepted bucket is read once more this long after it ended, so that late
 # events still reach it; a changed bucket is served again with the same timestamps.
-RECHECK_SECONDS = 3600
+RECHECK_SECONDS = HOUR_SECONDS
 # A recheck that keeps failing verification is given up this long after the bucket.
-RECHECK_GIVE_UP_SECONDS = 6 * 3600
+RECHECK_GIVE_UP_SECONDS = 6 * HOUR_SECONDS
 RECHECK_RETRY_SECONDS = 900
 # Pending buckets that ended within this span are read before rechecks and history.
-FRESH_SECONDS = 3600
+FRESH_SECONDS = HOUR_SECONDS
 # Under load Cloudflare answers a selection from a table holding every tenth or
 # hundredth event instead of its full data. Every group of such an answer has a
 # sample interval of 10 or more, and buckets with few events have no group at
@@ -73,11 +78,11 @@ SAMPLED_INTERVAL = 5.0
 # against, are therefore read together with the buckets of this many seconds
 # around the window: one group below SAMPLED_INTERVAL anywhere in that answer
 # proves that all of it, empty buckets included, comes from the full data.
-PROOF_SECONDS = 86400
+PROOF_SECONDS = DAY_SECONDS
 # Totals without any group in that range are read over this many seconds
 # instead: a quiet zone. Not longer, because Cloudflare answers ranges of a
 # month from a reduced table every time, which would prove nothing ever.
-LONG_PROOF_SECONDS = 7 * 86400
+LONG_PROOF_SECONDS = 7 * DAY_SECONDS
 # A zone stays in that mode until such an answer has at least this many groups.
 LONG_PROOF_GROUPS = 50
 # Totals without any group even there are believed, as an idle zone, after
@@ -88,7 +93,12 @@ EMPTY_LOOKS = 3
 # A bucket that never verifies but returns the same answer for this long is what
 # Cloudflare stored, not a transient reduced-resolution answer; it is accepted
 # and counted as unverified.
-UNVERIFIED_HOLD_SECONDS = 6 * 3600
+UNVERIFIED_HOLD_SECONDS = 6 * HOUR_SECONDS
+# Group sums equal the totals within this relative and absolute tolerance;
+# counts are integers, so it only absorbs floating-point rounding.
+SUM_TOLERANCE = 1e-9
+# Hex digits kept of the SHA-256 of a bucket's samples and of a zone's layout.
+DIGEST_LENGTH = 16
 # Delays before reading a rejected bucket again, by attempt.
 RETRY_DELAYS = (120, 240, 480, 900, 1800)
 # Selections that were answered at a reduced resolution or prove nothing are
@@ -117,38 +127,46 @@ OUTAGE_FAILURES = 2
 # and accepted at least this long ago. Then its samples are deleted.
 DELIVERY_RESPONSES = 2
 DELIVERY_SECONDS = 600
-# Samples per /analytics response. Buckets that still need a response go first,
-# the newest first; those only waiting for DELIVERY_SECONDS fill what is left.
-# Not a limit of the exported data: the rest follows in later responses.
+# Samples per /analytics response by default (CF_EXPORTER_RESPONSE_SAMPLES).
+# Buckets that still need a response go first, the newest first; those only
+# waiting for DELIVERY_SECONDS fill what is left. Not a limit of the exported
+# data: the rest follows in later responses.
 RESPONSE_SAMPLE_BUDGET = 50_000
+# Compression level of a gzip /analytics response.
+GZIP_LEVEL = 6
 # History is read only while fewer undelivered samples are stored, so that the
 # database follows the scrapes; fresh buckets and rechecks are always read.
 BACKLOG_SAMPLE_LIMIT = 500_000
 # Accepted buckets that no scraper consumed this long after their acceptance are
 # dropped; it bounds the database without scrapes.
-UNDELIVERED_KEEP_SECONDS = 35 * 86400
+UNDELIVERED_KEEP_SECONDS = 35 * DAY_SECONDS
 ZONES_REFRESH_SECONDS = 300
 # The state of a zone missing from the listing is kept this long, so that an
 # incomplete listing does not make the exporter read the zone's history again.
-ZONE_KEEP_SECONDS = 86400
-SETTINGS_REFRESH_SECONDS = 3600
+ZONE_KEEP_SECONDS = DAY_SECONDS
+# Settings are fetched again this often; a zone whose plan cannot be read is
+# tried again after the same time.
+SETTINGS_REFRESH_SECONDS = HOUR_SECONDS
 LOOP_SECONDS = 15
 PRUNE_SECONDS = 30
-# Least time between two history reads; fresh buckets and rechecks are not paced.
-# Cloudflare allows 300 GraphQL queries in 5 minutes for all users of a token
-# together and counts every selection of a request: two instances reading
-# history at this pace, with their fresh buckets, stay below that.
+# Least time between two history reads by default
+# (CF_EXPORTER_HISTORY_INTERVAL_SECONDS); fresh buckets and rechecks are not
+# paced. Cloudflare allows 300 GraphQL queries in 5 minutes for all users of a
+# token together and counts every selection of a request: two instances
+# reading history at this pace, with their fresh buckets, stay below that.
 HISTORY_INTERVAL_SECONDS = 15
 # Each time Cloudflare's rate limit is reached the interval doubles, up to this
 # factor; it halves again after every HISTORY_RECOVER_SECONDS without one.
 HISTORY_SLOWDOWN_MAX = 16
-HISTORY_RECOVER_SECONDS = 3600
+HISTORY_RECOVER_SECONDS = HOUR_SECONDS
 # Buckets per history read: starts here, halves after a split, doubles while
-# pages stay small, never above the maximum or the dataset's maxDuration.
+# pages stay less than WINDOW_GROW_FILL full, never above the maximum or the
+# dataset's maxDuration.
 INITIAL_WINDOW_BUCKETS = 12
 MAX_WINDOW_BUCKETS = 72
+WINDOW_GROW_FILL = 0.25
 # Keep away from the edge of the dataset's notOlderThan.
-RETENTION_MARGIN_SECONDS = 3600
+RETENTION_MARGIN_SECONDS = HOUR_SECONDS
 # Cloudflare's documented cooldown when a rate-limit response has no Retry-After.
 RATE_LIMIT_RETRY_SECONDS = 300
 # A full page of one second is paginated rather than split.
@@ -156,6 +174,9 @@ SLICE_RESOLUTION_SECONDS = 1
 SCHEMA_VERSION = 2
 # Marks the database file as the exporter's own ("cfex").
 APPLICATION_ID = 0x63666578
+# The SQLite file header: its size and where the application id lies in it.
+SQLITE_HEADER_BYTES = 100
+SQLITE_APPLICATION_ID_OFFSET = 68
 # How long an operation waits for another process holding the database lock.
 STORAGE_LOCK_SECONDS = 30
 # How often the file is tried again while the state is kept in memory.
@@ -340,6 +361,10 @@ class CloudflareAPIError(Exception):
 
 class RateLimitedError(CloudflareAPIError):
     """An explicitly configured limit prevents waiting for Cloudflare's rate limit."""
+
+
+class ZonePlanError(CloudflareAPIError):
+    """The zone's plan cannot serve the reads; asking again soon changes nothing."""
 
 
 @dataclass(frozen=True)
@@ -564,7 +589,7 @@ class CloudflareAPI:
     def __init__(
         self,
         api_token: str,
-        request_timeout: int = 30,
+        request_timeout: int = DEFAULT_REQUEST_TIMEOUT,
         base_url: str = API_BASE_URL,
         *,
         max_retry_after_seconds: int = 0,
@@ -776,7 +801,7 @@ def fetch_settings(api: CloudflareAPI, zone_id: str) -> ZoneSettings:
     node = zone_node(data, zone_id).get("settings")
     settings = node.get("httpRequestsAdaptiveGroups") if isinstance(node, dict) else None
     if not isinstance(settings, dict) or settings.get("enabled") is not True:
-        raise CloudflareAPIError("httpRequestsAdaptiveGroups is not enabled for the zone")
+        raise ZonePlanError("httpRequestsAdaptiveGroups is not enabled for the zone")
     fields = settings.get("availableFields")
     if not isinstance(fields, list) or any(not isinstance(f, str) for f in fields):
         raise CloudflareAPIError("httpRequestsAdaptiveGroups returned invalid availableFields")
@@ -787,7 +812,7 @@ def fetch_settings(api: CloudflareAPI, zone_id: str) -> ZoneSettings:
             raise CloudflareAPIError(f"httpRequestsAdaptiveGroups returned invalid {name}")
         limits[name] = value
     if limits["maxDuration"] < BUCKET_SECONDS or limits["notOlderThan"] < 2 * BUCKET_SECONDS:
-        raise CloudflareAPIError("httpRequestsAdaptiveGroups does not cover a 5-minute bucket")
+        raise ZonePlanError("httpRequestsAdaptiveGroups does not cover a 5-minute bucket")
     return ZoneSettings(
         frozenset(fields), limits["maxPageSize"], limits["maxDuration"], limits["notOlderThan"]
     )
@@ -862,7 +887,7 @@ def make_plan(
     fields = settings.fields
     missing = REQUIRED_FIELDS - fields
     if missing:
-        raise CloudflareAPIError(f"fields not available for the zone: {', '.join(sorted(missing))}")
+        raise ZonePlanError(f"fields not available for the zone: {', '.join(sorted(missing))}")
     available = frozenset(f.removeprefix("dimensions_") for f in fields if f.startswith("dim"))
     exported = {kind: schema.dimensions(kind) for kind in DATASETS}
     needed = FILTER_FIELDS["edge"] | {
@@ -886,7 +911,7 @@ def make_plan(
         dimensions["edge_totals"] = ()
     max_page = min(page_size or settings.max_page_size, settings.max_page_size)
     reach = max(BUCKET_SECONDS, settings.not_older_than - RETENTION_MARGIN_SECONDS)
-    history = min(reach, backfill_days * 86400) if backfill_days else reach
+    history = min(reach, backfill_days * DAY_SECONDS) if backfill_days else reach
     return ZonePlan(
         zone_id=zone_id,
         zone_name=zone_name,
@@ -1366,7 +1391,7 @@ def evaluate(
     holdable = count > 0
 
     def compare(name: str, actual: float, expected: float) -> None:
-        if not math.isclose(actual, expected, rel_tol=1e-9, abs_tol=1e-9):
+        if not math.isclose(actual, expected, rel_tol=SUM_TOLERANCE, abs_tol=SUM_TOLERANCE):
             problems.append(f"{name} {actual:g} != totals {expected:g}")
 
     compare("groups count", sum(_count(g) for g in data.groups), count)
@@ -1419,7 +1444,7 @@ def evaluate(
     samples[(ZONE_REQUESTS, zone)] = count
     samples[(ZONE_VISITS, zone)] = visits
     ordered = tuple(sorted((name, labels, value) for (name, labels), value in samples.items()))
-    digest = hashlib.sha256(repr(ordered).encode()).hexdigest()[:16]
+    digest = hashlib.sha256(repr(ordered).encode()).hexdigest()[:DIGEST_LENGTH]
     result = BucketResult(bucket_end, ordered, digest, requests=count, client_requests=edge_count)
     if unproven:
         return replace(
@@ -1502,9 +1527,10 @@ def recognizably_ours(path: str) -> bool:
     a crash can leave. Anything else, damaged or not, may be someone's data."""
     try:
         with open(path, "rb") as file:
-            header = file.read(100)
-            if header.startswith(SQLITE_MAGIC) and len(header) >= 72:
-                return int.from_bytes(header[68:72], "big") == APPLICATION_ID
+            header = file.read(SQLITE_HEADER_BYTES)
+            offset = SQLITE_APPLICATION_ID_OFFSET
+            if header.startswith(SQLITE_MAGIC) and len(header) >= offset + 4:
+                return int.from_bytes(header[offset : offset + 4], "big") == APPLICATION_ID
             while header:
                 if header.strip(b"\x00"):
                     return False
@@ -2172,7 +2198,53 @@ def retry_delay(attempts: int) -> int:
 def recheck_time(bucket_end: int) -> int:
     """When an accepted bucket is read once more: RECHECK_SECONDS after the end of
     its UTC hour, so that one read rechecks the buckets of an hour."""
-    return -(-bucket_end // 3600) * 3600 + RECHECK_SECONDS
+    return -(-bucket_end // HOUR_SECONDS) * HOUR_SECONDS + RECHECK_SECONDS
+
+
+@dataclass
+class ZoneState:
+    """What the exporter keeps in memory about one zone; the buckets are in the
+    storage. All of it lives and goes with the zone."""
+
+    name: str
+    plan: ZonePlan | None = None
+    # When the settings are to be fetched (again).
+    settings_due: float = 0.0
+    # Whether the last settings request or read worked (1) or failed (0);
+    # None before either.
+    success: int | None = None
+    # Buckets per history read, and their maximum after a history read of full
+    # size failed, until the settings are fetched again.
+    window: int = INITIAL_WINDOW_BUCKETS
+    window_ceiling: int | None = None
+    # No reads of the zone before this time, after a failed read.
+    paused_until: float = 0.0
+    # Failed reads in a row, and the window of the last one.
+    failures: int = 0
+    failed_window: tuple[int, int] | None = None
+    # When the zone was first missing from the listing; such a zone is not
+    # read, but its state is kept for ZONE_KEEP_SECONDS.
+    gone_since: float | None = None
+    # Totals selections read over the long proof range, because the usual range
+    # had no group: zones with little traffic.
+    long_proof: set[str] = field(default_factory=set)
+    # Totals selection -> end of the newest bucket any answer had events in,
+    # accepted or not; the storage knows the accepted ones. An answer without
+    # groups over a range with known events left them out: a reduced one.
+    last_event: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ExporterSnapshot:
+    """A consistent view of the exporter for the health metrics."""
+
+    zones: Mapping[str, str]  # listed zone ID -> name
+    plans: Mapping[str, ZonePlan]  # listed zone ID -> plan
+    success: Mapping[str, int]  # listed zone name -> 1 or 0
+    results: Mapping[str, int]
+    analytics_responses: int
+    analytics_samples: int
+    heartbeat: float | None
 
 
 class Exporter:
@@ -2189,24 +2261,23 @@ class Exporter:
         schema: Schema | None = None,
         *,
         backfill_days: int = 0,
+        history_interval: float | None = None,
         clock: Callable[[], float] = time.time,
     ):
         self.api = api
         self.storage = storage
         self.schema = Schema() if schema is None else schema
         self.backfill_days = backfill_days
+        # Least time between history reads; None: HISTORY_INTERVAL_SECONDS.
+        self.history_interval = history_interval
         self.clock = clock
         self._lock = threading.Lock()
         self.zones: dict[str, str] = {}  # zone ID -> name, as last listed
         self.zones_listed = False
         self.zones_at: float | None = None
-        self.plans: dict[str, ZonePlan] = {}
-        self.settings_at: dict[str, float] = {}
-        self.zone_success: dict[str, int] = {}  # zone name -> last read/settings ok
-        self.windows: dict[str, int] = {}  # zone ID -> buckets per history read
-        # Zone ID -> the most buckets per history read after a window that
-        # failed, until the zone's settings are fetched again.
-        self.window_ceilings: dict[str, int] = {}
+        # Zone ID -> state, for the listed zones and those missing from the
+        # listing for less than ZONE_KEEP_SECONDS.
+        self.zone_states: dict[str, ZoneState] = {}
         self.results = dict.fromkeys(READ_RESULTS, 0)
         self.heartbeat: float | None = None
         self.analytics_responses = 0
@@ -2222,22 +2293,42 @@ class Exporter:
         self._limited_seen = 0
         # No reads before this time, after an explicit rate-limit maximum.
         self._paused_until = 0.0
-        # Zone ID -> no reads of the zone before this time, after a failed read.
-        self._zone_paused: dict[str, float] = {}
-        # Zone ID -> failed reads in a row, and the window of the last one.
-        self._zone_failures: dict[str, int] = {}
-        self._failed_window: dict[str, tuple[int, int]] = {}
-        # Zone ID -> when it was first missing from the listing. Such a zone is
-        # not read, but its state is kept for ZONE_KEEP_SECONDS.
-        self._gone: dict[str, float] = {}
-        # (zone ID, totals selection) read over the long proof range, because the
-        # usual range had no group: zones with little traffic.
-        self._long_proof: set[tuple[str, str]] = set()
-        # (zone ID, totals selection) -> end of the newest bucket any answer had
-        # events in, accepted or not; the storage knows the accepted ones. An
-        # answer without groups over a range with known events left them out,
-        # so it is a reduced one.
-        self._last_event: dict[tuple[str, str], int] = {}
+
+    # State for other threads
+
+    @property
+    def plans(self) -> dict[str, ZonePlan]:
+        """Zone ID -> plan, of every zone whose settings were fetched."""
+        return {zone_id: s.plan for zone_id, s in self.zone_states.items() if s.plan}
+
+    def snapshot(self) -> ExporterSnapshot:
+        """The state the health metrics show, taken at once."""
+        with self._lock:
+            zones = dict(self.zones)
+            states = [(zone_id, self.zone_states.get(zone_id)) for zone_id in zones]
+            return ExporterSnapshot(
+                zones=zones,
+                plans={zone_id: s.plan for zone_id, s in states if s and s.plan},
+                success={
+                    zones[zone_id]: s.success
+                    for zone_id, s in states
+                    if s and s.success is not None
+                },
+                results=dict(self.results),
+                analytics_responses=self.analytics_responses,
+                analytics_samples=self.analytics_samples,
+                heartbeat=self.heartbeat,
+            )
+
+    def count_delivery(self, samples: int) -> None:
+        """Count a complete consuming /analytics response."""
+        with self._lock:
+            self.analytics_responses += 1
+            self.analytics_samples += samples
+
+    def _succeeded(self, state: ZoneState, value: int) -> None:
+        with self._lock:
+            state.success = value
 
     # Zones and plans
 
@@ -2263,8 +2354,8 @@ class Exporter:
                 self._follow_listing(listed, now)
                 self.zones_at = now
         for zone_id, zone_name in list(self.zones.items()):
-            since = self.settings_at.get(zone_id)
-            if since is not None and now - since < SETTINGS_REFRESH_SECONDS:
+            state = self.zone_states[zone_id]
+            if now < state.settings_due:
                 continue
             try:
                 plan = make_plan(
@@ -2279,19 +2370,30 @@ class Exporter:
                 # Every further request would be rejected as well.
                 self._rate_limited(e)
                 return
+            except ZonePlanError as e:
+                # The zone's plan, not the API: asking again soon changes nothing.
+                logging.error(
+                    "Zone %s: cannot be read: %s; settings are fetched again in %ds",
+                    zone_name,
+                    e,
+                    SETTINGS_REFRESH_SECONDS,
+                )
+                self._succeeded(state, 0)
+                state.settings_due = now + SETTINGS_REFRESH_SECONDS
+                continue
             except CloudflareAPIError as e:
                 logging.error("Zone %s: settings failed: %s", zone_name, e)
-                with self._lock:
-                    self.zone_success[zone_name] = 0
-                self.settings_at[zone_id] = now - SETTINGS_REFRESH_SECONDS + ERROR_RETRY_SECONDS
+                self._succeeded(state, 0)
+                state.settings_due = now + ERROR_RETRY_SECONDS
                 continue
             with self._lock:
-                self.plans[zone_id] = plan
+                state.plan = plan
                 # Known and readable from now on; a failed read keeps its 0.
-                self.zone_success.setdefault(zone_name, 1)
-            self.settings_at[zone_id] = now
+                if state.success is None:
+                    state.success = 1
+            state.settings_due = now + SETTINGS_REFRESH_SECONDS
             # Larger history windows get another chance.
-            self.window_ceilings.pop(zone_id, None)
+            state.window_ceiling = None
             skipped = self.storage.skip_rechecks(zone_id, self.layout(plan))
             if skipped:
                 logging.warning(
@@ -2306,39 +2408,28 @@ class Exporter:
         """Take over a new zone listing. A zone missing from it, also one only the
         database still knows after a restart, keeps its state for
         ZONE_KEEP_SECONDS: a listing can lack a zone that is not gone."""
-        known = set(self.zones) | set(self.plans)
-        if not self.zones_listed:
-            # After a restart only the database knows the zones.
-            known |= self.storage.zone_ids()
-        for zone_id in known - set(listed):
-            self._gone.setdefault(zone_id, now)
-        self._gone = {
-            zone_id: since
-            for zone_id, since in self._gone.items()
-            if zone_id not in listed and now - since < ZONE_KEEP_SECONDS
-        }
-        keep = set(listed) | set(self._gone)
         with self._lock:
+            if not self.zones_listed:
+                # After a restart only the database knows the zones.
+                for zone_id in self.storage.zone_ids() - set(listed):
+                    self.zone_states.setdefault(zone_id, ZoneState(name=zone_id))
+            for zone_id, state in list(self.zone_states.items()):
+                if zone_id in listed:
+                    state.gone_since = None
+                    continue
+                if state.gone_since is None:
+                    state.gone_since = now
+                if now - state.gone_since >= ZONE_KEEP_SECONDS:
+                    del self.zone_states[zone_id]
+            for zone_id, name in listed.items():
+                state = self.zone_states.setdefault(zone_id, ZoneState(name=name))
+                state.name = name
             self.zones = dict(listed)
             self.zones_listed = True
-            for zone_id in set(self.plans) - keep:
-                del self.plans[zone_id]
-            names = {plan.zone_name for plan in self.plans.values()} | set(listed.values())
-            self.zone_success = {
-                name: value for name, value in self.zone_success.items() if name in names
-            }
-        for state in (
-            self.settings_at,
-            self.windows,
-            self.window_ceilings,
-            self._zone_paused,
-            self._zone_failures,
-            self._failed_window,
-        ):
-            for zone_id in set(state) - keep:
-                del state[zone_id]
-        self._long_proof = {key for key in self._long_proof if key[0] in keep}
-        self._last_event = {key: end for key, end in self._last_event.items() if key[0] in keep}
+
+    def gone_zones(self) -> list[str]:
+        """Zones missing from the listing whose state is still kept."""
+        return [z for z, state in self.zone_states.items() if state.gone_since is not None]
 
     def layout(self, plan: ZonePlan) -> str:
         """What the labels of a zone's samples depend on: the exported labels and
@@ -2347,12 +2438,16 @@ class Exporter:
         used = sorted({d for kind in DATASETS for d in self.schema.dimensions(kind).values()})
         offered = [d for d in used if d in plan.available]
         state = repr((families, offered, sorted(plan.supported.items())))
-        return hashlib.sha256(state.encode()).hexdigest()[:16]
+        return hashlib.sha256(state.encode()).hexdigest()[:DIGEST_LENGTH]
 
     def listed_plans(self) -> dict[str, ZonePlan]:
         """Plans of the zones in the current listing; zones missing from it are
         not read."""
-        return {zone_id: plan for zone_id, plan in self.plans.items() if zone_id in self.zones}
+        return {
+            zone_id: state.plan
+            for zone_id, state in self.zone_states.items()
+            if state.plan and zone_id in self.zones
+        }
 
     def horizons(self, now: float) -> dict[str, int]:
         """Oldest bucket end still read and exported, per listed zone with a plan."""
@@ -2396,7 +2491,7 @@ class Exporter:
         zones = {
             zone_id: plan
             for zone_id, plan in self.listed_plans().items()
-            if now >= self._zone_paused.get(zone_id, 0)
+            if now >= self.zone_states[zone_id].paused_until
         }
         best = None
 
@@ -2421,7 +2516,7 @@ class Exporter:
                 offer("recheck", 2, zone_id, self._window([(e, 0, 0) for e in ends], limit))
         if best is None and self.storage.undelivered_samples() < BACKLOG_SAMPLE_LIMIT:
             for zone_id, plan in zones.items():
-                window = self.windows.get(zone_id, INITIAL_WINDOW_BUCKETS)
+                window = self.zone_states[zone_id].window
                 limit = min(window, plan.max_window_buckets)
                 low = horizons[zone_id]
                 high = max(low - BUCKET_SECONDS, newest - FRESH_SECONDS)
@@ -2456,7 +2551,7 @@ class Exporter:
         for alias in TOTAL_SELECTIONS:
             if alias not in plan.dimensions:
                 continue
-            long = (plan.zone_id, alias) in self._long_proof
+            long = alias in self.zone_states[plan.zone_id].long_proof
             span = plan.long_proof_seconds if long else PROOF_SECONDS
             since = min(start, max(end - span, oldest))
             until = max(end, min(since + span, newest))
@@ -2485,7 +2580,7 @@ class Exporter:
         stored = self.storage.nearest_event(plan.zone_id, alias, start, end, low, high)
         if stored is not None:
             candidates.append(stored)
-        seen = self._last_event.get((plan.zone_id, alias))
+        seen = self.zone_states[plan.zone_id].last_event.get(alias)
         if seen is not None and low <= seen <= high:
             candidates.append(seen)
 
@@ -2496,7 +2591,7 @@ class Exporter:
 
     def _events_known(self, plan: ZonePlan, alias: str, since: int, until: int) -> bool:
         """Whether a bucket of the range [since, until) is known to have events."""
-        seen = self._last_event.get((plan.zone_id, alias))
+        seen = self.zone_states[plan.zone_id].last_event.get(alias)
         if seen is not None and since < seen <= until:
             return True
         return self.storage.has_event(plan.zone_id, alias, since + BUCKET_SECONDS, until)
@@ -2513,19 +2608,19 @@ class Exporter:
         answer has plenty of groups.
         """
         again = set()
+        zone = self.zone_states[plan.zone_id]
         for alias in TOTAL_SELECTIONS:
-            key = (plan.zone_id, alias)
             state = stats.states.get(alias)
             seen = stats.newest.get(alias)
-            if seen is not None and seen > self._last_event.get(key, 0):
-                self._last_event[key] = seen
+            if seen is not None and seen > zone.last_event.get(alias, 0):
+                zone.last_event[alias] = seen
             if state == "empty":
                 since, until = stats.ranges.get(alias, (0, 0))
                 if self._events_known(plan, alias, since, until):
                     stats.states[alias] = "missing"
                     stats.looks.pop(alias, None)
-                elif key not in self._long_proof:
-                    self._long_proof.add(key)
+                elif alias not in zone.long_proof:
+                    zone.long_proof.add(alias)
                     again.add(alias)
                 else:
                     stats.looks[alias] = stats.looks.get(alias, 0) + 1
@@ -2537,7 +2632,7 @@ class Exporter:
                 # Any other answer ends a row of empty ones.
                 stats.looks.pop(alias, None)
                 if state == "full" and stats.groups.get(alias, 0) >= LONG_PROOF_GROUPS:
-                    self._long_proof.discard(key)
+                    zone.long_proof.discard(alias)
         return again
 
     def _repair(
@@ -2584,7 +2679,8 @@ class Exporter:
     def read(self, purpose: str, zone_id: str, start: int, end: int) -> None:
         """Read one window and settle or recheck its buckets. A failed read is
         tried again later; only an explicit rate-limit maximum raises."""
-        plan = self.plans[zone_id]
+        zone = self.zone_states[zone_id]
+        plan = zone.plan
         ends = list(range(start + BUCKET_SECONDS, end + 1, BUCKET_SECONDS))
         try:
             buckets, stats = read_window(
@@ -2619,29 +2715,29 @@ class Exporter:
                     rfc3339(end),
                 )
             with self._lock:
-                self.zone_success[plan.zone_name] = 0
+                zone.success = 0
                 self.results["error"] += 1
-            self._postpone(purpose, zone_id, ends, limited)
+            self._postpone(purpose, zone, ends, limited)
             if limited:
                 raise
             return
-        with self._lock:
-            self.zone_success[plan.zone_name] = 1
+        self._succeeded(zone, 1)
         now = self.clock()
-        self._failed_window.pop(zone_id, None)
-        if self._zone_failures.pop(zone_id, 0) >= OUTAGE_FAILURES:
+        zone.failed_window = None
+        failures, zone.failures = zone.failures, 0
+        if failures >= OUTAGE_FAILURES:
             # Cloudflare was failing, not single buckets: do not keep them
             # waiting, and let the history windows grow again.
             self.storage.release(zone_id, now)
-            self.window_ceilings.pop(zone_id, None)
+            zone.window_ceiling = None
         if purpose == "history":
-            window = self.windows.get(zone_id, INITIAL_WINDOW_BUCKETS)
+            window = zone.window
             if stats.split:
                 window = max(1, window // 2)
-            elif stats.fill < 0.25 and len(ends) >= window:
-                ceiling = self.window_ceilings.get(zone_id, plan.max_window_buckets)
+            elif stats.fill < WINDOW_GROW_FILL and len(ends) >= window:
+                ceiling = zone.window_ceiling or plan.max_window_buckets
                 window = max(window, min(plan.max_window_buckets, ceiling, window * 2))
-            self.windows[zone_id] = window
+            zone.window = window
         layout = self.layout(plan)
         if purpose == "recheck":
             for result in results:
@@ -2663,7 +2759,7 @@ class Exporter:
             else "",
         )
 
-    def _postpone(self, purpose: str, zone_id: str, ends: Sequence[int], limited: bool) -> None:
+    def _postpone(self, purpose: str, zone: ZoneState, ends: Sequence[int], limited: bool) -> None:
         """Schedule the buckets of a failed read again and leave the zone alone for
         a while.
 
@@ -2676,10 +2772,11 @@ class Exporter:
         rejection says nothing about the buckets.
         """
         now = self.clock()
+        zone_id = zone.plan.zone_id
         delay = RATE_LIMIT_RETRY_SECONDS if limited else ERROR_RETRY_SECONDS
-        self._zone_paused[zone_id] = now + delay
+        zone.paused_until = now + delay
         if not limited:
-            self._zone_failures[zone_id] = self._zone_failures.get(zone_id, 0) + 1
+            zone.failures += 1
         if purpose == "recheck":
             kept = [end for end in ends if now - end < RECHECK_GIVE_UP_SECONDS]
             self.storage.set_recheck(zone_id, kept, now + max(delay, RECHECK_RETRY_SECONDS))
@@ -2691,8 +2788,8 @@ class Exporter:
             self.storage.defer(zone_id, ends, now + delay, failed=False)
             return
         window = (ends[0], ends[-1])
-        repeated = self._failed_window.get(zone_id) == window
-        self._failed_window[zone_id] = window
+        repeated = zone.failed_window == window
+        zone.failed_window = window
         if len(ends) == 1:
             row = self.storage.bucket(zone_id, ends[0])
             if row is not None and row.errors:
@@ -2700,12 +2797,9 @@ class Exporter:
         elif purpose == "history":
             # A smaller read that failed, a gap or a retry, says nothing about
             # the size of the windows.
-            size = min(
-                self.windows.get(zone_id, INITIAL_WINDOW_BUCKETS),
-                self.plans[zone_id].max_window_buckets,
-            )
+            size = min(zone.window, zone.plan.max_window_buckets)
             if len(ends) >= size:
-                self.windows[zone_id] = self.window_ceilings[zone_id] = max(1, size // 2)
+                zone.window = zone.window_ceiling = max(1, size // 2)
         self.storage.defer(zone_id, ends, now + delay, failed=len(ends) == 1 or repeated)
 
     def _count(self, result: str, amount: int = 1) -> None:
@@ -2734,7 +2828,7 @@ class Exporter:
                 "answer (%s: %s)",
                 plan.zone_name,
                 rfc3339(result.bucket_end),
-                (now - row.signature_since) / 3600,
+                (now - row.signature_since) / HOUR_SECONDS,
                 result.problem,
                 result.reason,
             )
@@ -2797,7 +2891,7 @@ class Exporter:
         abandoned, expired = self.storage.prune(
             self.horizons(now),
             # Zones that left the listing only recently keep their state.
-            [*self.zones, *self._gone] if self.zones_listed else None,
+            list(self.zone_states) if self.zones_listed else None,
             now,
             now - UNDELIVERED_KEEP_SECONDS,
         )
@@ -2810,7 +2904,7 @@ class Exporter:
             logging.warning(
                 "%d accepted buckets expired after %d days without being scraped",
                 expired,
-                UNDELIVERED_KEEP_SECONDS // 86400,
+                UNDELIVERED_KEEP_SECONDS // DAY_SECONDS,
             )
             self._count("expired", expired)
         self._pruned_at = now
@@ -2851,7 +2945,7 @@ class Exporter:
                 # API token keep their share of Cloudflare's rate limit. The wait
                 # is cut into pieces: a new bucket, a retry or a recheck that
                 # falls due meanwhile goes first.
-                interval = HISTORY_INTERVAL_SECONDS * self._slowdown
+                interval = self.history_pace()
                 wait = (self._history_at or 0) + interval - now
                 if wait > 0:
                     settles = newest + BUCKET_SECONDS + SETTLE_SECONDS - now
@@ -2881,12 +2975,18 @@ class Exporter:
             if self._slowdown < HISTORY_SLOWDOWN_MAX:
                 self._slowdown *= 2
                 logging.warning(
-                    "Cloudflare's rate limit was reached; history is read every %ds for now",
-                    HISTORY_INTERVAL_SECONDS * self._slowdown,
+                    "Cloudflare's rate limit was reached; history is read every %gs for now",
+                    self.history_pace(),
                 )
         elif self._slowdown > 1 and now - self._slowdown_at >= HISTORY_RECOVER_SECONDS:
             self._slowdown //= 2
             self._slowdown_at = now
+
+    def history_pace(self) -> float:
+        """Least seconds between two history reads now: the configured interval,
+        slowed down after rate-limit rejections."""
+        base = HISTORY_INTERVAL_SECONDS if self.history_interval is None else self.history_interval
+        return base * self._slowdown
 
     def _rate_limited(self, error: RateLimitedError) -> None:
         self._paused_until = self.clock() + RATE_LIMIT_RETRY_SECONDS
@@ -2928,16 +3028,11 @@ class HealthCollector(Collector):
         self.storage = storage
 
     def collect(self) -> Iterator[Metric]:
-        exporter = self.exporter
-        with exporter._lock:
-            # Only the zones of the current listing; a missing zone's state is
-            # kept but not reported.
-            zones = dict(exporter.zones)
-            plans = {zone_id: plan for zone_id, plan in exporter.plans.items() if zone_id in zones}
-            names = set(zones.values())
-            zone_success = {k: v for k, v in exporter.zone_success.items() if k in names}
-            results = dict(exporter.results)
-            responses, served = exporter.analytics_responses, exporter.analytics_samples
+        # Only the zones of the current listing; a missing zone's state is kept
+        # but not reported.
+        view = self.exporter.snapshot()
+        zones, plans, zone_success, results = view.zones, view.plans, view.success, view.results
+        responses, served = view.analytics_responses, view.analytics_samples
         summary = self.storage.summary()
         success = GaugeMetricFamily(
             "cf_exporter_zone_success",
@@ -3026,11 +3121,11 @@ class HealthCollector(Collector):
             "Times the storage was recreated after a failure, removal or corruption",
             value=self.storage.resets,
         )
-        if exporter.heartbeat is not None:
+        if view.heartbeat is not None:
             yield GaugeMetricFamily(
                 "cf_exporter_loop_timestamp_seconds",
                 "Unix time of the last collection loop iteration",
-                value=exporter.heartbeat,
+                value=view.heartbeat,
             )
 
 
@@ -3064,22 +3159,80 @@ class MetricsRequestHandler(WSGIRequestHandler):
         pass
 
 
-def make_app(exporter: Exporter, storage: Storage, registry=REGISTRY):
+def accepts_gzip(header: str) -> bool:
+    """Whether an Accept-Encoding header allows gzip: named, or covered by `*`,
+    with a quality above zero."""
+    named = wildcard = None
+    for item in header.split(","):
+        coding, *params = (part.strip() for part in item.split(";"))
+        quality = 1.0
+        for param in params:
+            key, _, value = param.partition("=")
+            if key.strip().lower() == "q":
+                try:
+                    quality = float(value)
+                except ValueError:
+                    quality = 0.0
+        coding = coding.lower()
+        if coding in ("gzip", "x-gzip"):
+            named = max(named or 0.0, quality)
+        elif coding == "*":
+            wildcard = quality
+    if named is not None:
+        return named > 0
+    return wildcard is not None and wildcard > 0
+
+
+def _plain(start_response, status: str, text: str, extra=()) -> list[bytes]:
+    body = text.encode()
+    start_response(
+        status,
+        [
+            ("Content-Type", "text/plain; charset=utf-8"),
+            *extra,
+            ("Content-Length", str(len(body))),
+        ],
+    )
+    return [body]
+
+
+def make_app(
+    exporter: Exporter,
+    storage: Storage,
+    registry=REGISTRY,
+    *,
+    response_samples: int | None = None,
+    consume_token: str = "",
+):
     """WSGI app: /analytics, /readyz, and health metrics on every other path.
 
-    /analytics serves the newest undelivered buckets. Only a request with
+    /analytics serves the undelivered buckets, `response_samples` samples per
+    response at most (None: RESPONSE_SAMPLE_BUDGET). Only a request with
     `consume=1`, which the scraper sends, counts towards their delivery, so that
     looking at the endpoint by hand never takes samples away from the scraper.
+    With a `consume_token`, such a request needs it as a bearer token, so that
+    nothing else that reaches the port can consume.
     """
     metrics_app = make_wsgi_app(registry)
+    expected = f"Bearer {consume_token}".encode() if consume_token else b""
 
     def analytics(environ, start_response):
         consume = "consume=1" in environ.get("QUERY_STRING", "").split("&")
-        picked, rows = storage.exposition(RESPONSE_SAMPLE_BUDGET)
+        if consume and expected:
+            given = environ.get("HTTP_AUTHORIZATION", "").encode("latin-1", "replace")
+            if not hmac.compare_digest(given, expected):
+                body = _plain(
+                    start_response,
+                    "403 Forbidden",
+                    "consume=1 needs the bearer token of CF_EXPORTER_CONSUME_TOKEN\n",
+                )
+                return [] if environ["REQUEST_METHOD"] == "HEAD" else body
+        budget = RESPONSE_SAMPLE_BUDGET if response_samples is None else response_samples
+        picked, rows = storage.exposition(budget)
         body = render_analytics(rows)
         headers = [("Content-Type", "text/plain; version=0.0.4; charset=utf-8")]
-        if "gzip" in environ.get("HTTP_ACCEPT_ENCODING", ""):
-            body = gzip.compress(body, compresslevel=6)
+        if accepts_gzip(environ.get("HTTP_ACCEPT_ENCODING", "")):
+            body = gzip.compress(body, compresslevel=GZIP_LEVEL)
             headers.append(("Content-Encoding", "gzip"))
         headers.append(("Content-Length", str(len(body))))
         start_response("200 OK", headers)
@@ -3093,9 +3246,7 @@ def make_app(exporter: Exporter, storage: Storage, registry=REGISTRY):
             yield body
             # Only reached after the body was written completely.
             storage.mark_served(picked)
-            with exporter._lock:
-                exporter.analytics_responses += 1
-                exporter.analytics_samples += len(rows)
+            exporter.count_delivery(len(rows))
 
         return stream()
 
@@ -3104,16 +3255,12 @@ def make_app(exporter: Exporter, storage: Storage, registry=REGISTRY):
         if path not in ("/analytics", "/readyz"):
             return metrics_app(environ, start_response)
         if environ["REQUEST_METHOD"] not in ("GET", "HEAD"):
-            body = b"use GET or HEAD\n"
-            start_response(
+            return _plain(
+                start_response,
                 "405 Method Not Allowed",
-                [
-                    ("Content-Type", "text/plain; charset=utf-8"),
-                    ("Allow", "GET, HEAD"),
-                    ("Content-Length", str(len(body))),
-                ],
+                "use GET or HEAD\n",
+                [("Allow", "GET, HEAD")],
             )
-            return [body]
         if path == "/analytics":
             return analytics(environ, start_response)
         error = exporter.readiness_error()
@@ -3132,12 +3279,24 @@ def make_app(exporter: Exporter, storage: Storage, registry=REGISTRY):
 
 
 def start_http_server(
-    port: int, exporter: Exporter, storage: Storage, registry=REGISTRY
+    port: int,
+    exporter: Exporter,
+    storage: Storage,
+    registry=REGISTRY,
+    *,
+    response_samples: int | None = None,
+    consume_token: str = "",
 ) -> tuple[WSGIServer, threading.Thread]:
     server = make_server(
         "",
         port,
-        make_app(exporter, storage, registry),
+        make_app(
+            exporter,
+            storage,
+            registry,
+            response_samples=response_samples,
+            consume_token=consume_token,
+        ),
         MetricsHTTPServer,
         handler_class=MetricsRequestHandler,
     )
@@ -3150,16 +3309,20 @@ LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 
 class RedactingFormatter(logging.Formatter):
-    def __init__(self, token: str):
+    def __init__(self, *tokens: str):
         super().__init__("%(asctime)s [%(levelname)s] %(message)s")
-        self.token = token.strip()
+        self.tokens = [token.strip() for token in tokens if token.strip()]
 
     def format(self, record: logging.LogRecord) -> str:
         message = super().format(record)
-        if self.token:
-            message = message.replace(self.token, "[REDACTED]")
-            message = message.replace(repr(self.token)[1:-1], "[REDACTED]")
+        for token in self.tokens:
+            message = message.replace(token, "[REDACTED]")
+            message = message.replace(repr(token)[1:-1], "[REDACTED]")
         return message
+
+
+# Secrets of the configuration, redacted from every log line.
+SECRET_SETTINGS = ("CF_EXPORTER_API_TOKEN", "CF_EXPORTER_CONSUME_TOKEN")
 
 
 def configure_logging(environ: Mapping[str, str] = os.environ) -> None:
@@ -3167,7 +3330,7 @@ def configure_logging(environ: Mapping[str, str] = os.environ) -> None:
     level = environ.get("CF_EXPORTER_LOGLEVEL", "INFO").strip().upper()
     valid = level in LOG_LEVELS
     handler = logging.StreamHandler()
-    handler.setFormatter(RedactingFormatter(environ.get("CF_EXPORTER_API_TOKEN", "")))
+    handler.setFormatter(RedactingFormatter(*(environ.get(name, "") for name in SECRET_SETTINGS)))
     logging.basicConfig(
         level=getattr(logging, level) if valid else logging.INFO,
         handlers=[handler],
@@ -3193,12 +3356,14 @@ def _int_env(
     return value
 
 
-def _validate_token(raw: str) -> str:
+def _validate_token(raw: str, name: str = "CF_EXPORTER_API_TOKEN", required: bool = True) -> str:
     token = raw.strip()
     if not token:
-        raise ConfigError("CF_EXPORTER_API_TOKEN must be set.")
+        if required:
+            raise ConfigError(f"{name} must be set.")
+        return ""
     if not token.isascii() or not token.isprintable() or any(char.isspace() for char in token):
-        raise ConfigError("CF_EXPORTER_API_TOKEN must contain only printable ASCII without spaces.")
+        raise ConfigError(f"{name} must contain only printable ASCII without spaces.")
     return token
 
 
@@ -3251,14 +3416,19 @@ def parse_disabled_labels(raw: str) -> Schema:
 @dataclass(frozen=True)
 class Config:
     api_token: str = field(repr=False)
-    request_timeout: int = 30
-    metrics_port: int = 8000
+    request_timeout: int = DEFAULT_REQUEST_TIMEOUT
+    metrics_port: int = DEFAULT_METRICS_PORT
     db_path: str = DEFAULT_DB_PATH
     # Optional limits; 0 imposes none.
     backfill_days: int = 0
     max_retry_after_seconds: int = 0
     page_size: int = 0
     schema: Schema = field(default_factory=Schema)
+    # Tuning with defaults.
+    history_interval: int = HISTORY_INTERVAL_SECONDS
+    response_samples: int = RESPONSE_SAMPLE_BUDGET
+    # Bearer token a consuming /analytics request needs; empty: none.
+    consume_token: str = field(default="", repr=False)
 
 
 def parse_env(environ: Mapping[str, str] = os.environ) -> Config:
@@ -3268,13 +3438,25 @@ def parse_env(environ: Mapping[str, str] = os.environ) -> Config:
     api_token = _validate_token(environ.get("CF_EXPORTER_API_TOKEN", ""))
     return Config(
         api_token=api_token,
-        request_timeout=_int_env(environ, "CF_EXPORTER_REQUEST_TIMEOUT", 30, 1),
-        metrics_port=_int_env(environ, "CF_EXPORTER_METRICS_PORT", 8000, 1, 65535),
+        request_timeout=_int_env(
+            environ, "CF_EXPORTER_REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT, 1
+        ),
+        metrics_port=_int_env(environ, "CF_EXPORTER_METRICS_PORT", DEFAULT_METRICS_PORT, 1, 65535),
         db_path=environ.get("CF_EXPORTER_DB_PATH", "").strip() or DEFAULT_DB_PATH,
         backfill_days=_int_env(environ, "CF_EXPORTER_BACKFILL_DAYS", 0, 0),
         max_retry_after_seconds=_int_env(environ, "CF_EXPORTER_MAX_RETRY_AFTER_SECONDS", 0, 0),
         page_size=_int_env(environ, "CF_EXPORTER_PAGE_SIZE", 0, 0),
         schema=parse_disabled_labels(environ.get(DISABLED_LABELS, "")),
+        # The defaults as the class fixed them at import.
+        history_interval=_int_env(
+            environ, "CF_EXPORTER_HISTORY_INTERVAL_SECONDS", Config.history_interval, 1
+        ),
+        response_samples=_int_env(
+            environ, "CF_EXPORTER_RESPONSE_SAMPLES", Config.response_samples, 1
+        ),
+        consume_token=_validate_token(
+            environ.get("CF_EXPORTER_CONSUME_TOKEN", ""), "CF_EXPORTER_CONSUME_TOKEN", False
+        ),
     )
 
 
@@ -3306,7 +3488,9 @@ def describe(config: Config) -> str:
     )
     return (
         f"storage {config.db_path}; optional limits: {limits or 'none'}; "
-        f"disabled labels: {disabled or 'none'}"
+        f"disabled labels: {disabled or 'none'}; history every {config.history_interval}s; "
+        f"up to {config.response_samples} samples per response; "
+        f"consume token {'required' if config.consume_token else 'not set'}"
     )
 
 
@@ -3332,10 +3516,22 @@ def main() -> int:
 
     storage = Storage(config.db_path)
     api = create_api(config)
-    exporter = Exporter(api, storage, config.schema, backfill_days=config.backfill_days)
+    exporter = Exporter(
+        api,
+        storage,
+        config.schema,
+        backfill_days=config.backfill_days,
+        history_interval=config.history_interval,
+    )
     REGISTRY.register(HealthCollector(exporter, storage))
     REGISTRY.register(api.stats)
-    start_http_server(config.metrics_port, exporter, storage)
+    start_http_server(
+        config.metrics_port,
+        exporter,
+        storage,
+        response_samples=config.response_samples,
+        consume_token=config.consume_token,
+    )
     logging.info(
         "Exporter running on port %d (/analytics, /metrics, /readyz), %s",
         config.metrics_port,

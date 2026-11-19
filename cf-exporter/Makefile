@@ -50,10 +50,13 @@ USER_FLAGS := --user $(shell id -u):$(shell id -g)
 endif
 DEV_RUN = $(CONTAINER_ENGINE) run --rm $(USER_FLAGS) -v "$(ROOT):/src" -w /src
 # Settings are passed by name: a variable unset on the host stays unset.
+# CF_EXPORTER_CONSUME_TOKEN is a secret and is not passed: `make scrape` and the
+# checks read /analytics without consuming.
 CONFIG_ENV = --env CF_EXPORTER_REQUEST_TIMEOUT --env CF_EXPORTER_METRICS_PORT \
              --env CF_EXPORTER_LOGLEVEL --env CF_EXPORTER_DB_PATH \
              --env CF_EXPORTER_BACKFILL_DAYS --env CF_EXPORTER_MAX_RETRY_AFTER_SECONDS \
-             --env CF_EXPORTER_PAGE_SIZE --env CF_EXPORTER_DISABLED_LABELS
+             --env CF_EXPORTER_PAGE_SIZE --env CF_EXPORTER_DISABLED_LABELS \
+             --env CF_EXPORTER_HISTORY_INTERVAL_SECONDS --env CF_EXPORTER_RESPONSE_SAMPLES
 # Writes the token to stdout for a pipe, never to a command line or the log.
 TOKEN_CMD = if [ -n "$$CF_EXPORTER_API_TOKEN" ]; then printf '%s\n' "$$CF_EXPORTER_API_TOKEN"; \
             else head -n 1 "$(TOKEN_FILE)"; fi
