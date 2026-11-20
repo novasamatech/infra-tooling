@@ -12,7 +12,7 @@ import image_smoke
 import pytest
 import requests
 import responses
-from conftest import BASE_URL, NOW, requests_group
+from conftest import BASE_URL, T0, event, run
 from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 from urllib3.exceptions import InvalidHeader
@@ -20,7 +20,7 @@ from urllib3.exceptions import InvalidHeader
 import script
 
 ZONES = {"success": True, "result": [], "result_info": {"total_pages": 1}}
-SUCCESSFUL_ZONE = 'cf_exporter_zone_scrape_success{zone_name="example.org"} 1.0\n'
+SUCCESSFUL_ZONE = 'cf_exporter_zone_success{zone_name="example.org"} 1.0\n'
 
 
 def exposition(api):
@@ -137,24 +137,16 @@ def test_transport_failure_counts_without_a_response(rsps, api, exception, error
     assert counters(api) == {("errors", "rest", error): 1}
 
 
-def test_cycle_counts_listing_settings_and_a_failed_zone(cloudflare, api):
-    # Consistent datasets of the same requests: no empty page needs a check.
-    group = requests_group(4, edgeResponseStatus=200)
-    cloudflare.add_zone(
-        "a",
-        "good.example",
-        visits=[{"sum": {"visits": 0}}],
-        requests=[group],
-        cache=[group],
-        edge=[group],
-    )
-    cloudflare.add_zone("b", "bad.example", error="not authorized")
-    snapshot = script.collect_once(api, now=NOW)
-    assert snapshot.zone_success == {"good.example": 1, "bad.example": 0}
-    # One listing; settings for both zones, analytics for both (one is rejected).
+def test_collection_counts_listing_settings_reads_and_a_failed_zone(cloudflare, exporter, api):
+    cloudflare.add_zone("a", "good.example", event(T0 + 10, count=4))
+    cloudflare.add_zone("b", "bad.example").error = "not authorized"
+    run(exporter)
+    assert exporter.snapshot().success == {"good.example": 1, "bad.example": 0}
+    # One listing; settings for both zones; a fresh and a history read of the
+    # good zone and one rejected read of the bad one.
     assert counters(api) == {
         ("responses", "rest", "200"): 1,
-        ("responses", "graphql", "200"): 4,
+        ("responses", "graphql", "200"): 5,
         ("errors", "graphql", "graphql"): 1,
     }
 

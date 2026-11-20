@@ -9,9 +9,10 @@ FROM python:3.13-alpine
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Create a non-privileged user and group (pyuser)
+# Create a non-privileged user and group (pyuser) and its state directory
 # -D: do not create a home directory, -G: set the group
-RUN addgroup -g 1000 pyuser && adduser -D -G pyuser -u 1000 pyuser
+RUN addgroup -g 1000 pyuser && adduser -D -G pyuser -u 1000 pyuser \
+    && mkdir -p /var/lib/cf-exporter && chown pyuser:pyuser /var/lib/cf-exporter
 
 # Define the working directory inside the container
 WORKDIR /app
@@ -29,7 +30,12 @@ COPY --chmod=755 script.py .
 # Switch to the non-privileged user
 USER pyuser
 
-# Prometheus metrics and /readyz (CF_EXPORTER_METRICS_PORT, default 8000)
+# The SQLite state (CF_EXPORTER_DB_PATH). Mount a volume writable by UID or
+# GID 1000 to keep it across restarts; without one the exporter reads the
+# history again from Cloudflare.
+VOLUME /var/lib/cf-exporter
+
+# /analytics, /metrics and /readyz (CF_EXPORTER_METRICS_PORT, default 8000)
 EXPOSE 8000
 
 # By default, run the script

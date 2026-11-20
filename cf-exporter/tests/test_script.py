@@ -1,37 +1,24 @@
 # Copyright © 2026 Novasama Technologies GmbH
 # SPDX-License-Identifier: Apache-2.0
 
-"""Offline tests: external HTTP traffic is mocked; retry checks use localhost."""
+"""Configuration, logging, the API client, zone settings and plans, queries and
+main(). External HTTP traffic is mocked; retry checks use localhost."""
 
 import json
 import logging
 import signal
 import sys
 import threading
-import time
-from datetime import UTC, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 import requests
 import responses
-from conftest import (
-    ALL_FIELDS,
-    BASE_URL,
-    FREE_FIELDS,
-    MAX_PAGE_SIZE,
-    NOW,
-    json_response,
-    requests_group,
-    visits_group,
-)
-from image_smoke import cycle_started_today
-from prometheus_client import generate_latest
+from conftest import BASE_URL, BUCKET, FREE_FIELDS, PRO_FIELDS, T0, json_response, plan_for
+from prometheus_client import REGISTRY, CollectorRegistry, generate_latest
 from responses import matchers
 
 import script
-
-SINCE, UNTIL = script.day_window(NOW)
 
 # ------------------------------------------------------------- config ------
 
@@ -39,7 +26,14 @@ SINCE, UNTIL = script.day_window(NOW)
 def test_parse_env_defaults():
     config = script.parse_env({"CF_EXPORTER_API_TOKEN": "abc"})
     assert config == script.Config(
-        api_token="abc", request_timeout=30, scrape_interval=300, metrics_port=8000
+        api_token="abc",
+        request_timeout=30,
+        metrics_port=8000,
+        db_path="/var/lib/cf-exporter/cf-exporter.sqlite3",
+        backfill_days=0,
+        max_retry_after_seconds=0,
+        page_size=0,
+        schema=script.Schema(),
     )
 
 
@@ -48,11 +42,26 @@ def test_parse_env_custom_values():
         {
             "CF_EXPORTER_API_TOKEN": "abc",
             "CF_EXPORTER_REQUEST_TIMEOUT": "60",
-            "CF_EXPORTER_SCRAPE_INTERVAL": " 600 ",
-            "CF_EXPORTER_METRICS_PORT": "9000",
+            "CF_EXPORTER_METRICS_PORT": " 9000 ",
+            "CF_EXPORTER_DB_PATH": " /data/state.sqlite3 ",
+            "CF_EXPORTER_BACKFILL_DAYS": "7",
+            "CF_EXPORTER_MAX_RETRY_AFTER_SECONDS": "30",
+            "CF_EXPORTER_PAGE_SIZE": "500",
+            "CF_EXPORTER_DISABLED_LABELS": '{"cf_requests_5m": ["query"]}',
+            "CF_EXPORTER_HISTORY_INTERVAL_SECONDS": "40",
+            "CF_EXPORTER_RESPONSE_SAMPLES": "10000",
+            "CF_EXPORTER_CONSUME_TOKEN": " scraper-secret\n",
         }
     )
-    assert (config.request_timeout, config.scrape_interval, config.metrics_port) == (60, 600, 9000)
+    assert (config.request_timeout, config.metrics_port) == (60, 9000)
+    assert config.db_path == "/data/state.sqlite3"
+    assert (config.backfill_days, config.max_retry_after_seconds, config.page_size) == (7, 30, 500)
+    assert "query" not in config.schema.labels("cf_requests_5m")
+    assert (config.history_interval, config.response_samples) == (40, 10000)
+    assert config.consume_token == "scraper-secret"
+    api = script.create_api(config)
+    assert (api.max_retry_after_seconds, api.page_size, api.request_timeout) == (30, 500, 60)
+    api.session.close()
 
 
 def test_parse_env_strips_trailing_newline_from_secret():
@@ -69,24 +78,37 @@ def test_invalid_token_is_rejected_without_echoing_it(token):
 
 
 def test_config_repr_excludes_credentials():
-    assert "dummy-credential" not in repr(
-        script.parse_env({"CF_EXPORTER_API_TOKEN": "dummy-credential"})
+    config = script.parse_env(
+        {"CF_EXPORTER_API_TOKEN": "dummy-credential", "CF_EXPORTER_CONSUME_TOKEN": "dummy-consumer"}
     )
+    assert "dummy-credential" not in repr(config) and "dummy-consumer" not in repr(config)
+    assert "dummy-consumer" not in script.describe(config)
 
 
 def test_log_formatter_redacts_credentials_in_messages_and_tracebacks():
-    token = "dummy-credential"
-    formatter = script.RedactingFormatter(token)
+    token, consumer = "dummy-credential", "dummy-consumer"
+    formatter = script.RedactingFormatter(token, consumer, "")
     try:
         raise RuntimeError(token)
     except RuntimeError:
         record = logging.LogRecord(
-            "test", logging.ERROR, __file__, 1, "failed: %s", (token,), sys.exc_info()
+            "test", logging.ERROR, __file__, 1, "failed: %s %s", (token, consumer), sys.exc_info()
         )
     output = formatter.format(record)
-    assert token not in output
+    assert token not in output and consumer not in output
     assert "[REDACTED]" in output
     assert "RuntimeError" in output
+
+
+def test_configured_logging_redacts_both_secrets(capsys):
+    environ = {"CF_EXPORTER_API_TOKEN": "dummy-credential", "CF_EXPORTER_CONSUME_TOKEN": "dummy-c"}
+    script.configure_logging(environ)
+    try:
+        logging.error("leak %s and %s", "dummy-credential", "dummy-c")
+    finally:
+        logging.basicConfig(force=True)
+    err = capsys.readouterr().err
+    assert "dummy-credential" not in err and "dummy-c " not in err and "leak" in err
 
 
 @pytest.mark.parametrize("value", [None, "", "   \n"])
@@ -97,8 +119,12 @@ def test_parse_env_requires_api_token(value):
 
 
 def test_parse_env_empty_values_use_defaults():
-    config = script.parse_env({"CF_EXPORTER_API_TOKEN": "abc", "CF_EXPORTER_METRICS_PORT": ""})
-    assert config.metrics_port == 8000
+    config = script.parse_env(
+        {"CF_EXPORTER_API_TOKEN": "abc", "CF_EXPORTER_METRICS_PORT": "", "CF_EXPORTER_DB_PATH": " "}
+    )
+    assert config.metrics_port == 8000 and config.db_path == script.DEFAULT_DB_PATH
+    assert (config.history_interval, config.response_samples) == (15, 50_000)
+    assert config.consume_token == ""
 
 
 @pytest.mark.parametrize(
@@ -106,20 +132,46 @@ def test_parse_env_empty_values_use_defaults():
     [
         ("CF_EXPORTER_REQUEST_TIMEOUT", "abc", "must be an integer"),
         ("CF_EXPORTER_REQUEST_TIMEOUT", "0", "must be >= 1"),
-        ("CF_EXPORTER_SCRAPE_INTERVAL", "1.5", "must be an integer"),
-        ("CF_EXPORTER_SCRAPE_INTERVAL", "-5", "must be >= 1"),
         ("CF_EXPORTER_METRICS_PORT", "0", "must be between 1 and 65535"),
         ("CF_EXPORTER_METRICS_PORT", "70000", "must be between 1 and 65535"),
-        *(
-            case
-            for name in script.LIMITS.values()
-            for case in ((name, "-1", "must be >= 0"), (name, "1.5", "must be an integer"))
-        ),
+        ("CF_EXPORTER_BACKFILL_DAYS", "-1", "must be >= 0"),
+        ("CF_EXPORTER_BACKFILL_DAYS", "1.5", "must be an integer"),
+        ("CF_EXPORTER_MAX_RETRY_AFTER_SECONDS", "-1", "must be >= 0"),
+        ("CF_EXPORTER_PAGE_SIZE", "many", "must be an integer"),
+        ("CF_EXPORTER_HISTORY_INTERVAL_SECONDS", "0", "must be >= 1"),
+        ("CF_EXPORTER_RESPONSE_SAMPLES", "0", "must be >= 1"),
+        ("CF_EXPORTER_CONSUME_TOKEN", "two words", "must contain only printable ASCII"),
     ],
 )
 def test_parse_env_rejects_invalid_values(name, value, message):
     with pytest.raises(script.ConfigError, match=f"{name} {message}"):
         script.parse_env({"CF_EXPORTER_API_TOKEN": "abc", name: value})
+
+
+def test_describe_lists_storage_limits_and_disabled_labels():
+    config = script.parse_env({"CF_EXPORTER_API_TOKEN": "abc"})
+    assert script.describe(config) == (
+        "storage /var/lib/cf-exporter/cf-exporter.sqlite3; optional limits: none; "
+        "disabled labels: none; history every 15s; up to 50000 samples per response; "
+        "consume token not set"
+    )
+    config = script.parse_env(
+        {
+            "CF_EXPORTER_API_TOKEN": "abc",
+            "CF_EXPORTER_DB_PATH": "/data/x.sqlite3",
+            "CF_EXPORTER_BACKFILL_DAYS": "3",
+            "CF_EXPORTER_PAGE_SIZE": "100",
+            "CF_EXPORTER_DISABLED_LABELS": (
+                '{"cf_visits_5m": ["path"], "cf_requests_5m": ["user_agent_os", "query"]}'
+            ),
+        }
+    )
+    assert script.describe(config) == (
+        "storage /data/x.sqlite3; optional limits: CF_EXPORTER_BACKFILL_DAYS=3, "
+        "CF_EXPORTER_PAGE_SIZE=100; disabled labels: cf_visits_5m: path; "
+        "cf_requests_5m: query, user_agent_os; history every 15s; "
+        "up to 50000 samples per response; consume token not set"
+    )
 
 
 @pytest.fixture
@@ -146,6 +198,8 @@ def test_configure_logging_invalid_level_warns(basic_config, caplog):
     assert basic_config[0]["level"] == logging.INFO
     assert "Invalid CF_EXPORTER_LOGLEVEL 'VERBOSE', using INFO." in caplog.text
 
+
+# --------------------------------------------------------- API client ------
 
 # --------------------------------------------------------- API client ------
 
@@ -242,7 +296,8 @@ def test_partial_pagination_failure_is_not_silently_truncated(rsps, api):
 )
 def test_invalid_zone_listing_reports_failure(rsps, api, payload):
     rsps.add(responses.GET, f"{BASE_URL}/zones", json=payload)
-    assert script.collect_once(api, now=NOW).cycle_success == 0
+    with pytest.raises(script.CloudflareAPIError):
+        api.list_zones()
 
 
 @pytest.mark.parametrize("total_pages", [0, 1])
@@ -457,555 +512,277 @@ def test_format_errors(errors, expected):
     assert script.format_errors(errors) == expected
 
 
-# ------------------------------------------------------ query building -----
+def test_list_zones_reads_every_page_of_the_account(cloudflare, api):
+    for index in range(120):
+        cloudflare.add_zone(f"id{index:03}", f"zone{index:03}.example")
+    zones = api.list_zones()
+    assert [zone["name"] for zone in zones] == [f"zone{index:03}.example" for index in range(120)]
+    assert cloudflare.zone_calls == 3
 
 
-def test_day_window_starts_at_midnight_utc_and_drops_microseconds():
-    since, until = script.day_window(NOW)
-    assert since == datetime(2026, 10, 13, tzinfo=UTC)
-    assert until == datetime(2026, 10, 13, 7, 40, 12, tzinfo=UTC)
-    assert script.rfc3339(since) == "2026-10-13T00:00:00Z"
-    assert script.rfc3339(until) == "2026-10-13T07:40:12Z"
+def test_graphql_budget_error_waits_and_repeats_the_same_request(rsps, api, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(script.time, "sleep", sleeps.append)
+    budget = {"data": None, "errors": [{"message": "rate limiter budget depleted"}]}
+    rsps.add(responses.POST, f"{BASE_URL}/graphql", json=budget)
+    rsps.add(responses.POST, f"{BASE_URL}/graphql", json={"data": {"viewer": {}}})
+    assert api.graphql("q", {"a": 1}) == {"viewer": {}}
+    assert sleeps == [script.RATE_LIMIT_RETRY_SECONDS]
+    assert [json.loads(call.request.body) for call in rsps.calls] == [
+        {"query": "q", "variables": {"a": 1}}
+    ] * 2
 
 
-def test_day_window_converts_other_timezones_to_utc():
-    local = datetime(2026, 10, 13, 1, 30, tzinfo=timezone(timedelta(hours=3)))
-    since, until = script.day_window(local)
-    assert since == datetime(2026, 10, 12, tzinfo=UTC)
-    assert until == datetime(2026, 10, 12, 22, 30, tzinfo=UTC)
+# ------------------------------------------------------------ helpers ------
 
 
-def test_build_analytics_query_uses_variables_order_and_given_dimensions():
-    query = script.build_analytics_query(
-        {"visits": ["clientRequestPath"], "requests": ["cacheStatus", "userAgentOS"]}
-    )
-    assert "$zoneTag: string!" in query
-    assert "zoneTag: $zoneTag" in query
-    assert "datetime_geq: $since, datetime_lt: $until" in query
-    assert "visits: httpRequestsAdaptiveGroups(" in query
-    assert "requests: httpRequestsAdaptiveGroups(" in query
-    assert "orderBy: [sum_visits_DESC]" in query
-    assert "orderBy: [count_DESC]" in query
-    assert "cacheStatus userAgentOS" in query
-    assert "clientRequestQuery" not in query
+def test_time_helpers():
+    assert script.rfc3339(T0) == "2027-01-15T08:00:00Z"
+    assert script.rfc3339(T0 + 0.9) == "2027-01-15T08:00:00Z"
+    assert script.parse_rfc3339("2027-01-15T08:00:00Z") == T0
+    assert script.parse_rfc3339("2027-01-15T09:00:00+01:00") == T0
+    assert script.bucket_floor(T0) == T0
+    assert script.bucket_floor(T0 + 299.9) == T0
+    assert script.bucket_floor(T0 - 1) == T0 - BUCKET
+    # Buckets are aligned to UTC days and hours.
+    assert T0 % 3600 == 0 and script.BUCKET_SECONDS == 300 and 86400 % script.BUCKET_SECONDS == 0
 
 
-def test_query_omits_dimensions_when_none_are_available(cloudflare, api):
-    cloudflare.add_zone(
-        "z1",
-        "example.com",
-        fields=script.REQUIRED_FIELDS,
-        requests=[{"count": 2}],
-        visits=[{"sum": {"visits": 1}}],
-    )
-    result = script.collect_zone(api, "z1", "example.com", SINCE, UNTIL)
-    assert "dimensions" not in cloudflare.data_calls()[0]["query"]
-    assert list(result.requests.items()) == [
-        (("example.com", *(["unknown"] * len(script.REQUESTS_DIMENSIONS))), 2)
+@pytest.mark.parametrize("value", [None, 5, "", "08:00", "2027-01-15T08:00:00"])
+def test_invalid_bucket_times_are_api_errors(value):
+    with pytest.raises(script.CloudflareAPIError):
+        script.parse_rfc3339(value)
+
+
+def test_retry_delays_back_off_to_a_maximum():
+    assert [script.retry_delay(attempt) for attempt in (1, 2, 3, 4, 5, 6, 50)] == [
+        120,
+        240,
+        480,
+        900,
+        1800,
+        1800,
+        1800,
     ]
 
 
-def test_collect_zone_respects_plan_page_size(cloudflare, api, caplog):
-    cloudflare.add_zone(
-        "z1", "example.com", requests=[requests_group(2), requests_group(1)], max_page_size=1
-    )
-    script.collect_zone(api, "z1", "example.com", SINCE, UNTIL, limit=1)
-    assert cloudflare.data_calls()[0]["variables"]["limit"] == 1
-    assert "hit the 1 group limit" in caplog.text
+# ------------------------------------------------- settings and plans ------
 
 
-def test_collect_zone_at_midnight_avoids_empty_range_query(cloudflare, api):
-    cloudflare.add_zone("z1", "example.com")
-    assert script.collect_zone(api, "z1", "example.com", SINCE, SINCE) == script.ZoneMetrics(
-        {},
-        {},
-        limited=dict.fromkeys(script.DATASETS, 0),
-        available=dict.fromkeys(script.DATASETS, 1),
-    )
-    assert cloudflare.data_calls() == []
+def settings_reply(**overrides):
+    settings = {
+        "enabled": True,
+        "availableFields": PRO_FIELDS,
+        "maxPageSize": 10000,
+        "maxDuration": 2592000,
+        "notOlderThan": 2678400,
+        **overrides,
+    }
+    node = {"settings": {"httpRequestsAdaptiveGroups": settings}}
+    return {"data": {"viewer": {"zones": [node]}}, "errors": None}
 
 
-@pytest.mark.parametrize("page_size", [None, "10000", 0, -1, True])
-def test_collect_zone_rejects_invalid_plan_page_size(cloudflare, api, page_size):
-    cloudflare.add_zone("z1", "example.com", max_page_size=page_size)
-    assert script.collect_once(api, now=NOW).zone_success == {"example.com": 0}
+def test_settings_are_read_with_one_query(rsps, api):
+    rsps.add(responses.POST, f"{BASE_URL}/graphql", json=settings_reply())
+    settings = script.fetch_settings(api, "z1")
+    assert settings == script.ZoneSettings(frozenset(PRO_FIELDS), 10000, 2592000, 2678400)
+    sent = json.loads(rsps.calls[0].request.body)
+    assert sent["variables"] == {"zoneTag": "z1"}
+    for field in ("enabled", "availableFields", "maxPageSize", "maxDuration", "notOlderThan"):
+        assert field in sent["query"]
 
 
 @pytest.mark.parametrize(
-    "node",
+    ("overrides", "message"),
     [
-        None,
-        {},
-        {"visits": [], "requests": None},
-        {"visits": {}, "requests": []},
-        {"visits": [None], "requests": []},
-        {"visits": [], "requests": [{"count": None}]},
-        {"visits": [], "requests": [{"count": "1"}]},
-        {"visits": [], "requests": [{"count": -1}]},
-        {"visits": [], "requests": [{"count": True}]},
-        {"visits": [], "requests": [{"count": float("inf")}]},
-        {"visits": [], "requests": [{"count": 1, "dimensions": []}]},
-        {"visits": [{"sum": "invalid"}], "requests": []},
+        ({"enabled": False}, "is not enabled"),
+        ({"enabled": None}, "is not enabled"),
+        ({"availableFields": None}, "invalid availableFields"),
+        ({"availableFields": "count"}, "invalid availableFields"),
+        ({"availableFields": [123]}, "invalid availableFields"),
+        ({"maxPageSize": None}, "invalid maxPageSize"),
+        ({"maxPageSize": "10000"}, "invalid maxPageSize"),
+        ({"maxPageSize": 0}, "invalid maxPageSize"),
+        ({"maxPageSize": True}, "invalid maxPageSize"),
+        ({"maxDuration": -1}, "invalid maxDuration"),
+        ({"notOlderThan": 1.5}, "invalid notOlderThan"),
+        ({"maxDuration": 299}, "does not cover a 5-minute bucket"),
+        ({"notOlderThan": 599}, "does not cover a 5-minute bucket"),
     ],
 )
-def test_partial_or_invalid_analytics_is_a_zone_failure(rsps, api, node):
-    def callback(request):
-        query = json.loads(request.body)["query"]
-        zone = (
-            {
-                "settings": {
-                    "httpRequestsAdaptiveGroups": {
-                        "enabled": True,
-                        "availableFields": sorted(ALL_FIELDS),
-                        "maxPageSize": 10000,
-                    }
-                }
-            }
-            if "AvailableFields" in query
-            else ({"cache": [], "totals": [], **node} if isinstance(node, dict) else node)
-        )
-        return (
-            200,
-            {"Content-Type": "application/json"},
-            json.dumps({"data": {"viewer": {"zones": [zone]}}}),
-        )
+def test_invalid_settings_are_api_errors(rsps, api, overrides, message):
+    rsps.add(responses.POST, f"{BASE_URL}/graphql", json=settings_reply(**overrides))
+    with pytest.raises(script.CloudflareAPIError, match=message):
+        script.fetch_settings(api, "z1")
 
-    rsps.add_callback(responses.POST, f"{BASE_URL}/graphql", callback=callback)
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"data": {"viewer": {"zones": []}}},
+        {"data": {"viewer": {"zones": [{}, {}]}}},
+        {"data": {"viewer": {"zones": [{"settings": None}]}}},
+        {"data": {"viewer": {"zones": [{"settings": {}}]}}},
+        {"data": {"viewer": None}},
+    ],
+)
+def test_settings_without_the_zone_are_api_errors(rsps, api, payload):
+    rsps.add(responses.POST, f"{BASE_URL}/graphql", json=payload)
     with pytest.raises(script.CloudflareAPIError):
-        script.collect_zone(api, "z1", "example.com", SINCE, UNTIL)
+        script.fetch_settings(api, "z1")
 
 
-@pytest.mark.parametrize("fields", [None, "count", [123]])
-def test_invalid_available_fields_is_an_api_error(rsps, api, fields):
-    rsps.add(
-        responses.POST,
-        f"{BASE_URL}/graphql",
-        json={
-            "data": {
-                "viewer": {
-                    "zones": [
-                        {
-                            "settings": {
-                                "httpRequestsAdaptiveGroups": {
-                                    "enabled": True,
-                                    "availableFields": fields,
-                                    "maxPageSize": 10000,
-                                }
-                            }
-                        }
-                    ]
-                }
-            }
-        },
+def test_plan_follows_the_zone_settings(cloudflare, api):
+    zone = cloudflare.add_zone(
+        "z1", "example.org", page_size=5000, max_duration=7200, not_older_than=8 * 86400
     )
-    with pytest.raises(script.CloudflareAPIError, match="invalid availableFields"):
-        script.fetch_available_fields(api, "z1")
+    plan = plan_for(api, zone)
+    assert (plan.zone_id, plan.zone_name, plan.page_size) == ("z1", "example.org", 5000)
+    assert plan.max_window_buckets == 24
+    # An hour of margin to the edge of what Cloudflare still answers.
+    assert plan.reach_seconds == 8 * 86400 - 3600
+    assert plan.supported == {"visits": 1, "requests": 1, "cache": 1, "edge": 1}
+    assert plan.edge and list(plan.dimensions) == ["groups", "totals", "edge", "edge_totals"]
+    assert plan.dimensions["totals"] == plan.dimensions["edge_totals"] == ()
 
 
-# ----------------------------------------------------- zone collection -----
+@pytest.mark.parametrize(
+    ("configured", "expected"), [(0, 5000), (100, 100), (5000, 5000), (20000, 5000)]
+)
+def test_configured_page_size_never_exceeds_the_plans(cloudflare, api, configured, expected):
+    zone = cloudflare.add_zone("z1", "example.org", page_size=5000)
+    assert plan_for(api, zone, page_size=configured).page_size == expected
 
 
-def test_collect_zone_maps_dimensions_to_labels(cloudflare, api):
-    cloudflare.add_zone(
-        "z1",
-        "example.com",
-        visits=[
-            visits_group(
-                5,
-                clientRequestHTTPHost="www.example.com",
-                clientRequestPath="/",
-                clientCountryName="DE",
-                clientRequestReferer="",
-                userAgentBrowser="Chrome",
-                userAgentOS="Linux",
-            ),
-            visits_group(0, clientRequestHTTPHost="skipped"),
-        ],
-        requests=[
-            requests_group(
-                7,
-                clientRequestHTTPHost="www.example.com",
-                clientRequestHTTPMethodName="GET",
-                clientRequestPath="/a",
-                clientRequestQuery="?x=1",
-                clientCountryName="US",
-                clientRequestReferer="https://ref.example/",
-                userAgentBrowser="Firefox",
-                userAgentOS="Windows",
-                cacheStatus="hit",
-                originResponseStatus=200,
-            ),
-            requests_group(0, clientRequestHTTPHost="skipped"),
-        ],
+@pytest.mark.parametrize(
+    ("days", "expected"),
+    [(0, 31 * 86400 - 3600), (1, 86400), (31, 31 * 86400 - 3600), (90, 31 * 86400 - 3600)],
+)
+def test_backfill_days_only_shorten_the_history(cloudflare, api, days, expected):
+    zone = cloudflare.add_zone("z1", "example.org", not_older_than=31 * 86400)
+    plan = plan_for(api, zone, backfill_days=days)
+    assert plan.history_seconds == expected
+    # What can be queried, the proof ranges included, stays the dataset's reach.
+    assert plan.reach_seconds == 31 * 86400 - 3600
+    assert plan.long_proof_seconds == script.LONG_PROOF_SECONDS
+
+
+def test_window_never_exceeds_the_built_in_maximum(cloudflare, api):
+    zone = cloudflare.add_zone("z1", "example.org", max_duration=30 * 86400)
+    assert plan_for(api, zone).max_window_buckets == script.MAX_WINDOW_BUCKETS
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["count", "sum_visits", "avg_sampleInterval", "dimensions_datetimeFiveMinutes"],
+)
+def test_plan_without_a_required_field_fails_the_zone(cloudflare, api, missing):
+    zone = cloudflare.add_zone(
+        "z1", "example.org", fields=[field for field in PRO_FIELDS if field != missing]
     )
-    result = script.collect_zone(api, "z1", "example.com", SINCE, UNTIL)
-    assert result.visits == {
-        ("example.com", "www.example.com", "/", "DE", "direct", "Chrome", "Linux"): 5
-    }
-    assert result.requests == {
-        (
-            "example.com",
-            "www.example.com",
-            "GET",
-            "/a",
-            "?x=1",
-            "US",
-            "https://ref.example/",
-            "Firefox",
-            "Windows",
-            "hit",
-            "200",
-        ): 7
-    }
-    variables = cloudflare.data_calls()[0]["variables"]
-    assert variables == {
-        "zoneTag": "z1",
-        "since": "2026-10-13T00:00:00Z",
-        "until": "2026-10-13T07:40:12Z",
-        "limit": MAX_PAGE_SIZE,
+    with pytest.raises(script.CloudflareAPIError, match=f"fields not available.*{missing}"):
+        plan_for(api, zone)
+
+
+def test_free_plan_reads_only_what_it_offers(cloudflare, api):
+    zone = cloudflare.add_zone("z1", "example.org", fields=FREE_FIELDS)
+    plan = plan_for(api, zone)
+    assert plan.edge
+    assert "clientRequestQuery" not in plan.available
+    assert set(plan.dimensions["groups"]) == {
+        "clientRequestHTTPHost",
+        "clientRequestPath",
+        "clientCountryName",
+        "userAgentBrowser",
+        "userAgentOS",
+        "clientRequestHTTPMethodName",
+        "cacheStatus",
+        "originResponseStatus",
     }
 
 
-def test_collect_zone_free_plan_skips_unavailable_dimensions(cloudflare, api):
-    """Regression: Free zones used to fail entirely and export nothing."""
-    cloudflare.add_zone(
-        "z1",
-        "free.example",
-        fields=FREE_FIELDS,
-        visits=[visits_group(1, clientRequestHTTPHost="free.example", clientRequestPath="/")],
-        requests=[requests_group(2, clientRequestHTTPHost="free.example", cacheStatus="miss")],
-    )
-    result = script.collect_zone(api, "z1", "free.example", SINCE, UNTIL)
-    query = cloudflare.data_calls()[0]["query"]
-    assert "clientRequestQuery" not in query
-    assert "clientRequestReferer" not in query
-    (visit_labels,) = result.visits
-    assert dict(zip(script.VISITS_LABELS, visit_labels, strict=True))["client_request_referer"] == (
-        "unknown"
-    )
-    (request_labels,) = result.requests
-    labels = dict(zip(script.REQUESTS_LABELS, request_labels, strict=True))
-    assert labels["query"] == "unknown"
-    assert labels["client_request_referer"] == "unknown"
-    assert labels["cache_status"] == "miss"
-    # Dimensions missing from a group fall back to "unknown" as well.
-    assert labels["method_name"] == "unknown"
+# ------------------------------------------------------ query building -----
 
 
-def test_collect_zone_aggregates_duplicate_label_sets(cloudflare, api):
-    cloudflare.add_zone(
-        "z1",
-        "example.com",
-        requests=[
-            requests_group(3, clientRequestHTTPHost="a", originResponseStatus=200),
-            requests_group(4, clientRequestHTTPHost="a", originResponseStatus="200"),
-        ],
-    )
-    result = script.collect_zone(api, "z1", "example.com", SINCE, UNTIL)
-    assert list(result.requests.values()) == [7]
-
-
-def test_collect_zone_warns_when_group_limit_is_hit(cloudflare, api, caplog):
-    cloudflare.add_zone(
-        "z1",
-        "big.example",
-        requests=[
-            requests_group(2, clientRequestPath="/a"),
-            requests_group(1, clientRequestPath="/b"),
-            requests_group(1, clientRequestPath="/c"),
-        ],
-    )
-    script.collect_zone(api, "z1", "big.example", SINCE, UNTIL, limit=2)
-    assert "Zone big.example: requests hit the 2 group limit" in caplog.text
-    assert "visits hit" not in caplog.text
-
-
-def test_collect_zone_dataset_disabled(cloudflare, api):
-    cloudflare.add_zone("z1", "example.com", enabled=False)
-    with pytest.raises(script.CloudflareAPIError, match="not enabled"):
-        script.collect_zone(api, "z1", "example.com", SINCE, UNTIL)
-
-
-def test_collect_zone_required_fields_missing(cloudflare, api):
-    cloudflare.add_zone("z1", "example.com", fields=FREE_FIELDS - {"sum_visits"})
-    with pytest.raises(script.CloudflareAPIError, match="sum_visits"):
-        script.collect_zone(api, "z1", "example.com", SINCE, UNTIL)
-
-
-def test_collect_zone_graphql_error(cloudflare, api):
-    cloudflare.add_zone("z1", "example.com", error="does not have access to the field")
-    with pytest.raises(script.CloudflareAPIError, match="does not have access"):
-        script.collect_zone(api, "z1", "example.com", SINCE, UNTIL)
-
-
-def test_collect_zone_without_zone_node(rsps, api):
-    rsps.add(responses.POST, f"{BASE_URL}/graphql", json={"data": {"viewer": {"zones": []}}})
-    with pytest.raises(script.CloudflareAPIError, match="no data returned for zone z1"):
-        script.collect_zone(api, "z1", "example.com", SINCE, UNTIL)
-
-
-# ----------------------------------------------------- collection cycle ----
-
-
-def test_collect_once_isolates_failing_zones(cloudflare, api, caplog):
-    cloudflare.add_zone("ok", "ok.example", requests=[requests_group(1, clientRequestPath="/")])
-    cloudflare.add_zone("bad", "bad.example", error="quota exceeded")
-    snapshot = script.collect_once(api, now=NOW)
-    assert snapshot.zone_success == {"ok.example": 1, "bad.example": 0}
-    assert snapshot.cycle_success == 0
-    assert [labels[0] for labels in snapshot.requests] == ["ok.example"]
-    assert "Zone bad.example: collection failed: GraphQL: quota exceeded" in caplog.text
-
-
-@pytest.mark.parametrize("api", [{"max_retry_after_seconds": 30}], indirect=True)
-def test_explicit_retry_limit_skips_remaining_zones_until_next_cycle(cloudflare, api, caplog):
-    cloudflare.add_zone(
-        "a",
-        "a.example",
-        responder=lambda body: json_response(429, {"errors": [{"message": "budget depleted"}]}),
-    )
-    cloudflare.add_zone("b", "b.example")
-    cloudflare.add_zone("c", "c.example")
-    snapshot = script.collect_once(api, now=NOW)
-    assert snapshot.zone_success == {"a.example": 0, "b.example": 0, "c.example": 0}
-    assert snapshot.cycle_success == 0
-    assert {call["variables"]["zoneTag"] for call in cloudflare.graphql_calls} == {"a"}
-    assert "skipping the remaining zones this cycle" in caplog.text
-    # The next cycle tries every zone again.
-    cloudflare.zones["a"]["responder"] = None
-    snapshot = script.collect_once(api, now=NOW)
-    assert snapshot.zone_success == {"a.example": 1, "b.example": 1, "c.example": 1}
-
-
-def test_collect_once_all_zones_ok(cloudflare, api):
-    cloudflare.add_zone("a", "a.example", visits=[visits_group(2, clientRequestPath="/")])
-    cloudflare.add_zone("b", "b.example", fields=FREE_FIELDS)
-    snapshot = script.collect_once(api, now=NOW)
-    assert snapshot.cycle_success == 1
-    assert snapshot.zone_success == {"a.example": 1, "b.example": 1}
-    assert snapshot.cycle_timestamp is not None
-    assert snapshot.cycle_duration >= 0
-
-
-def test_collect_once_survives_zone_listing_failure(cloudflare, api, caplog):
-    """Regression: a failed zone listing used to terminate the process."""
-    cloudflare.zones_error = {"code": 10000, "message": "Authentication error"}
-    snapshot = script.collect_once(api, now=NOW)
-    assert snapshot.cycle_success == 0
-    assert snapshot.visits == snapshot.requests == snapshot.zone_success == {}
-    assert "Failed to list zones" in caplog.text
-    assert "Authentication error (10000)" in caplog.text
-
-
-def test_collect_once_skips_zones_without_id_or_name(rsps, api, caplog):
-    rsps.add(
-        responses.GET,
-        f"{BASE_URL}/zones",
-        json={
-            "success": True,
-            "result": [{"id": "x"}, {"name": "y"}],
-            "result_info": {"total_pages": 1},
-        },
-    )
-    snapshot = script.collect_once(api, now=NOW)
-    assert snapshot.zone_success == {}
-    assert snapshot.cycle_success == 0
-    assert "zone without a valid id or name" in caplog.text
-
-
-def test_collect_once_isolates_unexpected_errors(cloudflare, api, monkeypatch, caplog):
-    cloudflare.add_zone("a", "a.example")
-    cloudflare.add_zone("b", "b.example")
-    original = script.collect_zone
-
-    def flaky(api, zone_id, *args, **kwargs):
-        if zone_id == "a":
-            raise KeyError("bug")
-        return original(api, zone_id, *args, **kwargs)
-
-    monkeypatch.setattr(script, "collect_zone", flaky)
-    snapshot = script.collect_once(api, now=NOW)
-    assert snapshot.zone_success == {"a.example": 0, "b.example": 1}
-    assert "Zone a.example: unexpected error" in caplog.text
-
-
-def test_collect_once_uses_one_time_window_for_all_zones(cloudflare, api):
-    cloudflare.add_zone("a", "a.example")
-    cloudflare.add_zone("b", "b.example")
-    script.collect_once(api, now=NOW)
-    windows = {(c["variables"]["since"], c["variables"]["until"]) for c in cloudflare.data_calls()}
-    assert windows == {("2026-10-13T00:00:00Z", "2026-10-13T07:40:12Z")}
-
-
-# ------------------------------------------------------------ collector ----
-
-VISIT = ("z.example", "h", "/", "DE", "direct", "Chrome", "Linux")
-REQUEST = ("z.example", "h", "GET", "/", "", "DE", "direct", "Chrome", "Linux", "hit", "200")
-
-
-def snapshot(**overrides):
-    values = {
-        "visits": {VISIT: 3},
-        "requests": {REQUEST: 9},
-        "zone_success": {"z.example": 1},
-        "cycle_success": 1,
-        "cycle_timestamp": 1_700_000_000.0,
-        "cycle_duration": 1.5,
-    }
-    values.update(overrides)
-    return script.Snapshot(**values)
-
-
-def labels(names, values):
-    return dict(zip(names, values, strict=True))
-
-
-def test_collector_exposes_snapshot(registry):
-    collector = script.CloudflareCollector()
-    registry.register(collector)
-    collector.update(snapshot())
-    sample = registry.get_sample_value
-    assert sample("cf_visits", labels(script.VISITS_LABELS, VISIT)) == 3
-    assert sample("cf_requests", labels(script.REQUESTS_LABELS, REQUEST)) == 9
-    assert sample("cf_exporter_zone_scrape_success", {"zone_name": "z.example"}) == 1
-    assert sample("cf_exporter_last_cycle_success") == 1
-    assert sample("cf_exporter_last_cycle_timestamp_seconds") == 1_700_000_000.0
-    assert sample("cf_exporter_cycle_duration_seconds") == 1.5
-    text = generate_latest(registry).decode()
-    assert "# HELP cf_visits Total visits since midnight UTC" in text
-    assert "# TYPE cf_requests gauge" in text
-
-
-def test_collector_before_first_cycle_has_no_cycle_metrics(registry):
-    registry.register(script.CloudflareCollector())
-    text = generate_latest(registry).decode()
-    assert "# TYPE cf_visits gauge" in text
-    assert "cf_exporter_last_cycle_success" not in text
-
-
-def test_smoke_check_detects_cycles_that_crossed_midnight(registry):
-    collector = script.CloudflareCollector()
-    registry.register(collector)
-    now = time.time()
-    collector.update(script.Snapshot(cycle_success=1, cycle_timestamp=now, cycle_duration=0.0))
-    assert cycle_started_today(generate_latest(registry).decode())
-    since_midnight = now % 86400
-    collector.update(
-        script.Snapshot(cycle_success=1, cycle_timestamp=now, cycle_duration=since_midnight + 60)
-    )
-    assert not cycle_started_today(generate_latest(registry).decode())
-
-
-def test_collector_drops_series_missing_from_new_snapshot(registry):
-    """Regression: cf_requests series used to live forever."""
-    collector = script.CloudflareCollector()
-    registry.register(collector)
-    collector.update(snapshot())
-    collector.update(snapshot(visits={}, requests={}, zone_success={"z.example": 0}))
-    assert registry.get_sample_value("cf_visits", labels(script.VISITS_LABELS, VISIT)) is None
-    assert registry.get_sample_value("cf_requests", labels(script.REQUESTS_LABELS, REQUEST)) is None
+def test_query_uses_variables_and_orders_by_bucket():
+    query = script.build_query({"groups": ("clientRequestPath",), "edge_totals": ()})
+    # Totals have their own range and page size; only used variables are declared.
     assert (
-        registry.get_sample_value("cf_exporter_zone_scrape_success", {"zone_name": "z.example"})
-        == 0
+        "query Buckets($zoneTag: string!, $since: Time!, $until: Time!, $limit: uint64!, "
+        "$edge_totalsSince: Time!, $edge_totalsUntil: Time!, $totalsLimit: uint64!)" in query
+    )
+    assert "zones(filter: {zoneTag: $zoneTag})" in query
+    assert query.count("httpRequestsAdaptiveGroups(") == 2
+    assert query.count("limit: $limit") == 1 and query.count("limit: $totalsLimit") == 1
+    assert query.count("orderBy: [datetimeFiveMinutes_ASC]") == 2
+    assert "filter: {datetime_geq: $since, datetime_lt: $until}" in query
+    assert (
+        "filter: {datetime_geq: $edge_totalsSince, datetime_lt: $edge_totalsUntil, "
+        'requestSource: "eyeball"}' in query
+    )
+    assert "groups: httpRequestsAdaptiveGroups" in query
+    assert (
+        "{ count sum { visits } avg { sampleInterval } "
+        "dimensions { datetimeFiveMinutes clientRequestPath } }" in query
+    )
+    assert "{ count avg { sampleInterval } dimensions { datetimeFiveMinutes } }" in query
+    assert "$after" not in query
+
+
+def test_query_declares_only_the_variables_it_uses():
+    totals = script.build_query({"totals": (), "edge_totals": ()})
+    assert (
+        "query Buckets($zoneTag: string!, $totalsSince: Time!, $totalsUntil: Time!, "
+        "$totalsLimit: uint64!, $edge_totalsSince: Time!, $edge_totalsUntil: Time!)" in totals
+    )
+    groups = script.build_query({"groups": (), "edge": ("clientRequestPath",)})
+    assert (
+        "query Buckets($zoneTag: string!, $since: Time!, $until: Time!, $limit: uint64!)" in groups
     )
 
 
-def test_collector_scrape_sees_one_consistent_snapshot():
-    """An update during a scrape must not mix two cycles in one response."""
-    collector = script.CloudflareCollector()
-    collector.update(snapshot())
-    families = collector.collect()
-    visits = next(family for family in families if family.name == "cf_visits")
-    collector.update(snapshot(visits={}, requests={}))
-    requests_ = next(family for family in families if family.name == "cf_requests")
-    assert len(visits.samples) == 1
-    assert len(requests_.samples) == 1
+def test_paging_query_orders_by_the_dimensions_and_keeps_the_filters():
+    query = script.build_query(
+        {"edge": ("clientRequestHTTPHost", "edgeResponseStatus")}, paging=True
+    )
+    assert "$after: ZoneHttpRequestsAdaptiveGroupsFilter_InputObject!" in query
+    assert (
+        'filter: {datetime_geq: $since, datetime_lt: $until, requestSource: "eyeball", '
+        "AND: [$after]}" in query
+    )
+    assert "orderBy: [clientRequestHTTPHost_ASC, edgeResponseStatus_ASC]" in query
+    assert "dimensions { datetimeFiveMinutes clientRequestHTTPHost edgeResponseStatus }" in query
 
 
-# ----------------------------------------------------------- main loop -----
+def test_no_value_is_interpolated_into_queries(cloudflare, api, rsps):
+    zone = cloudflare.add_zone("z1", "example.org")
+    script.read_window(api, plan_for(api, zone), T0, T0 + BUCKET)
+    sent = json.loads(rsps.calls[-1].request.body)
+    window = {"Since": "2027-01-15T08:00:00Z", "Until": "2027-01-15T08:05:00Z"}
+    assert sent["variables"] == {
+        "zoneTag": "z1",
+        "since": window["Since"],
+        "until": window["Until"],
+        "limit": 10000,
+        **{
+            f"{alias}{bound}": window[bound]
+            for alias in ("totals", "edge_totals")
+            for bound in window
+        },
+        "totalsLimit": 10000,
+    }
+    assert "z1" not in sent["query"] and "2027" not in sent["query"]
 
 
-class StopAfter:
-    """Event stand-in that stops the loop after N waits and records them."""
-
-    def __init__(self, waits):
-        self.remaining = waits
-        self.timeouts = []
-
-    def is_set(self):
-        return self.remaining <= 0
-
-    def wait(self, timeout):
-        self.timeouts.append(timeout)
-        self.remaining -= 1
+def test_missing_zone_in_an_analytics_answer_is_an_api_error(cloudflare, api):
+    zone = cloudflare.add_zone("z1", "example.org")
+    plan = plan_for(api, zone)
+    cloudflare.replies.append(json_response(200, {"data": {"viewer": {"zones": [{}, {}]}}}))
+    with pytest.raises(script.CloudflareAPIError, match="no data returned for zone z1"):
+        script.read_window(api, plan, T0, T0 + BUCKET)
 
 
-def test_run_survives_unexpected_errors_and_keeps_going(monkeypatch, caplog):
-    """Regression: any exception used to end the main loop (and the process)."""
-    results = iter([RuntimeError("bug"), snapshot()])
-
-    def fake_collect_once(api):
-        result = next(results)
-        if isinstance(result, Exception):
-            raise result
-        return result
-
-    monkeypatch.setattr(script, "collect_once", fake_collect_once)
-    collector = script.CloudflareCollector()
-    stop = StopAfter(1)
-    original_update = collector.update
-    states = []
-
-    def recording_update(snap):
-        states.append(snap)
-        original_update(snap)
-
-    collector.update = recording_update
-    script.run(None, collector, 300, stop)
-    assert states[0].cycle_success == 0
-    assert states[0].cycle_duration >= 0
-    assert "Collection cycle failed unexpectedly" in caplog.text
-    stop.remaining = 1
-    script.run(None, collector, 300, stop)
-    assert collector.snapshot.cycle_success == 1
-
-
-def fixed_clock(monkeypatch, moment):
-    class Clock(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return moment
-
-    monkeypatch.setattr(script, "datetime", Clock)
-
-
-def test_run_sleeps_for_the_rest_of_the_interval(monkeypatch):
-    fixed_clock(monkeypatch, datetime(2026, 10, 26, 12, 0, tzinfo=UTC))
-    monkeypatch.setattr(script, "collect_once", lambda api: snapshot())
-    stop = StopAfter(2)
-    script.run(None, script.CloudflareCollector(), 300, stop)
-    assert len(stop.timeouts) == 2
-    assert all(299 < t <= 300 for t in stop.timeouts)
-
-
-def test_run_moves_the_last_cycle_of_the_day_before_midnight(monkeypatch):
-    """Regression: the traffic between the last cycle and midnight was never exported."""
-    fixed_clock(monkeypatch, datetime(2026, 10, 26, 23, 57, tzinfo=UTC))
-    monkeypatch.setattr(script, "collect_once", lambda api: snapshot())
-    stop = StopAfter(2)
-    script.run(None, script.CloudflareCollector(), 300, stop)
-    # 180 s to midnight minus the margin; then the regular interval, once a day.
-    assert 149 < stop.timeouts[0] <= 150
-    assert 299 < stop.timeouts[1] <= 300
-
-
-def test_run_stops_when_event_is_set(monkeypatch):
-    calls = []
-    monkeypatch.setattr(script, "collect_once", lambda api: calls.append(1) or snapshot())
-    event = threading.Event()
-    event.set()
-    script.run(None, script.CloudflareCollector(), 300, event)
-    assert calls == []
+# --------------------------------------------------------------- main ------
 
 
 @pytest.fixture
@@ -1019,41 +796,83 @@ def test_main_exits_with_error_on_invalid_config(monkeypatch, quiet_logging, cap
     assert "CF_EXPORTER_API_TOKEN must be set." in caplog.text
 
 
-def test_main_wires_everything_together(monkeypatch, quiet_logging, registry):
+def test_main_wires_everything_together(monkeypatch, quiet_logging, tmp_path, caplog):
+    path = tmp_path / "state" / "cf.sqlite3"
     monkeypatch.setenv("CF_EXPORTER_API_TOKEN", "abc\n")
     monkeypatch.setenv("CF_EXPORTER_METRICS_PORT", "9123")
-    monkeypatch.setenv("CF_EXPORTER_SCRAPE_INTERVAL", "42")
-    monkeypatch.setenv("CF_EXPORTER_MAX_EXTRA_SELECTIONS", "152")
-    monkeypatch.setenv("CF_EXPORTER_DISABLED_LABELS", '{"cf_requests": ["query"]}')
+    monkeypatch.setenv("CF_EXPORTER_DB_PATH", str(path))
+    monkeypatch.setenv("CF_EXPORTER_BACKFILL_DAYS", "2")
+    monkeypatch.setenv("CF_EXPORTER_PAGE_SIZE", "777")
+    monkeypatch.setenv("CF_EXPORTER_DISABLED_LABELS", '{"cf_requests_5m": ["query"]}')
+    monkeypatch.setenv("CF_EXPORTER_HISTORY_INTERVAL_SECONDS", "30")
+    monkeypatch.setenv("CF_EXPORTER_RESPONSE_SAMPLES", "2000")
+    monkeypatch.setenv("CF_EXPORTER_CONSUME_TOKEN", "scraper-secret")
+    # Settings of 1.x that no longer exist are reported, not silently ignored.
+    monkeypatch.setenv("CF_EXPORTER_SCRAPE_INTERVAL", "300")
+    monkeypatch.setenv("CF_EXPORTER_GROUP_LIMIT", "")
+    registry = CollectorRegistry()
     handlers, servers, runs = {}, [], []
     monkeypatch.setattr(script, "REGISTRY", registry)
     monkeypatch.setattr(
         script.signal, "signal", lambda sig, handler: handlers.update({sig: handler})
     )
-    monkeypatch.setattr(script, "start_http_server", lambda *args: servers.append(args))
-    monkeypatch.setattr(script, "run", lambda *args: runs.append(args))
+    monkeypatch.setattr(
+        script, "start_http_server", lambda *args, **options: servers.append((args, options))
+    )
+    # While the loop runs, the registered collectors serve the health metrics.
+    monkeypatch.setattr(
+        script.Exporter,
+        "run",
+        lambda self, stop: runs.append((self, stop, generate_latest(registry).decode())),
+    )
+    caplog.set_level(logging.INFO)
 
     assert script.main() == 0
 
     assert set(handlers) == {signal.SIGTERM, signal.SIGINT}
-    api, collector, interval, event = runs[0]
-    assert servers == [(9123, collector, 3 * 42)]
-    assert api.session.headers["Authorization"] == "Bearer abc"
-    # Configured options reach the client; nothing is derived from the interval.
-    assert (api.max_extra_selections, api.slice_allowance) == (152, 152)
-    assert (api.group_limit, api.max_slice_requests, api.min_slice_seconds, api.page_size) == (
-        0,
-        0,
-        0,
-        0,
-    )
-    assert "query" not in api.schema.labels("cf_requests")
-    assert isinstance(collector, script.CloudflareCollector)
-    assert interval == 42
-    assert not event.is_set()
-    text = generate_latest(registry).decode()
-    assert "cf_visits" in text
+    exporter, stop, text = runs[0]
+    assert servers == [
+        (
+            (9123, exporter, exporter.storage),
+            {"response_samples": 2000, "consume_token": "scraper-secret"},
+        )
+    ]
+    assert not stop.is_set()
+    assert exporter.api.session.headers["Authorization"] == "Bearer abc"
+    assert (exporter.backfill_days, exporter.api.page_size) == (2, 777)
+    assert exporter.history_pace() == 30
+    assert "scraper-secret" not in caplog.text and "consume token required" in caplog.text
+    assert "query" not in exporter.schema.labels("cf_requests_5m")
+    assert exporter.storage.persistent and path.exists()
+    assert "CF_EXPORTER_SCRAPE_INTERVAL was removed in 2.0.0 and is ignored" in caplog.text
+    assert "CF_EXPORTER_GROUP_LIMIT" not in caplog.text
+    assert f"storage {path}" in caplog.text
+    assert "cf_exporter_storage_persistent 1.0" in text
     assert 'cf_exporter_api_errors_total{api="rest",error="rate_limited"} 0.0' in text
+    assert "cf_requests_5m" not in text
+    # The database is closed when the loop ends, also by a signal.
+    assert not exporter.storage.usable()
+    exporter.api.session.close()
+
+
+def test_database_is_closed_when_a_signal_ends_the_loop(monkeypatch, quiet_logging, tmp_path):
+    monkeypatch.setenv("CF_EXPORTER_API_TOKEN", "abc")
+    monkeypatch.setenv("CF_EXPORTER_DB_PATH", str(tmp_path / "cf.sqlite3"))
+    storages = []
+    monkeypatch.setattr(script, "REGISTRY", CollectorRegistry())
+    monkeypatch.setattr(script.signal, "signal", lambda sig, handler: None)
+    monkeypatch.setattr(
+        script, "start_http_server", lambda *args, **options: storages.append(args[2])
+    )
+
+    def interrupted(self, stop):
+        script._handle_signal(signal.SIGTERM, None)
+
+    monkeypatch.setattr(script.Exporter, "run", interrupted)
+    with pytest.raises(SystemExit) as exit_:
+        script.main()
+    assert exit_.value.code == 0
+    assert not storages[0].usable()
 
 
 def test_signal_handler_exits_cleanly(caplog):
@@ -1067,3 +886,4 @@ def test_signal_handler_exits_cleanly(caplog):
 def test_module_import_has_no_side_effects():
     """Signal handlers and metrics must only be installed by main()."""
     assert signal.getsignal(signal.SIGTERM) is not script._handle_signal
+    assert "cf_exporter" not in generate_latest(REGISTRY).decode()

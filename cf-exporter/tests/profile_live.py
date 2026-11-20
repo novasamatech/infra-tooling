@@ -1,300 +1,314 @@
 # Copyright © 2026 Novasama Technologies GmbH
 # SPDX-License-Identifier: Apache-2.0
 
-"""Measure live cycles and exposition in the Python 3.13 dev container.
+"""Live validation and resource measurements against the real Cloudflare API.
 
-Examples (token already delivered via the Makefile's stdin wrapper):
-    python tests/profile_live.py --day 2026-10-25 --cycles 2
-    python tests/profile_live.py --until 2026-10-25T12:00:00Z
-The exporter's settings, including its optional limits and disabled labels, come
-from the environment as for the service. Only aggregate measurements are
-printed: no credentials or label values, except the zone of a mismatched sum.
+Reads the buckets of a few closed hours of every zone with the exporter's own
+code, renders them as /analytics would, and compares each zone's sums with
+hourly totals fetched independently. Reports API requests, duration, memory and
+the size of the exposition.
+
+    CF_EXPORTER_API_TOKEN=... python tests/profile_live.py [--hours N] [--end TIME]
 """
 
+from __future__ import annotations
+
 import argparse
-import io
-import json
-import re
+import math
 import resource
 import sys
 import time
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
-from prometheus_client import CollectorRegistry, generate_latest
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import script
 
-SOURCES_QUERY = """
-query RequestSources($zoneTag: string!, $since: Time!, $until: Time!) {
-  viewer {
-    zones(filter: {zoneTag: $zoneTag}) {
-      eyeball: httpRequestsAdaptiveGroups(
-        limit: 1
-        filter: {datetime_geq: $since, datetime_lt: $until, requestSource: "eyeball"}
-      ) { count }
-      sources: httpRequestsAdaptiveGroups(
-        limit: 100
-        filter: {datetime_geq: $since, datetime_lt: $until}
-        orderBy: [count_DESC]
-      ) { count dimensions { requestSource } }
+HOUR = 3600
+# The newest validated hour ended at least this long ago, so that its late
+# events have arrived and exporter and reference see the same data.
+SETTLED_SECONDS = 900
+# Times a zone's rejected buckets and a reduced-resolution reference are read again.
+ROUNDS = 6
+# Deliberately not script.EYEBALL_FILTER: the oracle must not share the
+# production filter constant it checks.
+CLIENT_SOURCE = "eyeball"
+# Cloudflare answers from a table of every tenth or hundredth event under load.
+# Its groups have a sample interval of 10 or more, and quiet hours have no group
+# at all. A reference is trusted only with a group below this value, which
+# proves the full data; an answer without any group proves nothing by itself.
+REFERENCE_INTERVAL_LIMIT = 5.0
+# The reference is read with this much time before the window, to contain such
+# a group. Without any group in all of it the zone had no traffic. The plan's
+# longest query range and page size may shorten it.
+REFERENCE_PROOF_SECONDS = 7 * 86400
+# Hourly groups per reference page; a week and the window need about 180.
+REFERENCE_PAGE_SIZE = 1000
+# Families whose buckets add up to all requests, to all visits and to client requests.
+REQUEST_FAMILIES = ("cf_zone_requests_5m", "cf_requests_5m", "cf_cache_requests_5m")
+VISIT_FAMILIES = ("cf_zone_visits_5m", "cf_visits_5m")
+EDGE_FAMILY = "cf_edge_requests_5m"
+
+
+def reference_query(clients: bool) -> str:
+    """Hourly totals: another shape than the exporter's 5-minute buckets."""
+    selection = """
+      clients: httpRequestsAdaptiveGroups(
+        limit: $limit
+        filter: {datetime_geq: $since, datetime_lt: $until, requestSource: $source}
+        orderBy: [datetimeHour_ASC]
+      ) { count avg { sampleInterval } dimensions { datetimeHour } }"""
+    return f"""
+query Reference($zoneTag: string!, $since: Time!, $until: Time!, $limit: uint64!
+    {", $source: string!" if clients else ""}) {{
+  viewer {{
+    zones(filter: {{zoneTag: $zoneTag}}) {{
+      all: httpRequestsAdaptiveGroups(
+        limit: $limit
+        filter: {{datetime_geq: $since, datetime_lt: $until}}
+        orderBy: [datetimeHour_ASC]
+      ) {{ count sum {{ visits }} avg {{ sampleInterval }} dimensions {{ datetimeHour }} }}{
+        selection if clients else ""
     }
-  }
-}
+    }}
+  }}
+}}
 """
 
 
-def request_sources(graphql, zone_id, since, until):
-    """Independently fetch the eyeball total and all requests by source, for validation.
-
-    The exporter fetches no unconditional eyeball total. This independent query
-    checks its edge sums, including when empty-page recovery used a client total.
-    """
-    if since == until:
-        return 0, {}
-    # Deliberately do not reuse the production filter: this is its independent oracle.
-    variables = {"zoneTag": zone_id, "since": script.rfc3339(since), "until": script.rfc3339(until)}
-    node = script.zone_node(graphql(SOURCES_QUERY, variables), zone_id)
-    totals = script.group_list("eyeball", node.get("eyeball"))
-    if len(totals) > 1:
-        raise script.CloudflareAPIError("GraphQL: multiple dimensionless eyeball totals")
-    eyeball = script.checked_value("eyeball", totals[0], lambda g: g.get("count")) if totals else 0
-    sources = {}
-    for group in script.group_list("sources", node.get("sources")):
-        count = script.checked_value("sources", group, lambda g: g.get("count"))
-        dimensions = group.get("dimensions")
-        source = dimensions.get("requestSource") if isinstance(dimensions, dict) else None
-        if not isinstance(source, str) or not source or source in sources:
-            raise script.CloudflareAPIError("GraphQL: invalid or duplicate request source")
-        sources[source] = count
-    return eyeball, sources
-
-
-def expected_totals(visits, requests, eyeball):
-    """Map datasets to matching-scope reference totals (scalars or per-zone maps)."""
-    return {"visits": visits, "requests": requests, "cache": requests, "edge": eyeball}
-
-
-def source_filter_valid(eyeball, sources, requests, *, completed_day):
-    """Check the raw source value, requiring exact comparable totals only for a past day."""
-    raw_eyeball = sources.get("eyeball", 0)
-    # A zone can contain only subrequests. An absent eyeball source is valid;
-    # a completely empty source breakdown despite traffic is not a valid oracle.
-    return (not requests or bool(sources)) and (
-        not completed_day or eyeball == raw_eyeball <= requests
-    )
-
-
-def source_value_present(checked) -> bool:
-    """Whether the filter's source value still occurs in the data.
-
-    `checked` holds the request total and raw sources of every zone checked in
-    one window. A zone with only subrequests is valid on its own, but a renamed
-    value empties the filter and its reference in every zone at once.
-    """
-    checked = list(checked)
-    return not any(requests for requests, _ in checked) or any(
-        sources.get("eyeball", 0) > 0 for _, sources in checked
-    )
-
-
-class HistoricalCollector(script.CloudflareCollector):
-    """Render historical snapshots for profiling without changing their window."""
-
-    @staticmethod
-    def _day_visible(snapshot: script.Snapshot) -> bool:
-        return True
-
-
-@dataclass(frozen=True)
-class ZoneSummary:
-    """Validation scalars; retaining every zone's raw series would inflate RSS."""
-
-    zone_id: str
-    total_requests: float
-    total_visits: float
-    available: dict[str, int]
-    limited: dict[str, int]
-    sums: dict[str, float]
-    groups: dict[str, int]
-
-
-def pinned_window(args) -> tuple[datetime, datetime] | None:
-    """The fixed window of --day or --until, or None for the current cycle."""
-    if args.day:
-        since = datetime.strptime(args.day, "%Y-%m-%d").replace(tzinfo=UTC)
-        if args.day != since.strftime("%Y-%m-%d"):
-            raise ValueError("--day must be a UTC date in YYYY-MM-DD format")
-        if since.date() >= datetime.now(UTC).date():
-            raise ValueError("--day must be a completed UTC day")
-        return since, since + timedelta(days=1)
-    if args.until:
-        until = datetime.strptime(args.until, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
-        if until > datetime.now(UTC):
-            raise ValueError("--until must not be in the future")
-        return until.replace(hour=0, minute=0, second=0), until
-    return None
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    window = parser.add_mutually_exclusive_group()
-    window.add_argument("--day", help="Completed UTC date, YYYY-MM-DD; default: current cycle")
-    window.add_argument(
-        "--until",
-        help="Fixed exclusive window end, YYYY-MM-DDTHH:MM:SSZ; starts at its UTC midnight",
-    )
-    parser.add_argument("--cycles", type=int, default=2)
-    args = parser.parse_args()
-    if args.cycles < 1:
-        parser.error("--cycles must be positive")
+def parse_time(value: str) -> int:
     try:
-        pinned = pinned_window(args)
-    except ValueError as error:
-        parser.error(str(error))
-    config = script.parse_env()
-    api = script.create_api(config)
-    graphql = api.graphql
-    counters = {}
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an RFC3339 time: {value!r}") from None
+    if moment.tzinfo is None:
+        raise argparse.ArgumentTypeError(f"time without a zone: {value!r}")
+    return int(moment.astimezone(UTC).timestamp())
 
-    def measured(query, variables):
-        selections = len(re.findall(r": httpRequestsAdaptiveGroups\(", query))
-        counters["graphql_requests"] += 1
-        counters["analytics_requests" if selections else "settings_requests"] += 1
-        counters["analytics_selections"] += selections
-        return graphql(query, variables)
 
-    api.graphql = measured
-    # Keep only summaries, not an extra copy of every zone's series, to validate
-    # per-zone sums even when the exposition combines zones without zone_name.
-    results = {}
-    collect_zone, day_window = script.collect_zone, script.day_window
-
-    def recorded(api, zone_id, zone_name, *args, **kwargs):
-        result = collect_zone(api, zone_id, zone_name, *args, **kwargs)
-        results[zone_name] = ZoneSummary(
-            zone_id=zone_id,
-            total_requests=result.total_requests,
-            total_visits=result.total_visits,
-            available=dict(result.available),
-            limited=dict(result.limited),
-            sums={kind: sum(getattr(result, kind).values()) for kind in script.DATASETS},
-            groups={kind: len(getattr(result, kind)) for kind in script.DATASETS},
-        )
-        return result
-
-    registry = CollectorRegistry()
-    collector = HistoricalCollector() if pinned else script.CloudflareCollector()
-    registry.register(collector)
-    script.collect_zone = recorded
-    if pinned:
-        # Pin the window itself; only its rendering bypasses the day check.
-        script.day_window = lambda moment: pinned
+def positive(value: str) -> int:
     try:
-        for cycle in range(args.cycles):
-            counters.update(
-                graphql_requests=0,
-                settings_requests=0,
-                analytics_requests=0,
-                analytics_selections=0,
-            )
-            results.clear()
-            completed_day = pinned is not None and pinned[0].date() < datetime.now(UTC).date()
-            report = measure_cycle(api, graphql, results, collector, registry, completed_day)
-            report = {"cycle": cycle + 1, **report, "settings": script.describe(config)}
-            report.update(counters)
-            print(json.dumps(report), flush=True)
-            # Current-day data can still be ingested between the requests of a cycle
-            # and the later validation, so only a completed day must match exactly.
-            if (
-                report["success"] != 1
-                or not report["source_filter_valid"]
-                or (completed_day and report["mismatches"])
-                or report["truncated_selections"]
-            ):
-                return 1
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an integer: {value!r}") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
+
+
+def parse_args(argv: list[str], now: float) -> tuple[int, int]:
+    """[start, end) of the hours to validate; exits on invalid arguments."""
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--hours", type=positive, default=2, help="closed hours to validate")
+    parser.add_argument(
+        "--end", type=parse_time, help="end of the last hour, a past UTC hour boundary"
+    )
+    args = parser.parse_args(argv)
+    latest = int(now - SETTLED_SECONDS) // HOUR * HOUR
+    end = latest if args.end is None else args.end
+    if end % HOUR:
+        parser.error("--end must be a full UTC hour")
+    if end > latest:
+        parser.error(f"--end must not be after {script.rfc3339(latest)}: the hour has to settle")
+    return end - args.hours * HOUR, end
+
+
+def window_totals(groups: list, start: int, end: int) -> tuple[float, float] | None:
+    """(count, visits) of the hours in [start, end) from an answer proven to be at
+    full resolution; None for an answer that is reduced or has no group."""
+    if not any(group["avg"]["sampleInterval"] < REFERENCE_INTERVAL_LIMIT for group in groups):
+        return None
+    count = visits = 0
+    for group in groups:
+        hour = parse_time(group["dimensions"]["datetimeHour"])
+        if start <= hour < end:
+            count += group["count"]
+            visits += (group.get("sum") or {}).get("visits", 0)
+    return count, visits
+
+
+def fetch_reference(
+    api: script.CloudflareAPI, plan: script.ZonePlan, start: int, end: int, now: float
+):
+    """(requests, visits, client requests or None) of the window, or None if it
+    cannot be told.
+
+    Each selection is answered on its own, so each keeps its first proven
+    answer. A selection whose every answer was without groups had no traffic
+    in the whole range and counts as zero.
+    """
+    oldest = (int(now - plan.reach_seconds) // HOUR + 1) * HOUR
+    # One page of hours and one query of the plan's longest range must hold it all.
+    page = min(REFERENCE_PAGE_SIZE, plan.totals_page_size) - ROUNDS
+    longest = min(plan.max_duration, (page - 1) * HOUR) // HOUR * HOUR
+    since = min(start, max(start - REFERENCE_PROOF_SECONDS, oldest, end - longest))
+    aliases = ("all", "clients") if plan.edge else ("all",)
+    proven: dict[str, tuple[float, float]] = {}
+    seen_groups = set()
+    for attempt in range(ROUNDS):
+        variables = {
+            "zoneTag": plan.zone_id,
+            "since": script.rfc3339(since),
+            "until": script.rfc3339(end),
+            # Another page size each time: Cloudflare caches by query and variables.
+            "limit": page + attempt,
+        }
+        if plan.edge:
+            variables["source"] = CLIENT_SOURCE
+        data = api.graphql(reference_query(plan.edge), variables)
+        node = script.zone_node(data, plan.zone_id)
+        for alias in aliases:
+            groups = node.get(alias) or []
+            if groups:
+                seen_groups.add(alias)
+            totals = window_totals(groups, start, end)
+            if totals is not None:
+                proven.setdefault(alias, totals)
+        # An empty answer may be a reduced one: only all attempts together tell.
+        if all(alias in proven for alias in aliases):
+            break
+    for alias in aliases:
+        if alias not in proven:
+            if alias in seen_groups:
+                return None
+            proven[alias] = (0, 0)
+    return (*proven["all"], proven["clients"][0] if plan.edge else None)
+
+
+def read_zone(exporter: script.Exporter, plan: script.ZonePlan, start: int, end: int) -> int:
+    """Read every bucket of [start, end) as the exporter would; returns how many
+    buckets are still not accepted after the retries."""
+    first, last = start + script.BUCKET_SECONDS, end
+    exporter.storage.ensure(plan.zone_id, first, last)
+    pending = []
+    for _ in range(ROUNDS):
+        # Rejected buckets are due at once here; the service would wait first.
+        pending = exporter.storage.pending(plan.zone_id, math.inf, first, last, 10**6)
+        while pending:
+            window = exporter._window(pending, script.INITIAL_WINDOW_BUCKETS)
+            exporter.read("history", plan.zone_id, *window)
+            pending = [item for item in pending if item[0] <= window[0]]
+        pending = exporter.storage.pending(plan.zone_id, math.inf, first, last, 10**6)
+        if not pending:
+            break
+    return len(pending)
+
+
+def zone_sums(rows, start: int, end: int) -> dict[str, dict[str, float]]:
+    """zone name -> family -> sum over the buckets ending in (start, end]."""
+    sums: dict[str, dict[str, float]] = {}
+    for family, labels, value, bucket_end in rows:
+        if not start < bucket_end <= end:
+            continue
+        zone = labels.split('zone_name="', 1)[1].split('"', 1)[0]
+        families = sums.setdefault(zone, {})
+        families[family] = families.get(family, 0) + value
+    return sums
+
+
+def compare(sums: dict[str, float], reference: tuple) -> list[str]:
+    """Differences between a zone's exported sums and its reference totals."""
+    requests_, visits, clients = reference
+    problems = []
+    expected = {
+        **dict.fromkeys(REQUEST_FAMILIES, requests_),
+        **dict.fromkeys(VISIT_FAMILIES, visits),
+    }
+    if clients is not None:
+        expected[EDGE_FAMILY] = clients
+    for family, value in expected.items():
+        exported = sums.get(family, 0)
+        if exported != value:
+            problems.append(f"{family} {exported:g} != {value:g}")
+    return problems
+
+
+def validate(
+    api: script.CloudflareAPI,
+    schema: script.Schema,
+    start: int,
+    end: int,
+    now: float | None = None,
+) -> dict:
+    """Read and check every zone; returns the report. `now` is the current time."""
+    started = time.monotonic()
+    now = time.time() if now is None else now
+    storage = script.Storage(None)
+    exporter = script.Exporter(api, storage, schema, clock=lambda: now + time.monotonic() - started)
+    try:
+        exporter.refresh(now)
+        zones = {}
+        for plan in exporter.plans.values():
+            unaccepted = read_zone(exporter, plan, start, end)
+            reference = fetch_reference(api, plan, start, end, now)
+            zones[plan.zone_name] = {"unaccepted": unaccepted, "reference": reference}
+        rows = storage.exposition(10**9)[1]
     finally:
-        script.collect_zone, script.day_window = collect_zone, day_window
-        api.graphql = graphql
-        api.session.close()
+        storage.close()
+    sums = zone_sums(rows, start, end)
+    for name, zone in zones.items():
+        zone["sums"] = sums.get(name, {})
+        if zone["unaccepted"]:
+            zone["verdict"] = f"incomplete: {zone['unaccepted']} buckets not accepted"
+        elif zone["reference"] is None:
+            zone["verdict"] = "inconclusive: the reference stayed at a reduced resolution"
+        else:
+            problems = compare(zone["sums"], zone["reference"])
+            zone["verdict"] = "MISMATCH: " + "; ".join(problems) if problems else "ok"
+    failed_zones = [name for name in exporter.zones.values() if name not in zones]
+    families: dict[str, int] = {}
+    series = set()
+    for family, labels, _, _ in rows:
+        families[family] = families.get(family, 0) + 1
+        series.add((family, labels))
+    responses = {key: value for key, value in api.stats._responses.items()}
+    return {
+        "zones": zones,
+        "zones_without_plan": failed_zones,
+        "results": {key: value for key, value in exporter.results.items() if value},
+        "samples": families,
+        "series": len(series),
+        "exposition_bytes": len(script.render_analytics(rows)),
+        "http_responses": responses,
+        "seconds": time.monotonic() - started,
+        "max_rss_mib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
+    }
+
+
+def exit_code(report: dict) -> int:
+    """1 for a wrong or unreadable zone, 2 if nothing could be judged, else 0."""
+    verdicts = [zone["verdict"] for zone in report["zones"].values()]
+    if report["zones_without_plan"] or any(v.startswith("MISMATCH") for v in verdicts):
+        return 1
+    if verdicts and not any(verdict == "ok" for verdict in verdicts):
+        return 2
     return 0
 
 
-def measure_cycle(api, graphql, results, collector, registry, completed_day) -> dict:
-    """Run, render and validate one cycle; `results` receives per-zone summaries."""
-    completed_day = bool(completed_day)
-    snapshot = script.collect_once(api)
-    collector.update(snapshot)
-    started = time.monotonic()
-    body = generate_latest(registry)
-    exposition_seconds = time.monotonic() - started
-    # Fetched outside the measured counters; validation is not part of a cycle.
-    references = {
-        zone: request_sources(graphql, result.zone_id, snapshot.window_start, snapshot.window_end)
-        for zone, result in results.items()
-        if result.available["edge"]
-    }
-    sources_valid = all(
-        source_filter_valid(
-            total, sources, results[zone].total_requests, completed_day=completed_day
+def main(argv: list[str] | None = None) -> int:
+    start, end = parse_args(sys.argv[1:] if argv is None else argv, time.time())
+    script.configure_logging()
+    config = script.parse_env()
+    api = script.create_api(config)
+    print(f"window {script.rfc3339(start)} to {script.rfc3339(end)}; {script.describe(config)}")
+    report = validate(api, config.schema, start, end)
+    for name, zone in sorted(report["zones"].items()):
+        sums = zone["sums"]
+        print(
+            f"{name}: requests {sums.get('cf_zone_requests_5m', 0):g}, "
+            f"visits {sums.get('cf_zone_visits_5m', 0):g}, "
+            f"client requests {sums.get(EDGE_FAMILY, 0):g}, reference {zone['reference']}: "
+            f"{zone['verdict']}"
         )
-        for zone, (total, sources) in references.items()
-    ) and source_value_present(
-        (results[zone].total_requests, sources) for zone, (_, sources) in references.items()
-    )
-    mismatches = []
-    for zone, result in results.items():
-        # Edge groups are compared with the eyeball total, never cf_zone_requests.
-        expected = expected_totals(
-            result.total_visits, result.total_requests, references.get(zone, (0, {}))[0]
-        )
-        for kind in script.DATASETS:
-            exported = result.sums[kind]
-            if result.available[kind] and exported != expected[kind]:
-                _, starts = api.slice_hints.get((result.zone_id, kind), (None, ()))
-                mismatches.append(
-                    {
-                        "zone": zone,
-                        "dataset": kind,
-                        "exported": exported,
-                        "total": expected[kind],
-                        "groups": result.groups[kind],
-                        "leaves": len(starts) + 1,
-                        "truncated": result.limited[kind],
-                    }
-                )
-    window = snapshot.window_start and [
-        script.rfc3339(snapshot.window_start),
-        script.rfc3339(snapshot.window_end),
-    ]
-    return {
-        "window": window,
-        "success": snapshot.cycle_success,
-        "zones": len(snapshot.zone_success),
-        "cycle_seconds": round(snapshot.cycle_duration, 3),
-        "groups": {
-            kind: int(sum(v for (_, k), v in snapshot.groups.items() if k == kind))
-            for kind in script.DATASETS
-        },
-        "series": {script.METRICS[kind]: len(getattr(snapshot, kind)) for kind in script.DATASETS},
-        "truncated_selections": sum(snapshot.limited.values()),
-        "edge_unavailable_zones": sum(
-            1 for (_, kind), ok in snapshot.available.items() if kind == "edge" and not ok
-        ),
-        "totals_match": not mismatches,
-        "strict_totals": completed_day,
-        "source_filter_valid": sources_valid,
-        "mismatched_datasets": sorted({mismatch["dataset"] for mismatch in mismatches}),
-        "mismatches": mismatches,
-        "metrics_bytes": len(body),
-        "samples": sum(1 for line in io.BytesIO(body) if not line.startswith(b"#")),
-        "exposition_seconds": round(exposition_seconds, 3),
-        "peak_rss_mib": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 2),
-    }
+    for name in report["zones_without_plan"]:
+        print(f"{name}: FAILED - no settings")
+    print(f"bucket reads: {report['results']}")
+    print(f"samples: {report['samples']}; series: {report['series']}")
+    print(f"exposition: {report['exposition_bytes']} bytes")
+    print(f"HTTP responses: {report['http_responses']}")
+    print(f"duration: {report['seconds']:.1f}s; max RSS: {report['max_rss_mib']:.1f} MiB")
+    return exit_code(report)
 
 
 if __name__ == "__main__":
